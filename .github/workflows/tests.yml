@@ -1,0 +1,38 @@
+name: CPU tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.11']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install CPU and Web dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Test Python protocol and server lifecycle
+        run: python -m pytest -q tests --tb=short
+      - name: Test PCM and AudioWorklet
+        run: node static/test_pcm.mjs
+      - name: Check command-line entry point
+        run: python run.py --help
+      - name: Check whitespace
+        run: git diff --check

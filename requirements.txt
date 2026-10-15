@@ -1,0 +1,6 @@
+# Web/CPU dependencies only. Install into the existing WORKING GPU environment;
+# do not replace its torch/transformers/vLLM stack blindly.
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+websockets>=13,<17
+numpy>=1.26,<3
