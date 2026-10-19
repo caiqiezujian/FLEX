@@ -26,7 +26,7 @@
       <div class="direction-control"><span class="field-label">翻译方向</span><select id="sourceLang" aria-label="源语言"><option value="en">英语</option><option value="zh">中文</option></select><button id="swapLang" class="swap-button" title="切换翻译方向" aria-label="切换翻译方向">⇄</button><select id="targetLang" aria-label="目标语言"><option value="zh">中文</option><option value="en">英语</option></select></div>
       <div class="toolbar-actions">
         <details id="settings" class="settings"><summary><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16M8 4v6m8 4v6"/></svg>推理设置</summary>
-          <div class="settings-panel"><h3>流式参数</h3><label>基础分块<select id="chunkSeconds"><option value="1">1 秒</option><option value="2">2 秒</option><option value="3">3 秒</option></select></label><label class="check-label"><input id="adaptive" type="checkbox" checked><span>麦克风积压时合并<small id="adaptiveHint">文件固定分块</small></span></label><label id="authField" hidden>服务访问令牌<input id="authToken" type="password" autocomplete="off" placeholder="仅在本次页面中保存"></label></div>
+          <div class="settings-panel"><h3>流式参数</h3><label>基础分块<select id="chunkSeconds"><option value="1">1 秒</option><option value="2">2 秒</option><option value="3">3 秒</option></select></label><label class="check-label"><input id="adaptive" type="checkbox" checked><span>实时声音积压时合并<small id="adaptiveHint">文件固定分块</small></span></label><label id="authField" hidden>服务访问令牌<input id="authToken" type="password" autocomplete="off" placeholder="仅在本次页面中保存"></label></div>
         </details>
         <button id="clearButton" class="button button-subtle" disabled>清空结果</button>
       </div>
@@ -34,19 +34,19 @@
 
     <section class="panels">
       <article class="panel source-panel">
-        <div class="panel-heading"><div class="panel-title"><h2>原始内容</h2></div><div class="segmented" role="group" aria-label="输入来源"><button id="fileMode" class="selected" aria-pressed="true">音视频</button><button id="micMode" aria-pressed="false">麦克风</button></div></div>
+        <div class="panel-heading"><div class="panel-title"><h2>原始内容</h2></div><div class="segmented" role="group" aria-label="输入来源"><button id="fileMode" class="selected" aria-pressed="true">音视频</button><button id="micMode" aria-pressed="false">电脑声音</button></div></div>
         <div id="fileArea">
           <div id="mediaStage" class="media-stage">
             <video id="media" controls playsinline preload="metadata" hidden></video>
             <div id="audioArtwork" class="audio-artwork" hidden><div class="audio-disc"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l11-2v13M9 8l11-2"/><ellipse cx="6" cy="18" rx="3" ry="2"/><ellipse cx="17" cy="16" rx="3" ry="2"/></svg></div><div class="audio-bars" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div></div>
-            <button id="dropZone" class="drop-zone"><span class="upload-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m-4 4 4-4 4 4M4 15v5h16v-5"/></svg></span><strong>选择或拖入音视频</strong><span>MP4 / WebM / WAV / MP3 等</span></button>
+            <button id="dropZone" class="drop-zone"><span class="upload-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m-4 4 4-4 4 4M4 15v5h16v-5"/></svg></span><strong>选择或拖入音视频</strong><span>MP4 / WMV / WebM / WAV / MP3 等</span></button>
           </div>
           <div class="media-info"><div class="file-description"><span id="fileType" class="file-type">文件</span><div><strong id="fileName">尚未选择文件</strong><small id="fileDetails"></small></div></div><button id="chooseFile" class="button button-small">选择文件</button></div>
           <div class="source-options"><button id="chooseSubtitle" class="text-button" disabled>添加 VTT 字幕</button><span id="subtitleName"></span><button id="removeSubtitle" class="text-button" hidden>移除</button><span class="upload-note" title="开始时完整上传到当前服务器；模型按播放进度读取，会话结束后清理。">文件临时上传，结束后清理</span></div>
-          <input id="fileInput" type="file" accept="audio/*,video/*,.mkv,.mov,.mp4,.webm,.wav,.mp3,.m4a,.ogg,.flac" hidden>
+          <input id="fileInput" type="file" accept="audio/*,video/*,.wmv,.asf,.mkv,.mov,.mp4,.webm,.wav,.mp3,.m4a,.ogg,.flac" hidden>
           <input id="subtitleInput" type="file" accept=".vtt,text/vtt" hidden>
         </div>
-        <div id="micArea" hidden><div class="microphone-stage"><div class="mic-orbit"><div class="mic-symbol"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="12" rx="3"/><path d="M6 10v2a6 6 0 0 0 12 0v-2M12 18v3m-4 0h8"/></svg></div></div><strong id="micTitle">麦克风就绪</strong><p id="micDescription">开始时需要麦克风授权</p><div id="micMeter" class="mic-meter" aria-label="麦克风音量"><span></span></div></div></div>
+        <div id="micArea" hidden><div class="microphone-stage"><div class="mic-orbit"><div class="mic-symbol"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9h4l5-4v14l-5-4H4zM16 8a6 6 0 0 1 0 8m3-11a10 10 0 0 1 0 14"/></svg></div></div><strong id="micTitle">电脑声音就绪</strong><p id="micDescription">开始后选择共享来源，并勾选共享音频</p><label class="check-label system-microphone"><input id="includeMicrophone" type="checkbox"><span>同时收录我的讲话</span></label><p class="capture-help">Chrome / Edge + HTTPS。选择带音频的标签页，或整屏并共享系统音频（以浏览器选项为准）。讲话需额外麦克风授权，建议使用耳机。</p><div id="micMeter" class="mic-meter" aria-label="采集声音音量"><span></span></div></div></div>
         <div class="source-footer"><span class="clock-label"><i id="captureDot"></i><span id="sourceClock">00:00.0</span><small id="clockDescription">播放位置</small></span><span id="captureFormat">16 kHz · 单声道</span></div>
       </article>
 

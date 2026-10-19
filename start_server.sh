@@ -3,7 +3,7 @@ set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 # Usage: CUDA_VISIBLE_DEVICES=6 bash start_server.sh /absolute/merged-checkpoint
 # Extra arguments override the defaults, e.g. --max-model-len 4096.
-# Default intranet URL: https://10.185.1.71:18889 (microphone enabled after CA trust).
+# Default intranet URL: https://10.185.1.71:18889 (computer audio after CA trust).
 # Additional --https-host arguments add certificate IPs/names, not replace this IP.
 # TLS certificates are generated once on this server and reused on later starts.
 if [[ $# -lt 1 ]]; then

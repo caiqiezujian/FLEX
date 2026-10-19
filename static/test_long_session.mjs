@@ -31,7 +31,11 @@ class Element {
     return this.specialChild ||= new Element();
   }
   addEventListener(name,callback) {this.listeners.set(name,callback);}
+  removeEventListener(name,callback) {if(this.listeners.get(name)===callback)this.listeners.delete(name);}
   setAttribute() {}
+  getAttribute(name) {return this[name] || null;}
+  removeAttribute(name) {delete this[name];}
+  load() {this.loadCount=(this.loadCount || 0)+1;}
   contains() { return false; }
   pause() { this.paused = true; }
   click() { this.onDownload?.(this); }
@@ -56,7 +60,7 @@ function harness() {
     addEventListener() {}, body:new Element('body'),
   };
   const sandbox = {
-    document, performance:{now:() => 1000}, Date, Blob, AbortController,
+    document, performance:{now:() => 1000}, Date, Blob, AbortController,WebSocket:{OPEN:1,CLOSING:2},
     URL:{createObjectURL(blob) { const url = `blob:${blobs.size}`; blobs.set(url,blob); return url; },revokeObjectURL() {}},
     window:{addEventListener(name,callback) {listeners.set(name,callback);},confirm(message) {prompts.push(message);return confirmed;}},
     location:{protocol:'https:',host:'example.test'},
@@ -67,7 +71,7 @@ function harness() {
   const evaluate = code => vm.runInContext(code,sandbox);
   evaluate(`config={status:'ready',backend:'mock',max_chunk_seconds:3,max_session_seconds:0};
     session={sessionId:'session-one',sourceKind:'microphone',sourceLang:'en',targetLang:'zh',mediaOffset:0,chunkSeconds:1,startedAt:0,startedDate:'2026-10-19T01:02:03.000Z',authToken:'token-test'};
-    ui.sourceLang.value='en';ui.targetLang.value='zh';mode='microphone';state='live';`);
+    ui.sourceLang.value='en';ui.targetLang.value='zh';ui.includeMicrophone.checked=false;ui.micMeter.append(document.createElement('span'));mode='system';state='live';`);
   return {evaluate,elements,downloads,prompts,listeners,timers,
     setFetch(handler) {fetchHandler=handler;},confirm(value) {confirmed=value;},
     deferAnimationFrames(value) {deferFrames=value;},flushAnimationFrames() {for(const callback of frames.splice(0))callback();}};
@@ -389,4 +393,111 @@ test('legacy backends without health fields retain normal start and status behav
   assert.equal(h.elements.get('sessionStatus').textContent,'正在生成译文');
   h.evaluate("renderMetrics({inference_state:'queued'});");
   assert.equal(h.elements.get('sessionStatus').textContent,'等待推理调度');
+});
+
+test('computer sound is the live mode and microphone inclusion is explicit opt-in', () => {
+  const h=harness();
+  h.evaluate("state='idle';ui.micMode.onclick();");
+  assert.equal(h.evaluate('mode'),'system');
+  assert.equal(h.elements.get('includeMicrophone').checked,false);
+  assert.equal(h.elements.get('micArea').hidden,false);
+  assert.equal(h.elements.get('adaptive').disabled,false);
+  h.evaluate("state='connecting';updateControls();");
+  assert.equal(h.elements.get('includeMicrophone').disabled,true);
+});
+
+test('WMV selection defers unsupported browser decode until server conversion', () => {
+  const h=harness();
+  h.evaluate("state='idle';chooseFile({name:'演示.WMV',type:'video/x-ms-wmv',size:1234});");
+  assert.equal(h.evaluate('needsPlaybackConversion()'),true);
+  assert.equal(h.evaluate('mediaUrl'),null);
+  assert.equal(h.elements.get('media').getAttribute('src'),null);
+  assert.equal(h.elements.get('media').hidden,true);
+  assert.match(h.elements.get('fileDetails').textContent,/开始后准备播放/);
+  assert.equal(h.elements.get('startButton').disabled,false);
+  h.evaluate("chooseFile({name:'normal.mp4',type:'video/mp4',size:222});");
+  assert.equal(h.evaluate('needsPlaybackConversion()'),false);
+  assert.match(h.elements.get('media').src,/^blob:/);
+});
+
+test('display picker is called synchronously before old-session cleanup, including restart', async () => {
+  const h=harness();
+  h.evaluate(`state='done';ui.chunkSeconds.value='2';ui.authToken.value='';
+    globalThis.order=[];globalThis.cleanupResolve=null;
+    cleanupCapture=async()=>{order.push('cleanup');await new Promise(resolve=>{cleanupResolve=resolve;});};
+    globalThis.requestSystemAudio=options=>{order.push('display');globalThis.requestOptions=options;return new Promise(()=>{});};
+    ensureAudioContext=async()=>{order.push('audio');return 'worklet';};
+    globalThis.startPending=startSession();`);
+  assert.deepEqual(JSON.parse(h.evaluate('JSON.stringify(order)')),['display','audio','cleanup']);
+  assert.equal(h.evaluate('requestOptions.includeMicrophone'),false);
+  assert.equal(h.evaluate('session.sourceKind'),'system');
+  assert.equal(h.evaluate('session.chunkSeconds'),2);
+  h.evaluate('session.terminal=true;session.captureAbort.abort();cleanupResolve();');
+  await h.evaluate('startPending');
+  assert.equal(h.evaluate('requestOptions.signal.aborted'),true);
+});
+
+test('capture mixes only audio sources with headroom and muted monitoring; sharing end drains tail', async () => {
+  const h=harness();
+  h.evaluate(`globalThis.connections=[];globalThis.actions=[];globalThis.endCallback=null;
+    globalThis.WebSocket={OPEN:1,CLOSING:2};
+    globalThis.ensureAudioContext=async()=>'worklet';
+    audioContext={createMediaStreamSource(stream){return {connect(node){connections.push(['source',stream,node]);},disconnect(){}};},
+      createGain(){return {gain:{value:1},connect(node){connections.push(['gain',this.gain.value,node]);},disconnect(){}};}};
+    monitor={gain:{value:1}};
+    globalThis.AudioWorkletNode=function(){this.port={};this.connect=node=>connections.push(['monitor',node]);};
+    globalThis.capture={audioStreams:['system-stream','mic-stream'],stopped:false,stop(){actions.push('stop');},onEnded(callback){endCallback=callback;return ()=>actions.push('unsubscribe');}};
+    session={sourceKind:'system',captureRequest:Promise.resolve(capture),acks:new Map(),terminal:false,ready:true,ws:{readyState:1,send(data){actions.push(JSON.parse(data).type);}}};
+    state='live';`);
+  await h.evaluate('prepareCapture(session)');
+  assert.equal(h.evaluate('monitor.gain.value'),0);
+  assert.deepEqual(JSON.parse(h.evaluate('JSON.stringify(session.sourceGains.map(node=>node.gain.value))')),[.5,.5]);
+  assert.equal(h.evaluate('connections.filter(item=>item[0]==="source").length'),2);
+  h.evaluate("gate=async()=>{actions.push('flush');};endCallback(new Error('shared source ended'));");
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(h.evaluate('state'),'draining');
+  assert.deepEqual(JSON.parse(h.evaluate('JSON.stringify(actions)')),['flush','unsubscribe','stop','finish']);
+});
+
+test('prepared playback accepts only the matching same-origin path and cancellation removes listeners', async () => {
+  const h=harness();
+  h.evaluate("state='connecting';session.mediaId='upload-one';");
+  assert.throws(()=>h.evaluate("loadPreparedPlayback(session,{playback_url:'https://other.example/video.mp4',playback_type:'video/mp4',transcoded:true})"),/有效的 WMV/);
+  const pending=h.evaluate("loadPreparedPlayback(session,{playback_url:'/api/media/upload-one/playback',playback_type:'video/mp4',transcoded:true})");
+  assert.equal(h.elements.get('media').src,'/api/media/upload-one/playback');
+  assert.equal(h.evaluate('session.loadingPlayback'),true);
+  h.evaluate('session.cancelPlaybackLoad();');
+  await assert.rejects(pending,/已取消/);
+  assert.equal(h.evaluate('session.loadingPlayback'),false);
+  assert.equal(h.evaluate('session.cancelPlaybackLoad'),null);
+  assert.equal(h.timers.size,0);
+});
+
+test('Web Audio initialization rejection releases authorized capture before any socket', async () => {
+  const h=harness();
+  h.evaluate(`state='idle';session=null;ui.chunkSeconds.value='1';ui.authToken.value='';
+    globalThis.stops=0;globalThis.sockets=0;
+    globalThis.requestSystemAudio=async()=>({audioStreams:[],stop(){stops++;},onEnded(){return ()=>{};}});
+    ensureAudioContext=async()=>{throw new Error('synthetic AudioWorklet load failure');};
+    openSocket=async()=>{sockets++;};`);
+  await h.evaluate('startSession()');
+  assert.equal(h.evaluate('state'),'error');
+  assert.equal(h.evaluate('sockets'),0);
+  assert.equal(h.evaluate('stops'),1);
+  assert.match(h.elements.get('errorMessage').textContent,/AudioWorklet load failure/);
+});
+
+test('cancelling during pending AudioContext setup stops capture and ignores late initialization', async () => {
+  const h=harness();
+  h.evaluate(`state='idle';session=null;ui.chunkSeconds.value='1';ui.authToken.value='';
+    globalThis.stops=0;globalThis.sockets=0;
+    globalThis.requestSystemAudio=async()=>({audioStreams:[],stop(){stops++;},onEnded(){return ()=>{};}});
+    ensureAudioContext=()=>new Promise(resolve=>{globalThis.resolveAudio=resolve;});
+    openSocket=async()=>{sockets++;};globalThis.pendingStart=startSession();`);
+  await new Promise(resolve=>setImmediate(resolve));
+  await h.evaluate('finishSession()');
+  assert.equal(h.evaluate('stops'),1);
+  h.evaluate("resolveAudio('worklet');");await h.evaluate('pendingStart');
+  assert.equal(h.evaluate('sockets'),0);
+  assert.equal(h.evaluate('state'),'error');
 });

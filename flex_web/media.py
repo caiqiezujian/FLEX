@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import json
 import math
 from pathlib import Path
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -39,6 +41,10 @@ class Upload:
     samples: int = 0
     claimed: bool = False
     ready: bool = False
+    transcoded: bool = False
+    playback_secret: str = field(default_factory=lambda: secrets.token_urlsafe(32), repr=False)
+    playback_readers: set = field(default_factory=set, repr=False)
+    deleting: bool = False
 
     @property
     def raw_path(self):
@@ -48,9 +54,17 @@ class Upload:
     def pcm_path(self):
         return self.directory / 'audio.pcm'
 
+    @property
+    def playback_path(self):
+        return self.directory / 'playback.mp4'
+
     def public(self):
-        return dict(media_id=self.media_id, duration_s=self.samples / RATE,
-                    samples=self.samples, sample_rate=RATE, source_name=self.source_name)
+        result = dict(media_id=self.media_id, duration_s=self.samples / RATE,
+                      samples=self.samples, sample_rate=RATE, source_name=self.source_name)
+        if self.transcoded:
+            result.update(playback_url=f'/api/media/{self.media_id}/playback',
+                          playback_type='video/mp4', transcoded=True)
+        return result
 
 
 class MediaStore:
@@ -82,7 +96,7 @@ class MediaStore:
 
     def claim(self, key):
         self.expire()
-        if not isinstance(key, str) or key not in self.uploads:
+        if not isinstance(key, str) or key not in self.uploads or self.uploads[key].deleting:
             raise MediaError('media_missing', 'Uploaded file expired or was removed. Upload it again.', 404)
         item = self.uploads[key]
         if not item.ready:
@@ -92,16 +106,46 @@ class MediaStore:
         item.claimed = True
         return item
 
+    def playback(self, key):
+        self.expire()
+        item = self.uploads.get(key)
+        if item is None or item.deleting:
+            raise MediaError('media_missing', 'Uploaded file expired or was removed. Upload it again.', 404)
+        if not item.ready:
+            raise MediaError('media_not_ready', 'File is still uploading or converting.', 409)
+        if not item.transcoded:
+            raise MediaError('playback_missing', 'This upload uses the original local file for playback.', 404)
+        return item
+
+    def open_playback(self, item):
+        # A range response may still be sending while the session ends. Defer
+        # physical removal until all readers close, including on Windows.
+        handle = item.playback_path.open('rb')
+        item.playback_readers.add(handle)
+        return handle
+
+    def close_playback(self, item, handle):
+        handle.close()
+        item.playback_readers.discard(handle)
+        if item.deleting and not item.playback_readers:
+            self.discard(item.media_id, allow_claimed=True)
+
     def discard(self, key, *, allow_claimed=False):
         item = self.uploads.get(key)
         if item is None:
             return
         if item.claimed and not allow_claimed:
             raise MediaError('media_in_use', 'Cancel the active session before discarding its file.', 409)
+        item.deleting = True
+        if item.playback_readers:
+            return
         shutil.rmtree(item.directory)
         self.uploads.pop(key, None)
 
     def close(self):
+        for item in self.uploads.values():
+            for handle in item.playback_readers:
+                handle.close()
         self.uploads.clear()
         self.temporary.cleanup()
 
@@ -118,6 +162,8 @@ def _container(path):
         return 'ogg'
     if header[:4] == b'\x1aE\xdf\xa3':
         return 'matroska'
+    if header[:16] == bytes.fromhex('3026b2758e66cf11a6d900aa0062ce6c'):
+        return 'asf'
     if header[4:8] in (b'ftyp', b'moov', b'mdat', b'wide', b'free'):
         return 'mov'
     if header[:4] == b'RIFF' and header[8:12] == b'AVI ':
@@ -130,13 +176,81 @@ def _container(path):
         return 'aac'
     if len(header) > 1 and header[0] == 255 and header[1] & 0xe0 == 0xe0:
         return 'mp3'
-    raise MediaError('unsupported_media', 'Unsupported or invalid media. Choose WAV, MP3, MP4/M4A, WebM/MKV, OGG, FLAC, AAC, AIFF or AVI; playlists are not accepted.')
+    raise MediaError('unsupported_media', 'Unsupported or invalid media. Choose WAV, MP3, MP4/M4A, WMV/ASF, WebM/MKV, OGG, FLAC, AAC, AIFF or AVI; playlists are not accepted.')
 
 
-def decode_upload(item, max_seconds, timeout=1800, *, ffmpeg=None):
+def _transcode_wmv(item, executable, max_seconds, deadline, max_playback_bytes):
+    """Prepare one bounded browser-compatible video; never return partial output."""
+    probe_name = 'ffprobe.exe' if Path(executable).suffix.lower() == '.exe' else 'ffprobe'
+    sibling = Path(executable).with_name(probe_name)
+    probe = str(sibling) if sibling.is_file() else shutil.which('ffprobe')
+    if not probe:
+        raise MediaError('ffprobe_missing', 'WMV playback requires ffprobe alongside ffmpeg. Install the complete ffmpeg package, then upload again.', 503)
+
+    def remaining():
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise MediaError('decode_timeout', 'WMV conversion exceeded the decoding timeout. Try a shorter video or increase --decode-timeout-seconds.', 422)
+        return value
+
+    command = [executable, '-hide_banner', '-loglevel', 'error', '-nostdin', '-n', '-xerror',
+               '-protocol_whitelist', 'file,pipe', '-f', 'asf', '-threads', '1',
+               '-i', str(item.raw_path), '-map', '0:v:0', '-map', '0:a:0', '-sn', '-dn',
+               '-map_metadata', '-1', '-map_chapters', '-1', '-filter_threads', '1',
+               '-vf', 'pad=ceil(iw/2)*2:ceil(ih/2)*2',
+               '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p',
+               '-threads', '2', '-maxrate', '6M', '-bufsize', '12M',
+               '-c:a', 'aac', '-b:a', '128k', '-af', 'aresample=async=1:first_pts=0',
+               '-movflags', '+faststart', '-t', str(max_seconds + 1),
+               '-fs', str(max_playback_bytes), '-f', 'mp4', str(item.playback_path)]
+    error_path = item.directory / 'transcode.stderr'
+    try:
+        with error_path.open('wb') as error:
+            result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=error,
+                                    timeout=remaining(), check=False)
+        if result.returncode:
+            with error_path.open('rb') as error:
+                detail = error.read(8192).lower()
+            if b'unknown encoder' in detail or b'encoder not found' in detail:
+                raise MediaError('transcode_encoder', 'WMV needs the libx264 and AAC encoders. Install a full FFmpeg build with libx264 support, then upload again.', 503)
+            raise MediaError('transcode_failed', 'Unable to convert this WMV/ASF. It must contain a decodable video track and audio track; check that the file is complete.', 422)
+        if not item.playback_path.is_file() or not item.playback_path.stat().st_size:
+            raise MediaError('transcode_failed', 'WMV conversion produced no playable video.', 422)
+        if item.playback_path.stat().st_size >= max_playback_bytes:
+            raise MediaError('playback_size', 'Converted video exceeds the temporary playback size budget. Use a shorter video or increase --max-upload-mb.', 413)
+        # Only two mapped streams can reach this probe. Store output on disk and
+        # parse at most 16 KiB rather than buffering arbitrary media metadata.
+        probe_path = item.directory / 'playback.json'
+        command = [probe, '-v', 'error', '-protocol_whitelist', 'file,pipe', '-f', 'mov',
+                   '-enable_drefs', '0', '-use_absolute_path', '0',
+                   '-show_entries', 'format=duration:stream=codec_type,codec_name',
+                   '-of', 'json', str(item.playback_path)]
+        with probe_path.open('wb') as output, error_path.open('ab') as error:
+            checked = subprocess.run(command, stdout=output, stderr=error,
+                                     timeout=remaining(), check=False)
+        if checked.returncode or probe_path.stat().st_size > 16384:
+            raise MediaError('transcode_failed', 'Converted WMV video could not be validated; upload the complete original file again.', 422)
+        try:
+            info = json.loads(probe_path.read_text(encoding='utf-8'))
+            duration = float(info['format']['duration'])
+            codecs = {s['codec_type']: s['codec_name'] for s in info['streams']}
+            valid = math.isfinite(duration) and duration > 0 and codecs == {'video': 'h264', 'audio': 'aac'}
+        except (ValueError, KeyError, TypeError):
+            valid = False
+        if not valid:
+            raise MediaError('transcode_failed', 'Converted WMV is missing a valid H.264 video/AAC audio timeline.', 422)
+        if duration > max_seconds:
+            raise MediaError('media_duration', f'File exceeds the {max_seconds:g}-second session limit. Choose a shorter segment or increase --max-session-seconds.')
+        return duration, remaining()
+    except subprocess.TimeoutExpired as exc:
+        raise MediaError('decode_timeout', 'WMV conversion timed out. Try a shorter video or increase --decode-timeout-seconds.', 422) from exc
+
+
+def decode_upload(item, max_seconds, timeout=1800, *, ffmpeg=None, max_playback_bytes=MAX_UPLOAD_BYTES):
     """Write bounded 16k mono PCM16; reject overlong or empty media explicitly."""
     limit = round(max_seconds * RATE)
     container = _container(item.raw_path)
+    playback_duration = None
     native = False
     if container == 'wav':
         try:
@@ -165,13 +279,20 @@ def decode_upload(item, max_seconds, timeout=1800, *, ffmpeg=None):
         executable = shutil.which(str(ffmpeg)) if ffmpeg else shutil.which('ffmpeg')
         if executable is None:
             raise MediaError('ffmpeg_missing', 'This format needs FFmpeg on the server. Install ffmpeg, or upload a 16 kHz mono PCM16 WAV.', 503)
+        source_path = item.raw_path
+        if container == 'asf':
+            playback_duration, timeout = _transcode_wmv(
+                item, executable, max_seconds, time.monotonic() + timeout, max_playback_bytes)
+            # Playback and model PCM must be derived from the exact same file,
+            # including any codec delay or timestamp normalization.
+            source_path, container = item.playback_path, 'mov'
         # Select a single safe demuxer before opening the uploaded data. No concat,
         # HLS, DASH or URL probing; mov external data references default disabled.
         command = [executable, '-hide_banner', '-loglevel', 'error', '-nostdin', '-y', '-xerror',
                    '-protocol_whitelist', 'file,pipe', '-f', container]
         if container == 'mov':
             command += ['-enable_drefs', '0', '-use_absolute_path', '0']
-        command += ['-threads', '1', '-i', str(item.raw_path), '-map', '0:a:0', '-vn', '-sn', '-dn',
+        command += ['-threads', '1', '-i', str(source_path), '-map', '0:a:0', '-vn', '-sn', '-dn',
                    '-filter_threads', '1',
                    '-af', 'aresample=async=1:first_pts=0', '-ac', '1', '-ar', str(RATE),
                    '-t', str(max_seconds + 1), '-fs', str((limit + 1) * 2),
@@ -190,7 +311,10 @@ def decode_upload(item, max_seconds, timeout=1800, *, ffmpeg=None):
         raise MediaError('empty_audio', 'The uploaded file contains no usable audio.', 422)
     if length // 2 > limit:
         raise MediaError('media_duration', f'File exceeds the {max_seconds:g}-second session limit. Choose a shorter segment or increase --max-session-seconds.')
+    if playback_duration is not None and abs(playback_duration - length / (2 * RATE)) > .5:
+        raise MediaError('media_timeline', 'WMV video and audio durations differ by more than 0.5 seconds. Trim or repair the original file; no content was silently dropped or padded.', 422)
     item.samples = length // 2
+    item.transcoded = playback_duration is not None
     return item.samples
 
 

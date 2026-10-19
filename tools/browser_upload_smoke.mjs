@@ -180,9 +180,11 @@ async function openPage(origin, secure) {
     'The server already has an active session; use an isolated mock for this test.');
   assert.equal(configuration.file_mode, 'uploaded', 'Server does not support uploaded files.');
   const capabilities = await page.evaluate(() => ({ secure: window.isSecureContext,
-    getUserMedia: Boolean(navigator.mediaDevices?.getUserMedia) }));
+    getUserMedia: Boolean(navigator.mediaDevices?.getUserMedia),
+    getDisplayMedia: Boolean(navigator.mediaDevices?.getDisplayMedia) }));
   assert.equal(capabilities.secure, secure, `Unexpected secure-context classification for ${origin}.`);
   if (!secure) assert.equal(capabilities.getUserMedia, false, 'HTTP test unexpectedly exposes microphone capture.');
+  if (!secure) assert.equal(capabilities.getDisplayMedia, false, 'HTTP test unexpectedly exposes display capture.');
   await page.locator('#settings summary').click();
   await page.locator('#chunkSeconds').selectOption('1');
   if (configuration.auth_required) {
@@ -397,22 +399,22 @@ async function runFileTest({ secure = false, pause = false, immediateFinish = fa
   } finally { await test.context.close(); }
 }
 
-async function runHttpMicrophoneTest() {
+async function runHttpSystemAudioTest() {
   const test = await openPage(unsafeOrigin, false);
   try {
     if (await test.page.locator('#micMode').isEnabled()) {
       await test.page.locator('#micMode').click();
       if (await test.page.locator('#startButton').isEnabled()) await test.page.locator('#startButton').click();
-      await until(async () => /HTTPS|安全上下文|localhost/.test(await visibleError(test.page)), 'HTTP microphone explanation');
+      await until(async () => /HTTPS|安全上下文|localhost/.test(await visibleError(test.page)), 'HTTP computer-audio explanation');
     } else {
       const text = await test.page.locator('#micMode').getAttribute('title') || await test.page.locator('#micDescription').textContent();
-      assert(/HTTPS|安全上下文|localhost/.test(text), 'Disabled microphone must explain the secure-context requirement.');
+      assert(/HTTPS|安全上下文|localhost/.test(text), 'Disabled computer audio must explain the secure-context requirement.');
     }
-    assert.equal(test.wire.length, 0, 'Insecure microphone mode started a model session.');
-    assert.equal(test.uploads.length, 0, 'Microphone mode unexpectedly uploaded a file.');
+    assert.equal(test.wire.length, 0, 'Insecure computer-audio mode started a model session.');
+    assert.equal(test.uploads.length, 0, 'Computer-audio mode unexpectedly uploaded a file.');
     assert.deepEqual(test.pageErrors, []);
-    reports.push({ test: 'HTTP microphone rejected without model session', secure: false });
-    console.log('PASS HTTP microphone rejected without model session');
+    reports.push({ test: 'HTTP computer audio rejected without model session', secure: false });
+    console.log('PASS HTTP computer audio rejected without model session');
   } finally { await test.context.close(); }
 }
 
@@ -501,7 +503,7 @@ try {
   browser = await chromium.launch({ headless: true,
     ...(process.env.FLEX_BROWSER_EXECUTABLE ? { executablePath: process.env.FLEX_BROWSER_EXECUTABLE } : {}),
     args: ['--host-resolver-rules=MAP flex-http.test 127.0.0.1', '--no-proxy-server'] });
-  await runHttpMicrophoneTest();
+  await runHttpSystemAudioTest();
   await runUploadErrorTests();
   await runUploadCancelTest();
   await runFileTest({ pause: true });

@@ -2,7 +2,9 @@
 /** Real Chromium UI checks using synthetic WebSocket events, not model output.
  * Serve the real application with a local mock backend, then run:
  * node tools/browser_runtime_smoke.mjs --base-url http://127.0.0.1:31223
- * The WebSocket is intercepted: no GPU, physical microphone or real speech.
+ * WebSocket and getDisplayMedia are intercepted: no GPU, real system audio,
+ * physical microphone, screen capture or real speech. Audio is an oscillator;
+ * the required display track is generated from a local synthetic canvas.
  * Covers full transcript retention/scrolling and WAIT versus runtime health.
  */
 import assert from 'node:assert/strict';
@@ -39,10 +41,35 @@ function output(delta,tag='DIRECT'){
 try {
   browser=await chromium.launch({headless:true,
     ...(process.env.FLEX_BROWSER_EXECUTABLE?{executablePath:process.env.FLEX_BROWSER_EXECUTABLE}:{}),
-    args:['--use-fake-device-for-media-stream','--no-proxy-server']});
-  const context=await browser.newContext({permissions:['microphone'],viewport:{width:1366,height:768}});
+    args:['--no-proxy-server']});
+  const context=await browser.newContext({viewport:{width:1366,height:768}});
   const page=await context.newPage();
   page.on('pageerror',error=>errors.push(String(error)));
+  await page.addInitScript(()=>{
+    window.__runtimeAudioTracks=[];window.__runtimeAudioSources=[];
+    window.__runtimeMicCalls=0;window.__runtimeDisplayCalls=0;
+    navigator.mediaDevices.getUserMedia=()=>{
+      window.__runtimeMicCalls++;
+      return Promise.reject(new Error('Runtime test must not request a microphone.'));
+    };
+    navigator.mediaDevices.getDisplayMedia=()=>{
+      window.__runtimeDisplayCalls++;
+      const audio=new AudioContext(),oscillator=audio.createOscillator();
+      const destination=audio.createMediaStreamDestination();
+      oscillator.connect(destination);oscillator.start();void audio.resume();
+      const canvas=document.createElement('canvas');canvas.width=16;canvas.height=16;
+      canvas.getContext('2d').fillRect(0,0,16,16);
+      const video=canvas.captureStream(1);
+      const tracks=[...video.getTracks(),...destination.stream.getAudioTracks()];
+      for(const track of tracks){
+        const stop=track.stop.bind(track);
+        track.stop=()=>{stop();if(tracks.every(item=>item.readyState==='ended')){oscillator.stop();void audio.close();}};
+      }
+      window.__runtimeAudioTracks.push(...tracks);
+      window.__runtimeAudioSources.push({audio,oscillator,canvas,video});
+      return Promise.resolve(new MediaStream(tracks));
+    };
+  });
   await page.route('**/api/config',route=>route.fulfill({json:{...config,
     max_sessions:4,active_sessions:0,available_sessions:4,busy:false,engine_health:health}}));
   await page.routeWebSocket('**/ws',socket=>{
@@ -50,8 +77,11 @@ try {
     socket.onMessage(message=>{
       if(typeof message!=='string'){received += Math.max(0,(message.byteLength-8)/2);return;}
       const event=JSON.parse(message);controls.push(event.type);
-      if(event.type==='start')send({type:'ready',sample_rate:16000,engine_health:health,
-        max_sessions:4,active_sessions:1,available_sessions:3,busy:false,results_available:false});
+      if(event.type==='start'){
+        assert.equal(event.source_kind,'system');assert.equal(event.include_microphone,false);
+        send({type:'ready',sample_rate:16000,engine_health:health,
+          max_sessions:4,active_sessions:1,available_sessions:3,busy:false,results_available:false});
+      }
       if(event.type==='finish')send({type:'done',reason:'finished',engine_health:health,
         turn_count:turn,translation_chars:chars,processed_audio_s:received/16000});
     });
@@ -107,6 +137,8 @@ try {
   health={state:'ready',accepting:true,running_seconds:0,queued_requests:0,message:''};
   await page.waitForFunction(()=>!document.getElementById('startButton').disabled,undefined,{timeout:10000});
   assert.equal(await page.locator('#transcript').textContent(),deltas.join(''));
+  assert.deepEqual(await page.evaluate(()=>({display:__runtimeDisplayCalls,microphone:__runtimeMicCalls,
+    tracks:__runtimeAudioTracks.map(track=>track.readyState)})),{display:1,microphone:0,tracks:['ended','ended']});
   assert.equal(errors.length,0,errors.join('\n'));
   console.log('PASS recovery re-enables new sessions and retains all previous text; no browser exceptions.');
   console.log('5 runtime UI checks passed (synthetic protocol events, no model accuracy/throughput claim).');

@@ -1,7 +1,10 @@
 """CPU-only file storage, decoding and prefix gating regressions."""
 import asyncio
 import io
+import json
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 from types import SimpleNamespace
 import wave
@@ -353,3 +356,127 @@ def test_range_timestamps_remain_exact_across_two_second_chunks_and_tail(store, 
         finally:
             queue.close()
     asyncio.run(scenario())
+
+
+@pytest.fixture
+def real_wmv(tmp_path):
+    executable = shutil.which('ffmpeg')
+    if not executable or not shutil.which('ffprobe'):
+        pytest.skip('Real WMV integration requires FFmpeg and ffprobe')
+    path = tmp_path / 'synthetic.wmv'
+    subprocess.run([executable, '-hide_banner', '-loglevel', 'error', '-nostdin',
+                    '-f', 'lavfi', '-i', 'color=c=blue:s=160x96:r=10:d=1.2',
+                    '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=44100:duration=1.2',
+                    '-c:v', 'wmv2', '-c:a', 'wmav2', '-f', 'asf', str(path)],
+                   check=True, timeout=30)
+    return path
+
+
+def test_real_wmv_transcodes_same_playback_timeline_to_pcm(store, real_wmv):
+    item = store.reserve('synthetic.wmv')
+    original = real_wmv.read_bytes()
+    item.raw_path.write_bytes(original)
+    assert media._container(item.raw_path) == 'asf'
+    media.decode_upload(item, 3, timeout=30)
+    assert item.raw_path.read_bytes() == original
+    assert item.transcoded and item.samples > 0
+    assert media._container(item.playback_path) == 'mov'
+    public = item.public()
+    assert public['playback_url'] == f'/api/media/{item.media_id}/playback'
+    assert public['playback_type'] == 'video/mp4' and public['transcoded']
+    assert item.playback_secret not in json.dumps(public)
+    expected = item.directory / 'independent.pcm'
+    subprocess.run([shutil.which('ffmpeg'), '-hide_banner', '-loglevel', 'error', '-nostdin',
+                    '-i', str(item.playback_path), '-map', '0:a:0', '-vn',
+                    '-af', 'aresample=async=1:first_pts=0', '-ac', '1', '-ar', '16000',
+                    '-f', 's16le', '-acodec', 'pcm_s16le', str(expected)], check=True, timeout=30)
+    assert expected.read_bytes() == item.pcm_path.read_bytes()
+
+
+def test_real_wmv_duration_limit_is_not_silently_truncated(store, real_wmv):
+    item = store.reserve('synthetic.wmv')
+    item.raw_path.write_bytes(real_wmv.read_bytes())
+    with pytest.raises(media.MediaError) as error:
+        media.decode_upload(item, .5, timeout=30)
+    assert error.value.code == 'media_duration'
+    assert not item.transcoded and not item.samples
+
+
+def _fake_wmv(store, monkeypatch):
+    item = store.reserve('test.wmv')
+    item.raw_path.write_bytes(bytes.fromhex('3026b2758e66cf11a6d900aa0062ce6c') + b'\0' * 32)
+    monkeypatch.setattr(media.shutil, 'which', lambda name: '/usr/bin/' + str(name))
+    return item
+
+
+def test_wmv_missing_encoder_is_actionable(store, monkeypatch):
+    item = _fake_wmv(store, monkeypatch)
+    def rejected(args, **kwargs):
+        assert 'libx264' in args and '-n' in args and '-shortest' not in args
+        assert args[args.index('-f') + 1] == 'asf'
+        assert args[args.index('-protocol_whitelist') + 1] == 'file,pipe'
+        kwargs['stderr'].write(b"Unknown encoder 'libx264'")
+        return SimpleNamespace(returncode=1)
+    monkeypatch.setattr(media.subprocess, 'run', rejected)
+    with pytest.raises(media.MediaError) as error:
+        media.decode_upload(item, 3)
+    assert error.value.code == 'transcode_encoder' and 'libx264' in str(error.value)
+    assert not item.transcoded
+
+
+def test_wmv_timeout_and_disk_budget_are_explicit(store, monkeypatch):
+    item = _fake_wmv(store, monkeypatch)
+    def oversized(args, **kwargs):
+        assert args[args.index('-fs') + 1] == '1024'
+        assert 0 < kwargs['timeout'] <= 7
+        item.playback_path.write_bytes(b'\0' * 1024)
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(media.subprocess, 'run', oversized)
+    with pytest.raises(media.MediaError) as error:
+        media.decode_upload(item, 3, timeout=7, max_playback_bytes=1024)
+    assert error.value.code == 'playback_size'
+    def timed_out(args, **kwargs):
+        raise subprocess.TimeoutExpired(args, kwargs['timeout'])
+    monkeypatch.setattr(media.subprocess, 'run', timed_out)
+    with pytest.raises(media.MediaError) as error:
+        media.decode_upload(item, 3, timeout=7)
+    assert error.value.code == 'decode_timeout'
+
+
+def test_wmv_probe_required_and_bad_timeline_rejected(store, monkeypatch):
+    item = _fake_wmv(store, monkeypatch)
+    monkeypatch.setattr(media.shutil, 'which', lambda name: None if name == 'ffprobe' else '/absent/ffmpeg')
+    with pytest.raises(media.MediaError) as error:
+        media.decode_upload(item, 3)
+    assert error.value.code == 'ffprobe_missing'
+    monkeypatch.setattr(media.shutil, 'which', lambda name: '/usr/bin/' + str(name))
+    def prepared(args, **kwargs):
+        if '-show_entries' in args:
+            kwargs['stdout'].write(json.dumps(dict(format=dict(duration='2.0'), streams=[
+                dict(codec_type='video', codec_name='h264'), dict(codec_type='audio', codec_name='aac')])).encode())
+        elif 'libx264' in args:
+            item.playback_path.write_bytes(b'mp4')
+        else:
+            assert args[args.index('-i') + 1] == str(item.playback_path)
+            item.pcm_path.write_bytes(b'\0\0' * media.RATE)
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(media.subprocess, 'run', prepared)
+    with pytest.raises(media.MediaError) as error:
+        media.decode_upload(item, 3)
+    assert error.value.code == 'media_timeline' and not item.transcoded
+
+
+def test_playback_readers_defer_cleanup_without_accepting_new_claims(store):
+    item = make_upload(store, np.zeros(16000))
+    item.transcoded = True
+    item.playback_path.write_bytes(b'video')
+    handle = store.open_playback(item)
+    store.discard(item.media_id)
+    assert item.directory.exists() and handle.read() == b'video'
+    with pytest.raises(media.MediaError) as error:
+        store.playback(item.media_id)
+    assert error.value.code == 'media_missing'
+    with pytest.raises(media.MediaError):
+        store.claim(item.media_id)
+    store.close_playback(item, handle)
+    assert not item.directory.exists() and item.media_id not in store.uploads

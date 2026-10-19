@@ -38,6 +38,8 @@ jobs:
         run: node static/test_file_playback.mjs
       - name: Test full-session transcript, runtime state and exports
         run: node static/test_long_session.mjs
+      - name: Test system-audio permissions and lifecycle
+        run: node static/test_system_audio.mjs
       - name: Check command-line entry point
         run: |
           python run.py --help

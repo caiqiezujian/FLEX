@@ -23,6 +23,7 @@ node static/test_pcm.mjs
 node static/test_capture.mjs
 node static/test_file_playback.mjs
 node static/test_long_session.mjs
+node static/test_system_audio.mjs
 python run.py --help
 python infer_audio.py --help
 git diff --check
@@ -37,7 +38,9 @@ Python 测试不加载 checkpoint，不要求 GPU；`tests/test_infer_audio.py` 
 3. 确认正文只有新增译文，WAIT 不追加内容，FLEX/DIRECT 标签保留在时间线。
 4. 检查 TXT / JSON 导出、双向切换与小屏布局。
 5. 改动模型接口后，在真实 checkpoint 上分别验证中→英、英→中。
-6. HTTP 文件模式必须在真实非安全 origin 下验证，例如测试域名通过浏览器 host-resolver 映射本机；不能仅用 localhost（它是可信例外），也不能通过关闭浏览器安全检查伪装通过。同时确认 HTTP 麦克风被单独阻止。
+6. HTTP 文件模式必须在真实非安全 origin 下验证，例如测试域名通过浏览器 host-resolver 映射本机；不能仅用 localhost（它是可信例外），也不能通过关闭浏览器安全检查伪装通过。同时确认 HTTP 电脑声音采集被单独阻止。
+7. WMV 使用合成媒体验证真实 FFmpeg 转码、MP4 播放、Range/可选认证、暂停/结束/重播与清理；不得只把容器白名单放行当作完整支持。
+8. 电脑声音测试不得无提示采集开发者屏幕或物理麦克风。Node 使用 fake media API；浏览器测试使用合成音轨和明确的 getDisplayMedia 替身，验证真实 AudioWorklet/PCM/WS，不得将它宣称为目标系统共享授权或实际扬声器采集验收。
 
 请在变更说明中区分“自动化测试通过”“浏览器 mock 验证”和“真实 GPU 验证”，不要将它们混写成模型效果证明。
 
@@ -59,7 +62,9 @@ node tools/browser_upload_smoke.mjs --base-url http://127.0.0.1:8000
 
 全文显示与运行状态回归：运行 `node tools/browser_runtime_smoke.mjs --base-url http://127.0.0.1:8000`。在真实浏览器中注入合成 WebSocket 事件，检查超过原显示上限后的全文、手动滚动/跟随、连续 WAIT、变慢/疑似停滞/故障及恢复。它验证的是页面对状态的处理，不是实际 GPU 故障检测或性能；真实服务端状态机另由 Python 的 `tests/test_runtime_health.py` 和调度器测试覆盖。
 
-### HTTPS 麦克风与上传回归
+电脑声音与 WMV 回归：在独立本地 mock 服务运行 `node tools/browser_media_sources_smoke.mjs --base-url http://127.0.0.1:8000 --screenshots`。需要本机 FFmpeg；脚本生成合成 WMV，验证真实转码、原生视频播放、完整文件推理与重播。声音授权使用合成音轨/视频轨替身，检查延迟选择授权、再次开始、可选讲话混音、拒绝/无音轨/取消及停止共享后的尾块；不读取真实电脑声音或屏幕。共享 API 由替身提供，不等于验证操作系统的共享选择器。该套件不设置自动播放豁免，localhost 本身属于可信上下文；生产采集仍需受信任 HTTPS。可选认证测试需在终端设置与 mock 服务一致的 `FLEX_ACCESS_TOKEN`。
+
+### HTTPS 电脑声音与上传回归
 
 ```bash
 python run.py --backend mock --host 127.0.0.1 --port 31220 \
@@ -69,7 +74,7 @@ node tools/browser_https_smoke.mjs --base-url https://localhost:31220 \
   --ca-cert certs/root-ca.crt --certfile certs/server.crt
 ```
 
-只连接本地 mock，不访问物理麦克风、不加载 GPU 模型。Node 使用指定根 CA 验证 TLS 链、主机名和实际叶证书；隔离的测试浏览器仅为该叶证书公钥设置 SPKI 例外，使用浏览器合成麦克风执行真实 AudioWorklet → WSS → 协议响应 → 停止释放设备，再验证 HTTPS 文件上传与固定切块。没有全局关闭证书校验，没有修改电脑根证书存储；这不等于已经验证了用户电脑的系统证书导入。生产使用者应按 README 正常信任专用根 CA。
+只连接本地 mock，不访问物理麦克风、屏幕或系统音频，不加载 GPU 模型。Node 使用指定根 CA 验证 TLS 链、主机名和实际叶证书；隔离的测试浏览器仅为该叶证书公钥设置 SPKI 例外，使用合成 oscillator 音轨和 canvas 视频轨替代 getDisplayMedia 返回值，执行真实 AudioWorklet → WSS → 协议响应 → 停止释放轨道，再验证 HTTPS 文件上传与固定切块。没有全局关闭证书校验，没有修改电脑根证书存储；这不等于已经验证了用户电脑的共享选择器或系统证书导入。生产使用者应按 README 正常信任专用根 CA。
 
 Python TLS 测试另行覆盖真实 OpenSSL 生成、SAN、可信/不可信握手、重启复用、换 IP 和到期续签、不完整 CA 拒绝；无 OpenSSL 的环境会跳过涉及生成的部分，发布时应确认这些测试实际执行。
 
@@ -78,6 +83,8 @@ Python TLS 测试另行覆盖真实 OpenSSL 生成、SAN、可信/不可信握�
 - 译文 append-only：不修改、去重改写或替换已提交的内容。
 - WAIT 是模型策略，不是错误兜底，不自动重放同一段音频。
 - 原始协议响应进入历史；前端显示纯译文不能改变模型历史。
+- 电脑声音授权必须从用户点击同步发起，不等待网络后调用；仅传音频不传屏幕，麦克风默认关闭且无静默回退。取消/失败/晚到授权/浏览器停止共享必须释放所有 tracks；没有音轨不允许假装已开始。
+- WMV 播放与模型 PCM 必须来自同一份转码 MP4，不通过静默截短媒体修复时长问题。临时视频从同源 Range 接口流式播放，可选认证不放 token URL，不下载整份视频到 Blob。
 - 共享模型只由一个线程调用，支持一批多个独立会话请求；每会话最多一个待执行/在途轮次，不能由多个线程并发调用同一个 LLM。取消/断连时排队任务可移除，在途批次返回前不能释放该会话名额。
 - 默认四路接入，第五路满员拒绝；四路音频、方向、历史、滚动、字幕和导出必须隔离，一路普通协议失败不能停止其他路。
 - 队列、上下文与会话长度都有明确上限；滚动只能按完整音频+响应轮次、保留 system，成功 commit 才应用，并记录统计。不能静默丢输入帧或根据 DIRECT 清空历史。

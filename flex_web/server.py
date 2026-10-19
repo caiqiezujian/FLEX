@@ -27,7 +27,7 @@ import uuid
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
 
@@ -248,8 +248,15 @@ def validate_start(data, settings):
         raise ClientError('bad_start', 'Invalid chunk duration or media offset.')
     if not isinstance(data.get('adaptive', True), bool):
         raise ClientError('bad_start', 'adaptive must be a boolean.')
-    if data.get('source_kind') not in ('file', 'microphone'):
-        raise ClientError('bad_start', 'source_kind must be file or microphone.')
+    if data.get('source_kind') not in ('file', 'microphone', 'system'):
+        raise ClientError('bad_start', 'source_kind must be file, system or microphone.')
+    include_microphone = data.get('include_microphone', False)
+    if not isinstance(include_microphone, bool):
+        raise ClientError('bad_start', 'include_microphone must be a boolean.')
+    if include_microphone and data['source_kind'] != 'system':
+        raise ClientError('bad_start', 'include_microphone is only supported with system audio.')
+    if data['source_kind'] == 'system' and offset != 0:
+        raise ClientError('bad_start', 'System audio starts at sample zero, without a file offset.')
     media_id = data.get('media_id')
     if media_id is not None and (data['source_kind'] != 'file' or not isinstance(media_id, str)
                                  or len(media_id) != 32 or any(c not in '0123456789abcdef' for c in media_id)):
@@ -257,7 +264,8 @@ def validate_start(data, settings):
     return dict(source_lang=source, target_lang=target, chunk_seconds=chunk,
                 adaptive=data.get('adaptive', True), source_kind=data['source_kind'],
                 source_name=str(data.get('source_name', ''))[:256], media_offset_s=offset,
-                media_id=media_id)
+                media_id=media_id,
+                **({'include_microphone': include_microphone} if data['source_kind'] == 'system' else {}))
 
 
 def origin_allowed(ws, settings):
@@ -273,6 +281,19 @@ def origin_allowed(ws, settings):
     # Browser default: same host AND matching transport security, not arbitrary CORS.
     scheme = 'https' if ws.url.scheme in ('wss', 'https') else 'http'
     return parsed.scheme == scheme and parsed.netloc == ws.headers.get('host') and not parsed.path
+
+
+class PlaybackResponse(StreamingResponse):
+    """Release a media reader even if ASGI fails before iterating the body."""
+    def __init__(self, *args, release, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.release = release
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self.release()
 
 
 def create_app(settings=None):
@@ -347,7 +368,7 @@ def create_app(settings=None):
         response = await call_next(request)
         response.headers['X-Content-Type-Options'] = 'nosniff'
         response.headers['Referrer-Policy'] = 'same-origin'
-        response.headers['Permissions-Policy'] = 'microphone=(self), camera=()'
+        response.headers['Permissions-Policy'] = 'microphone=(self), display-capture=(self), camera=()'
         response.headers['Content-Security-Policy'] = (
             "default-src 'self'; script-src 'self'; style-src 'self'; "
             "connect-src 'self' ws: wss:; media-src 'self' blob:; img-src 'self' data:; "
@@ -362,7 +383,8 @@ def create_app(settings=None):
                     chunk_seconds=settings.chunk_seconds, max_chunk_seconds=settings.max_chunk_seconds,
                     max_pending_seconds=settings.max_pending_seconds,
                     max_session_seconds=settings.max_session_seconds, auth_required=bool(settings.token),
-                    file_mode='uploaded', max_upload_bytes=settings.max_upload_bytes,
+                    file_mode='uploaded', input_sources=('file', 'system'),
+                    max_upload_bytes=settings.max_upload_bytes,
                     result_retention_hours=settings.result_retention_hours,
                     context_policy=app.state.model_options.context_policy,
                     history_window_seconds=app.state.model_options.history_window_seconds,
@@ -410,19 +432,38 @@ def create_app(settings=None):
             decode_future = asyncio.get_running_loop().run_in_executor(
                 app.state.media_executor, functools.partial(
                     decode_upload, item, settings.max_session_seconds,
-                    timeout=settings.decode_timeout_seconds, ffmpeg=settings.ffmpeg))
+                    timeout=settings.decode_timeout_seconds, ffmpeg=settings.ffmpeg,
+                    max_playback_bytes=settings.max_upload_bytes))
             try:
                 await asyncio.shield(decode_future)
             except asyncio.CancelledError:
                 # Do not delete an input while its decoding worker still owns it.
-                with suppress(Exception):
-                    await asyncio.shield(decode_future)
+                # A server shutdown/disconnect can cancel the HTTP handler more
+                # than once. Every cancellation must retain the same real worker,
+                # rather than allowing a second cancel to jump to directory cleanup.
+                while not decode_future.done():
+                    try:
+                        await asyncio.shield(decode_future)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break  # The worker has finished with a decoding error.
+                with suppress(Exception, asyncio.CancelledError):
+                    decode_future.result()  # Consume worker failure; cancellation wins.
                 raise
             item.ready = True
             item.created = time.monotonic()
-            item.raw_path.unlink()  # Keep only bounded decoded audio for playback.
+            item.raw_path.unlink()  # Keep PCM and, for WMV, a bounded browser-playable MP4.
             succeeded = True
-            return item.public()
+            response = JSONResponse(item.public())
+            if item.transcoded and settings.token:
+                # HTML video cannot attach a Bearer header. Grant only this
+                # file's playback path, never expose the service token in URLs.
+                response.set_cookie('FLEX_MEDIA_PLAYBACK', item.playback_secret,
+                                    path=f'/api/media/{item.media_id}/playback',
+                                    max_age=math.ceil(settings.max_session_seconds + app.state.media.ttl_seconds),
+                                    httponly=True, samesite='strict', secure=request.url.scheme == 'https')
+            return response
         except MediaError as exc:
             raise HTTPException(exc.status, detail=dict(code=exc.code, message=str(exc))) from exc
         except (asyncio.TimeoutError, TimeoutError) as exc:
@@ -441,6 +482,74 @@ def create_app(settings=None):
         except MediaError as exc:
             raise HTTPException(exc.status, detail=dict(code=exc.code, message=str(exc))) from exc
         return dict(deleted=True)
+
+    @app.api_route('/api/media/{media_id}/playback', methods=['GET', 'HEAD'])
+    async def playback_media(media_id: str, request: Request):
+        # No cross-site embedding, even on tokenless trusted intranet deployments.
+        if (not origin_allowed(request, settings)
+                or request.headers.get('sec-fetch-site') in ('cross-site', 'same-site')):
+            raise HTTPException(403, detail=dict(code='origin', message='Cross-origin media playback is not allowed.'))
+        try:
+            item = app.state.media.playback(media_id)
+        except MediaError as exc:
+            raise HTTPException(exc.status, detail=dict(code=exc.code, message=str(exc))) from exc
+        bearer = request.headers.get('authorization', '')
+        cookie = request.cookies.get('FLEX_MEDIA_PLAYBACK', '')
+        if settings.token and not (
+                hmac.compare_digest(bearer.encode('utf-8'), f'Bearer {settings.token}'.encode('utf-8'))
+                or hmac.compare_digest(cookie.encode('utf-8'), item.playback_secret.encode('utf-8'))):
+            raise HTTPException(401, detail=dict(code='unauthorized', message='Upload this file in the current browser before playing it.'))
+        handle = None
+        try:
+            size = item.playback_path.stat().st_size
+            etag = f'"flex-{item.media_id}-{size}"'
+            response_headers = {'Accept-Ranges': 'bytes', 'ETag': etag}
+            first, last, status_code = 0, size - 1, 200
+            requested = request.headers.get('range', '') if request.method == 'GET' else ''
+            if requested and request.headers.get('if-range', etag) == etag:
+                try:
+                    unit, _, interval = requested.partition('=')
+                    if unit != 'bytes' or ',' in interval or '-' not in interval:
+                        raise ValueError('Only a single bytes range is supported.')
+                    left, right = interval.split('-', 1)
+                    if left:
+                        if not left.isdecimal() or (right and not right.isdecimal()):
+                            raise ValueError('Invalid byte range.')
+                        first, last = int(left), min(int(right) if right else size - 1, size - 1)
+                    else:
+                        if not right.isdecimal() or int(right) <= 0:
+                            raise ValueError('Invalid suffix range.')
+                        first, last = max(0, size - int(right)), size - 1
+                    if first >= size or first < 0 or last < first:
+                        raise ValueError('Byte range is outside the file.')
+                except ValueError:
+                    return Response(status_code=416, headers={**response_headers, 'Content-Range': f'bytes */{size}'})
+                status_code = 206
+                response_headers['Content-Range'] = f'bytes {first}-{last}/{size}'
+            response_headers['Content-Length'] = str(last - first + 1)
+            if request.method == 'HEAD':
+                return Response(status_code=200, media_type='video/mp4', headers=response_headers)
+            handle = app.state.media.open_playback(item)
+            handle.seek(first)
+        except OSError as exc:
+            if handle is not None:
+                app.state.media.close_playback(item, handle)
+            raise HTTPException(404, detail=dict(code='media_missing', message='Temporary playback file is unavailable. Upload it again.')) from exc
+
+        def close_reader():
+            app.state.media.close_playback(item, handle)
+
+        async def chunks():
+            remaining = last - first + 1
+            while remaining:
+                block = handle.read(min(128 * 1024, remaining))
+                if not block:
+                    raise OSError('Playback file ended before the requested range.')
+                remaining -= len(block)
+                yield block
+
+        return PlaybackResponse(chunks(), status_code=status_code, media_type='video/mp4',
+                                headers=response_headers, release=close_reader)
 
     @app.get('/api/health')
     async def health():

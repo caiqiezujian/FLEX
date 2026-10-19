@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Local HTTPS + WSS integration, with a synthetic browser microphone and WAV.
+ * Local HTTPS + WSS integration, with synthetic computer audio and WAV.
  *
  * python run.py --backend mock --host 127.0.0.1 --port 31220 \
  *   --https-host localhost --cert-dir /tmp/flex-test-tls --no-log
@@ -10,7 +10,8 @@
  * Node verifies TLS with the explicitly supplied CA. Chromium is given an
  * isolated-profile, exact-leaf-public-key exception, NOT a global certificate
  * bypass or an insecure-origin exemption. No OS/browser trust store is changed.
- * Fake capture is used exclusively; no physical microphone or GPU is accessed.
+ * getDisplayMedia is explicitly mocked with oscillator audio and canvas video;
+ * no physical microphone, screen capture, system audio or GPU is accessed.
  */
 import assert from 'node:assert/strict';
 import { createHash, X509Certificate } from 'node:crypto';
@@ -105,7 +106,6 @@ async function until(test, predicate, description) {
 
 async function openPage() {
   const context = await browser.newContext();
-  await context.grantPermissions(['microphone'], { origin: base.origin });
   const page = await context.newPage(), test = { context, page, wires: [], errors: [], uploads: [] };
   page.on('pageerror', error => test.errors.push(String(error)));
   page.on('response', response => {
@@ -125,11 +125,34 @@ async function openPage() {
   await page.addInitScript(() => {
     window.__flexHttpsTracks = [];
     window.__flexHttpsWorklets = 0;
-    const getUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
-    navigator.mediaDevices.getUserMedia = async constraints => {
-      const stream = await getUserMedia(constraints);
-      window.__flexHttpsTracks.push(...stream.getTracks());
-      return stream;
+    window.__flexHttpsDisplayCalls = 0;
+    window.__flexHttpsMicCalls = 0;
+    window.__flexHttpsSources = [];
+    navigator.mediaDevices.getUserMedia = () => {
+      window.__flexHttpsMicCalls++;
+      return Promise.reject(new Error('Test must not request a microphone.'));
+    };
+    navigator.mediaDevices.getDisplayMedia = () => {
+      window.__flexHttpsDisplayCalls++;
+      const audio = new AudioContext(), oscillator = audio.createOscillator();
+      const destination = audio.createMediaStreamDestination();
+      oscillator.connect(destination);oscillator.start();void audio.resume();
+      const canvas = document.createElement('canvas');canvas.width=16;canvas.height=16;
+      canvas.getContext('2d').fillRect(0,0,16,16);
+      const video = canvas.captureStream(1);
+      const tracks = [...video.getTracks(),...destination.stream.getAudioTracks()];
+      for (const track of tracks) {
+        const stop = track.stop.bind(track);
+        track.stop = () => {
+          stop();
+          if (tracks.every(item => item.readyState === 'ended')) {
+            oscillator.stop();void audio.close();
+          }
+        };
+      }
+      window.__flexHttpsTracks.push(...tracks);
+      window.__flexHttpsSources.push({audio,oscillator,canvas,video});
+      return Promise.resolve(new MediaStream(tracks));
     };
     window.AudioWorkletNode = new Proxy(window.AudioWorkletNode, {
       construct(target, args, newTarget) {
@@ -140,8 +163,8 @@ async function openPage() {
   });
   await page.goto(base.origin, { waitUntil: 'networkidle' });
   await page.waitForFunction(() => document.getElementById('serverStatus').classList.contains('ready'));
-  assert.deepEqual(await page.evaluate(() => ({ secure: isSecureContext, mic: typeof navigator.mediaDevices?.getUserMedia, worklet: typeof AudioWorkletNode })),
-    { secure: true, mic: 'function', worklet: 'function' });
+  assert.deepEqual(await page.evaluate(() => ({ secure: isSecureContext, display: typeof navigator.mediaDevices?.getDisplayMedia, worklet: typeof AudioWorkletNode })),
+    { secure: true, display: 'function', worklet: 'function' });
   return test;
 }
 
@@ -173,17 +196,18 @@ async function finished(test, name) {
 try {
   browser = await chromium.launch({ headless: true,
     ...(process.env.FLEX_BROWSER_EXECUTABLE ? { executablePath: process.env.FLEX_BROWSER_EXECUTABLE } : {}),
-    args: [`--ignore-certificate-errors-spki-list=${spki}`, '--use-fake-device-for-media-stream', '--no-proxy-server'],
+    args: [`--ignore-certificate-errors-spki-list=${spki}`, '--no-proxy-server'],
   });
   const mic = await openPage();
   try {
     await mic.page.locator('#micMode').click();
     await mic.page.locator('#startButton').click();
-    await until(mic, () => mic.wires[0]?.received.filter(event => event.type === 'turn').length >= 3, 'three synthetic microphone turns');
+    await until(mic, () => mic.wires[0]?.received.filter(event => event.type === 'turn').length >= 3, 'three synthetic computer audio turns');
     await mic.page.locator('#finishButton').click();
-    const { wire, done } = await finished(mic, 'synthetic microphone');
-    assert.equal(wire.sent.find(event => event.type === 'start').source_kind, 'microphone');
-    assert(wire.binary.length > 0, 'Microphone sent no PCM packets.');
+    const { wire, done } = await finished(mic, 'synthetic computer audio');
+    assert.equal(wire.sent.find(event => event.type === 'start').source_kind, 'system');
+    assert.equal(wire.sent.find(event => event.type === 'start').include_microphone, false);
+    assert(wire.binary.length > 0, 'Computer audio sent no PCM packets.');
     let samples = 0;
     wire.binary.forEach((packet, i) => {
       assert.equal(packet.sequence, i); assert.equal(packet.start, samples);
@@ -191,9 +215,12 @@ try {
       samples += packet.samples;
     });
     assert.equal(done.received_audio_s, samples / rate);
-    const capture = await mic.page.evaluate(() => ({ worklets: __flexHttpsWorklets, tracks: __flexHttpsTracks.map(track => track.readyState) }));
+    const capture = await mic.page.evaluate(() => ({ worklets: __flexHttpsWorklets,
+      displayCalls:__flexHttpsDisplayCalls,micCalls:__flexHttpsMicCalls,
+      tracks: __flexHttpsTracks.map(track => track.readyState) }));
     assert.equal(capture.worklets, 1);
-    assert(capture.tracks.length > 0 && capture.tracks.every(state => state === 'ended'), 'Microphone tracks were not released.');
+    assert.equal(capture.displayCalls,1);assert.equal(capture.micCalls,0);
+    assert(capture.tracks.length === 2 && capture.tracks.every(state => state === 'ended'), 'Synthetic audio and video tracks were not released.');
     assert.equal(mic.uploads.length, 0);
   } finally { await mic.context.close(); }
 

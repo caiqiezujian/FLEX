@@ -136,6 +136,8 @@ class SessionResult:
                                  source_kind=config.get('source_kind'), source_name=config.get('source_name'),
                                  capture_mode='server-file' if config.get('media_id') else 'worklet',
                                  media_offset_s=config.get('media_offset_s', 0), chunk_seconds=config.get('chunk_seconds'))
+            if config.get('source_kind') == 'system':
+                self.metadata['include_microphone'] = config.get('include_microphone', False)
         if event['type'] == 'error':
             self.metadata['error'] = event
         if event['type'] == 'done':

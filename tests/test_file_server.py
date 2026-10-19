@@ -1,13 +1,14 @@
 """Uploaded file HTTP + WebSocket integration; no model/GPU is required."""
 import asyncio
 import json
+from threading import Event
 
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from test_media import wav_bytes
+from test_media import real_wmv, wav_bytes
 from test_server import app_factory, connect_ready, receive_until, start
 
 
@@ -258,3 +259,164 @@ def test_file_disconnect_keeps_resources_until_inflight_model_finishes(app_facto
                 raise AssertionError('admission not released')
             client.portal.call(released)
         assert not directory.exists() and not engine.sessions[0].committed
+
+
+@pytest.mark.parametrize('token', ['', 'synthetic-preview-secret'])
+@pytest.mark.parametrize('secure', [False, True])
+def test_real_wmv_upload_range_and_path_scoped_cookie(app_factory, real_wmv, token, secure):
+    app, engine = app_factory(token=token)
+    origin = f'{"https" if secure else "http"}://testserver'
+    auth = {'Authorization': f'Bearer {token}'} if token else {}
+    with TestClient(app, base_url=origin) as client:
+        response = client.post('/api/media?name=demo.wmv', content=real_wmv.read_bytes(),
+                               headers={**auth, 'Origin': origin})
+        assert response.status_code == 200, response.text
+        item = response.json()
+        assert item['transcoded'] and item['playback_type'] == 'video/mp4'
+        path = item['playback_url']
+        private = app.state.media.uploads[item['media_id']]
+        expected = private.playback_path.read_bytes()
+        assert not private.raw_path.exists()
+        assert not engine.sessions  # Conversion never feeds future audio to the model.
+        if token:
+            cookie = response.headers['set-cookie']
+            assert 'HttpOnly' in cookie and 'SameSite=strict' in cookie
+            assert f'Path={path}' in cookie and ('; Secure' in cookie) is secure
+            assert token not in cookie and private.playback_secret not in json.dumps(item)
+        else:
+            assert 'set-cookie' not in response.headers
+        result = client.get(path, headers={'Range': 'bytes=5-24', 'Sec-Fetch-Site': 'same-origin'})
+        assert result.status_code == 206 and result.content == expected[5:25]
+        assert result.headers['content-range'] == f'bytes 5-24/{len(expected)}'
+        assert result.headers['content-type'] == 'video/mp4'
+        assert result.headers['accept-ranges'] == 'bytes'
+        assert result.headers['content-length'] == '20'
+        assert not private.playback_readers
+        assert client.get(path, headers={'Range': 'bytes=-11'}).content == expected[-11:]
+        assert client.get(path, headers={'Range': f'bytes={len(expected)-11}-'}).content == expected[-11:]
+        head = client.head(path)
+        assert head.status_code == 200 and not head.content
+        assert int(head.headers['content-length']) == len(expected)
+        assert client.get(path, headers={'Range': 'bytes=0-2', 'If-Range': 'different'}).content == expected
+        for byte_range in (f'bytes={len(expected)}-', 'bytes=10-9', 'bytes=-0', 'bytes=0-1,3-4', 'bytes=x-y'):
+            invalid = client.get(path, headers={'Range': byte_range})
+            assert invalid.status_code == 416
+            assert invalid.headers['content-range'] == f'bytes */{len(expected)}'
+        assert client.get(path, headers={'Origin': 'https://attacker.example'}).status_code == 403
+        assert client.get(path, headers={'Sec-Fetch-Site': 'cross-site'}).status_code == 403
+        assert client.get(path, headers={'Sec-Fetch-Site': 'same-site'}).status_code == 403
+        if token:
+            assert client.get(path, headers={'Cookie': 'FLEX_MEDIA_PLAYBACK=wrong'}).status_code == 401
+            # A playback cookie is not authority to delete, upload or export.
+            assert client.delete('/api/media/' + item['media_id']).status_code == 401
+            other = client.post('/api/media', content=real_wmv.read_bytes(), headers=auth).json()
+            assert client.get(other['playback_url'], headers={
+                'Cookie': 'FLEX_MEDIA_PLAYBACK=' + private.playback_secret}).status_code == 401
+            assert client.delete('/api/media/' + other['media_id'], headers=auth).status_code == 200
+        assert client.delete('/api/media/' + item['media_id'], headers=auth).status_code == 200
+        assert not private.directory.exists()
+        assert client.get(path, headers=auth).status_code == 404
+
+
+def test_playback_unknown_unready_and_nontranscoded_files_are_rejected(app_factory):
+    app, _ = app_factory()
+    with TestClient(app) as client:
+        assert client.get('/api/media/unknown/playback').status_code == 404
+        unready = app.state.media.reserve('pending.wmv')
+        assert client.get(f'/api/media/{unready.media_id}/playback').status_code == 409
+        item = upload(client)
+        assert 'playback_url' not in item and 'transcoded' not in item
+        assert client.get(f'/api/media/{item["media_id"]}/playback').status_code == 404
+
+
+def test_wmv_prefix_gating_and_cancel_owns_preview_until_model_returns(app_factory, real_wmv):
+    app, engine = app_factory(engine_options=dict(block=True), max_sessions=1)
+    with TestClient(app) as client:
+        response = client.post('/api/media?name=demo.wmv', content=real_wmv.read_bytes())
+        assert response.status_code == 200, response.text
+        item = response.json()
+        directory = app.state.media.uploads[item['media_id']].directory
+        with client.websocket_connect('/ws') as ws:
+            connect_ready(ws, media_id=item['media_id'])
+            ws.send_json(dict(type='ping'))
+            receive_until(ws, 'pong')
+            assert not engine.sessions[0].generated
+            ws.send_json(dict(type='progress', position_s=1))
+            assert engine.entered.wait(2)
+            ws.send_json(dict(type='cancel'))
+            assert client.get(item['playback_url'], headers={'Range': 'bytes=0-31'}).status_code == 206
+            assert directory.exists() and app.state.active_sessions
+            assert client.delete('/api/media/' + item['media_id']).status_code == 409
+            engine.release.set()
+            events = receive_until(ws, 'done')
+            assert events[-1]['reason'] == 'cancelled'
+            assert not engine.sessions[0].committed
+        assert not directory.exists() and not app.state.media.uploads
+        assert client.get(item['playback_url']).status_code == 404
+
+
+def test_wmv_duration_rejection_cleans_transcoded_files(app_factory, real_wmv):
+    app, engine = app_factory(max_session_seconds=.5)
+    with TestClient(app) as client:
+        response = client.post('/api/media', content=real_wmv.read_bytes())
+        assert response.status_code == 400 and response.json()['detail']['code'] == 'media_duration'
+        assert not app.state.media.uploads and not list(app.state.media.root.iterdir())
+        assert not engine.sessions
+
+
+def test_playback_reader_released_when_transport_fails_before_body():
+    from flex_web.server import PlaybackResponse
+    async def scenario():
+        released = []
+        async def body():
+            raise AssertionError('Body must not be started after response header send fails')
+            yield b'unreachable'
+        async def receive():
+            return {'type': 'http.disconnect'}
+        async def broken_send(message):
+            raise OSError('Connection was closed')
+        response = PlaybackResponse(body(), release=lambda: released.append(True))
+        with pytest.raises(Exception):
+            await response({'type': 'http', 'asgi': {'spec_version': '2.4'}}, receive, broken_send)
+        assert released == [True]
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('cancel_count', [1, 2, 5])
+def test_cancelled_upload_waits_for_decoder_before_removing_inputs(app_factory, monkeypatch, cancel_count):
+    from flex_web import server
+    from starlette.requests import Request
+    entered, release = Event(), Event()
+    active = []
+    def blocked_decode(item, *args, **kwargs):
+        active.append(item)
+        entered.set()
+        assert release.wait(3)
+        assert item.raw_path.exists()  # No unlink while FFmpeg's worker owns it.
+        item.playback_path.write_bytes(b'converted-video')
+        item.pcm_path.write_bytes(b'\0\0' * 160)
+        item.samples, item.transcoded = 160, True
+    monkeypatch.setattr(server, 'decode_upload', blocked_decode)
+    app, _ = app_factory()
+    endpoint = next(route.endpoint for route in app.routes if getattr(route, 'name', '') == 'upload_media')
+    async def scenario():
+        async def receive():
+            return dict(type='http.request', body=b'uploaded-wmv', more_body=False)
+        request = Request(dict(type='http', method='POST', path='/api/media', scheme='http',
+                               server=('testserver', 80), headers=[], query_string=b'name=demo.wmv'), receive)
+        task = asyncio.create_task(endpoint(request))
+        assert await asyncio.to_thread(entered.wait, 2)
+        for _ in range(cancel_count):
+            task.cancel()
+            await asyncio.sleep(.01)
+            assert not task.done() and active[0].directory.exists()
+            assert app.state.media.uploads and not release.is_set()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not active[0].directory.exists() and not app.state.media.uploads
+    with TestClient(app) as client:
+        try:
+            client.portal.call(scenario)
+        finally:
+            release.set()
