@@ -36,7 +36,7 @@ jobs:
         run: node static/test_capture.mjs
       - name: Test uploaded-file playback progress
         run: node static/test_file_playback.mjs
-      - name: Test bounded long-session UI and exports
+      - name: Test full-session transcript, runtime state and exports
         run: node static/test_long_session.mjs
       - name: Check command-line entry point
         run: |

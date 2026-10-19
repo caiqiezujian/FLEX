@@ -8,17 +8,16 @@ const ui = Object.fromEntries([
   'fileMode','micMode','fileArea','micArea','mediaStage','media','audioArtwork','dropZone','fileType','fileName','fileDetails',
   'chooseFile','chooseSubtitle','subtitleName','removeSubtitle','fileInput','subtitleInput','micTitle','micDescription','micMeter',
   'captureDot','sourceClock','clockDescription','targetBadge','exportTxt','exportJson','sessionStatus','latestTag','transcriptViewport',
-  'transcriptEmpty','transcript','historyNotice','translationCount','followButton','turnCount','turnList','startButton','pauseButton','finishButton',
+  'transcriptEmpty','transcript','translationCount','followButton','turnCount','turnList','startButton','pauseButton','finishButton',
   'receivedMetric','pendingMetric','serviceMetric','processedMetric','footerHint'
 ].map(id => [id, $(id)]));
 
 const languageNames = { en: '英语', zh: '中文' };
 const BUSY_STATES = new Set(['connecting','live','paused','draining']);
 const MAX_NETWORK_BUFFER_BYTES = 256 * 1024;
-// The server keeps the full append-only result on disk. The browser is a
-// bounded live view, including when a microphone session lasts for hours.
-const MAX_VISIBLE_FRAGMENTS = 500;
-const MAX_VISIBLE_CHARACTERS = 60000;
+// Keep every received translation delta visible for the entire session.
+// Only the auxiliary research records are bounded; server exports remain
+// authoritative for complete protocol records, including unreceived events.
 const MAX_RECENT_TURNS = 200;
 const MAX_RECENT_RECORD_CHARACTERS = 120000;
 let config = null, mode = 'file', state = 'idle', selectedFile = null;
@@ -28,10 +27,47 @@ let session = null, sessionNumber = 0, followOutput = true, pollTimer = null;
 let currentTranslation = '', turns = [], transcriptFragments = 0, lastMetrics = {};
 let lastExport = null, microphoneAdaptive = ui.adaptive.checked;
 let totalTurns = 0, translationCharacters = 0, recentRecordCharacters = 0, recordsTrimmed = false;
-let visibleFragments = [], transcriptTrimmed = false, windowRollovers = 0, exportInProgress = false;
+let windowRollovers = 0, exportInProgress = false;
+let pageHidden = false, configRefreshFailed = false;
+let configRequest = null;
 
 function busy() { return BUSY_STATES.has(state); }
 function current(s) { return session === s; }
+function capacityFull() {
+  if (!config) return false;
+  if (Number.isInteger(config.max_sessions) && Number.isInteger(config.active_sessions)) return config.active_sessions >= config.max_sessions;
+  return config.busy === true;
+}
+function engineAccepting() {
+  return config?.status === 'ready' && config?.engine_health?.accepting !== false
+    && !['stalled','failed'].includes(config?.engine_health?.state);
+}
+function renderServerStatus() {
+  if (!config) return;
+  const health = config.engine_health;
+  ui.serverStatus.className = `server-status ${['stalled','failed'].includes(health?.state) ? 'error' : health?.state === 'slow' ? 'loading' : config.status}`;
+  let label = config.status === 'ready' ? '服务已就绪' : config.status === 'error' ? '模型加载失败' : '模型加载中';
+  if (config.status === 'ready' && Number.isInteger(config.max_sessions) && Number.isInteger(config.active_sessions)) {
+    label = `使用中 ${config.active_sessions} / ${config.max_sessions}${capacityFull() ? ' · 已满' : ''}`;
+  }
+  if (config.status === 'ready') {
+    if (health?.state === 'failed') label = '模型故障 · 暂停新会话';
+    else if (health?.state === 'stalled') label = '模型长时间无响应 · 暂停新会话';
+    else if (health?.state === 'slow') label = `处理较慢 · ${label}`;
+    else if (health?.accepting === false) label = `暂停新会话 · ${label}`;
+  }
+  if (configRefreshFailed) label += busy() ? ' · 状态暂未刷新' : ' · 正在重连状态';
+  ui.serverStatus.title = typeof health?.message === 'string' ? health.message : '';
+  ui.serverStatus.replaceChildren(document.createElement('i'),document.createTextNode(label));
+}
+function updateCapacity(data) {
+  if (!config) return;
+  let changed = false;
+  for (const key of ['max_sessions','active_sessions','available_sessions','busy','engine_health']) {
+    if (data[key] !== undefined) {config[key] = data[key];changed = true;}
+  }
+  if (changed) {configRefreshFailed = false;renderServerStatus();updateControls();}
+}
 function time(value, tenths = true) {
   const seconds = Math.max(0, Number.isFinite(value) ? value : 0);
   const hours = Math.floor(seconds / 3600), minutes = Math.floor(seconds / 60) % 60;
@@ -55,8 +91,9 @@ function statusLabel(text, kind = '') {
 }
 function updateControls() {
   const active = busy();
-  ui.startButton.disabled = active || !config || config.status !== 'ready' || (mode === 'file' && !selectedFile);
-  ui.startButton.lastChild.textContent = ['done','error'].includes(state) ? '重新开始' : '开始同传';
+  const health = config?.engine_health;
+  ui.startButton.disabled = active || !engineAccepting() || capacityFull() || (mode === 'file' && !selectedFile);
+  ui.startButton.lastChild.textContent = !active && config?.status === 'ready' && !engineAccepting() ? '模型暂不可用' : !active && capacityFull() ? '当前已满' : ['done','error'].includes(state) ? '重新开始' : '开始同传';
   ui.pauseButton.disabled = mode !== 'file' || !['live','paused'].includes(state);
   ui.pauseButton.textContent = state === 'paused' ? '继续播放' : '暂停播放';
   ui.finishButton.disabled = !['connecting','live','paused'].includes(state);
@@ -80,10 +117,23 @@ function updateControls() {
   const labels = {idle:'等待开始',connecting:'正在准备',live:'同传进行中',paused:'播放已暂停',draining:'处理剩余音频',done:'同传已结束',error:'会话已停止'};
   let label = state === 'connecting' ? session?.preparationLabel || labels.connecting : labels[state] || state;
   if (state === 'live') {
-    if ((lastMetrics.pending_audio_s || 0) >= Math.max(3, (session?.chunkSeconds || 1) * 2)) label = '正在处理积压音频';
-    else if (session?.lastTag === 'WAIT') label = '等待后续音频';
+    if (health?.state === 'failed') label = '模型故障，等待服务器处理';
+    else if (health?.state === 'stalled') label = '模型长时间无响应，等待恢复';
+    else if (lastMetrics.processing_health?.state === 'slow') label = '处理较慢，音频正在积压';
+    else if (health?.state === 'slow') label = '模型处理较慢，仍在等待结果';
+    else if (lastMetrics.inference_state === 'queued') label = '等待推理调度';
+    else if ((lastMetrics.pending_audio_s || 0) >= Math.max(3, (session?.chunkSeconds || 1) * 2)) label = '正在处理积压音频';
+    else if (lastMetrics.inference_state === 'running') label = '正在生成译文';
+    else if (session?.lastTag === 'WAIT') label = '模型本轮暂不输出';
   }
-  statusLabel(label, state === 'live' ? 'live' : state === 'error' ? 'error' : '');
+  if (state === 'draining') {
+    if (health?.state === 'failed') label = '模型故障，收尾未完成';
+    else if (health?.state === 'stalled') label = '收尾等待模型恢复';
+    else if (health?.state === 'slow' || lastMetrics.processing_health?.state === 'slow') label = '处理剩余音频（较慢）';
+  }
+  ui.sessionStatus.title = lastMetrics.processing_health?.state === 'slow'
+    ? lastMetrics.processing_health.message || '' : health?.message || '';
+  statusLabel(label, state === 'error' || (['live','draining'].includes(state) && ['stalled','failed'].includes(health?.state)) ? 'error' : state === 'live' ? 'live' : '');
 }
 function setState(value) { state = value; updateControls(); }
 function setMode(value) {
@@ -108,12 +158,11 @@ function updateDirection(source) {
 function clearTranscript() {
   if (busy()) return;
   currentTranslation = ''; turns = []; transcriptFragments = 0; lastExport = null; lastMetrics = {};
-  visibleFragments = []; totalTurns = 0; translationCharacters = 0; recentRecordCharacters = 0;
-  transcriptTrimmed = false; recordsTrimmed = false; windowRollovers = 0; session = null;
+  totalTurns = 0; translationCharacters = 0; recentRecordCharacters = 0;
+  recordsTrimmed = false; windowRollovers = 0; session = null;
   ui.transcript.replaceChildren(); ui.turnList.replaceChildren();
   const hint = document.createElement('p'); hint.className = 'no-turns'; hint.textContent = '暂无记录'; ui.turnList.append(hint);
   ui.transcriptEmpty.hidden = false; ui.translationCount.textContent = '0 个输出片段'; ui.turnCount.textContent = '0 轮';
-  ui.historyNotice.hidden = true;
   ui.latestTag.className = 'tag tag-neutral'; ui.latestTag.textContent = '—';
   followOutput = true; ui.followButton.hidden = true;
   renderMetrics({received_audio_s:0,processed_audio_s:0,pending_audio_s:0});
@@ -126,7 +175,7 @@ function renderMetric(element, value) {
 function renderMetrics(data) {
   // Do not accidentally retain a legacy done.translation or entire turn in
   // this long-lived metrics object.
-  for (const key of ['received_audio_s','processed_audio_s','pending_audio_s','service_s','turn_count','translation_chars','context']) {
+  for (const key of ['received_audio_s','processed_audio_s','pending_audio_s','service_s','scheduler_wait_s','batch_size','inference_state','processing_health','turn_count','translation_chars','context']) {
     if (data[key] !== undefined) lastMetrics[key] = data[key];
   }
   renderMetric(ui.receivedMetric,lastMetrics.received_audio_s);
@@ -135,12 +184,12 @@ function renderMetrics(data) {
   ui.pendingMetric.classList.toggle('warning', (lastMetrics.pending_audio_s || 0) > 3);
   if (data.context?.rollovers !== undefined) windowRollovers = Number(data.context.rollovers) || 0;
   updateRecordCounts();
-  if (state === 'live') updateControls();
+  updateCapacity(data);
+  if (['live','draining'].includes(state)) updateControls();
 }
 function updateRecordCounts() {
-  ui.translationCount.textContent = `${transcriptFragments} 个输出片段${transcriptTrimmed ? ` · 显示最近 ${visibleFragments.length} 段` : ''}`;
+  ui.translationCount.textContent = `${transcriptFragments} 个输出片段`;
   ui.turnCount.textContent = `${totalTurns} 轮${recordsTrimmed ? ` · 最近 ${turns.length} 轮` : ''}${windowRollovers ? ` · 窗口滚动 ${windowRollovers} 次` : ''}`;
-  ui.historyNotice.hidden = !transcriptTrimmed;
 }
 function appendResearchRow(row) {
   if (ui.turnList.querySelector('.no-turns')) ui.turnList.replaceChildren();
@@ -157,7 +206,7 @@ function appendContextWindow(data) {
 }
 function compactDone(event) {
   const {translation, ...summary} = event;
-  // The full transcript belongs to the export endpoint, never browser state.
+  // Avoid retaining a redundant full-transcript copy in final metadata.
   return summary;
 }
 function appendTurn(data, s) {
@@ -176,63 +225,65 @@ function appendTurn(data, s) {
   if (data.tag !== 'WAIT') {
     translationCharacters += [...data.delta].length;
     const span = document.createElement('span'); span.className = `fragment ${data.tag.toLowerCase()}`;
-    // A single unusually large output is bounded too. The visible suffix is
-    // explicitly marked partial; server exports still contain the full delta.
-    const visibleDelta = data.delta.length > MAX_VISIBLE_CHARACTERS ? data.delta.slice(-MAX_VISIBLE_CHARACTERS) : data.delta;
-    if (visibleDelta !== data.delta) transcriptTrimmed = true;
-    span.textContent = visibleDelta;
+    span.textContent = data.delta;
     span.title = `${data.tag} · 输入 ${time(data.source_start_s + s.mediaOffset)} – ${time(data.source_end_s + s.mediaOffset)} · 推理 ${Number(data.service_s).toFixed(2)} s`;
-    ui.transcript.append(span); visibleFragments.push(visibleDelta); currentTranslation += visibleDelta;
-    const beforeTrimHeight = ui.transcriptViewport.scrollHeight;
-    while (visibleFragments.length > MAX_VISIBLE_FRAGMENTS || currentTranslation.length > MAX_VISIBLE_CHARACTERS) {
-      currentTranslation = currentTranslation.slice(visibleFragments.shift().length);
-      ui.transcript.firstElementChild.remove(); transcriptTrimmed = true;
-    }
-    if (!followOutput) ui.transcriptViewport.scrollTop = Math.max(0,ui.transcriptViewport.scrollTop + ui.transcriptViewport.scrollHeight-beforeTrimHeight);
+    ui.transcript.append(span); currentTranslation += data.delta;
     ui.transcriptEmpty.hidden = true; transcriptFragments++;
-    if (followOutput) requestAnimationFrame(() => { ui.transcriptViewport.scrollTop = ui.transcriptViewport.scrollHeight; });
+    if (followOutput) requestAnimationFrame(() => { if (current(s) && followOutput) ui.transcriptViewport.scrollTop = ui.transcriptViewport.scrollHeight; });
   }
   const row = document.createElement('div'); row.className = `turn-row ${data.tag.toLowerCase()}`;
   const header = document.createElement('div'); header.className = 'turn-row-header';
   const tag = document.createElement('span'); tag.className = `tag tag-${data.tag.toLowerCase()}`; tag.textContent = data.tag;
   const timing = document.createElement('time'); timing.textContent = `${time(data.source_start_s+s.mediaOffset)} – ${time(data.source_end_s+s.mediaOffset)}`;
   header.append(tag,timing);
-  const latency = document.createElement('span'); latency.className = 'turn-latency'; latency.textContent = `推理 ${Number(data.service_s).toFixed(2)}s · 提交前等待 ${Number(data.queue_wait_s).toFixed(2)}s`;
-  const text = document.createElement('p'); text.textContent = data.tag === 'WAIT' ? '等待后续音频' : data.delta.length > 4000 ? `${data.delta.slice(0,4000)}…（完整输出见导出）` : data.delta;
+  const latency = document.createElement('span'); latency.className = 'turn-latency';
+  latency.textContent = `推理 ${Number(data.service_s).toFixed(2)}s · 调度等待 ${Number(data.scheduler_wait_s || 0).toFixed(2)}s · 提交前等待 ${Number(data.queue_wait_s || 0).toFixed(2)}s${data.batch_size ? ` · 批大小 ${data.batch_size}` : ''}`;
+  const text = document.createElement('p'); text.textContent = data.tag === 'WAIT' ? '模型本轮暂不输出' : data.delta.length > 4000 ? `${data.delta.slice(0,4000)}…（完整输出见正文或导出）` : data.delta;
   row.append(header,latency,text); appendResearchRow(row);
   updateRecordCounts();
   renderMetric(ui.serviceMetric,data.service_s);
-  renderMetrics({processed_audio_s:data.source_end_s,...(data.context ? {context:data.context} : {})});
+  renderMetrics({...data,processed_audio_s:data.source_end_s,inference_state:data.inference_state || 'idle'});
   updateControls();
 }
 
 async function loadConfig() {
+  if (pageHidden || configRequest) return;
+  clearTimeout(pollTimer); pollTimer = null;
+  const controller = new AbortController(); configRequest = controller;
+  const requestTimeout = setTimeout(() => controller.abort(),10000);
+  const firstLoad = !config;
   try {
-    const response = await fetch('/api/config', {cache:'no-store'});
+    const response = await fetch('/api/config', {cache:'no-store',signal:controller.signal});
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     config = await response.json();
+    configRefreshFailed = false;
     ui.modelLabel.textContent = config.model_label || '本地双向模型';
     ui.backendBadge.textContent = config.backend === 'mock' ? 'MOCK' : 'LOCAL';
     ui.backendBadge.classList.toggle('mock',config.backend === 'mock');
     ui.demoBanner.hidden = config.backend !== 'mock';
     ui.modelMeta.textContent = config.backend === 'mock' ? '模拟输出' : '中英互译';
-    ui.serverStatus.className = `server-status ${config.status}`;
-    ui.serverStatus.replaceChildren(document.createElement('i'), document.createTextNode(config.status === 'ready' ? '服务已就绪' : config.status === 'error' ? '模型加载失败' : '模型加载中'));
+    renderServerStatus();
     ui.authField.hidden = !config.auth_required;
     ui.adaptiveHint.textContent = `最多合并 ${config.max_chunk_seconds || 3} 秒`;
     if (!busy()) {
-      if ([...ui.chunkSeconds.options].some(x => x.value === String(config.chunk_seconds))) ui.chunkSeconds.value = String(config.chunk_seconds);
+      if (firstLoad && [...ui.chunkSeconds.options].some(x => x.value === String(config.chunk_seconds))) ui.chunkSeconds.value = String(config.chunk_seconds);
       for (const option of ui.chunkSeconds.options) option.disabled = Number(option.value) > (config.max_chunk_seconds || 3);
     }
-    if (config.status === 'error') showError(config.error || '请检查服务器日志和本地模型路径。','模型尚未就绪');
-    if (config.status === 'loading') pollTimer = setTimeout(loadConfig,3000);
-    else pollTimer = null;
-    ui.footerHint.textContent = `${sessionLimitLabel()} · 单会话`;
+    if (config.status === 'error' && !busy()) showError(config.error || '请检查服务器日志和本地模型路径。','模型尚未就绪');
+    if (!busy()) ui.footerHint.textContent = `${sessionLimitLabel()}${config.max_sessions ? ` · 最多 ${config.max_sessions} 路同传` : ''}`;
     updateControls();
   } catch (error) {
-    config = null; ui.serverStatus.className = 'server-status error'; ui.serverStatus.replaceChildren(document.createElement('i'),document.createTextNode('服务未连接'));
-    showError(`无法连接本地同传服务：${error.message}。请确认服务器已启动，再刷新页面。`,'连接失败');
+    if (pageHidden) return;
+    configRefreshFailed = true;
+    if (config) renderServerStatus();
+    else {
+      ui.serverStatus.className = 'server-status error'; ui.serverStatus.replaceChildren(document.createElement('i'),document.createTextNode('服务未连接'));
+      showError(`无法连接本地同传服务：${error.message}。正在重试，请确认服务器已启动。`,'连接失败');
+    }
     updateControls();
+  } finally {
+    clearTimeout(requestTimeout); configRequest = null;
+    if (!pageHidden) pollTimer = setTimeout(loadConfig,config?.status === 'loading' ? 3000 : 5000);
   }
 }
 
@@ -387,6 +438,7 @@ function openSocket(s) {
       if (!current(s)) return;
       try {
         const event = JSON.parse(data);
+        updateCapacity(event);
         if (s.terminal) {
           // A server may send its accepted-prefix accounting after an error.
           // Preserve it without turning an errored session into a success.
@@ -440,6 +492,8 @@ async function failSession(s, message, title = '会话已停止', notifyServer =
 }
 async function startSession() {
   if (busy() || !config || config.status !== 'ready') return;
+  if (!engineAccepting()) {showError(config.engine_health?.message || '模型暂不接收新会话，请等待恢复或检查服务端日志。','模型暂不可用');return;}
+  if (capacityFull()) {showError(`当前 ${config.max_sessions || ''} 路同传已满，请等待其他会话结束后再开始。`,'服务已满');return;}
   if (config.auth_required && !ui.authToken.value.trim()) {ui.settings.open = true;showError('请输入服务器访问令牌后再开始。');ui.authToken.focus();return;}
   const direction = `${ui.sourceLang.value}-${ui.targetLang.value}`;
   if (!(config.directions || ['en-zh','zh-en']).includes(direction)) {showError('当前服务器模型没有启用该翻译方向，请检查服务端配置。');return;}
@@ -494,7 +548,19 @@ async function resumeCapture() {
   setState('live'); sendFileProgress(s,true);
 }
 function exportData(s = session) {
-  return {schema_version:2,export_scope:'browser_tail_only',complete:false,partial:true,translation_truncated:transcriptTrimmed,turns_truncated:recordsTrimmed,total_received_turns:totalTurns,total_received_translation_chars:translationCharacters,backend:config?.backend,model_label:config?.model_label,session_id:s?.sessionId || null,source_language:s?.sourceLang || ui.sourceLang.value,target_language:s?.targetLang || ui.targetLang.value,source_kind:s?.sourceKind || mode,source_name:s?.sourceName || null,capture_mode:s?.captureMode || null,media_offset_s:s?.mediaOffset || 0,started_at:s?.startedDate || null,ended_at:s?.endedAt || null,sample_rate:16000,sent_audio_s:(s?.sentSamples || 0)/16000,chunk_seconds:s?.chunkSeconds,adaptive:s?.adaptive,translation:currentTranslation,turns:[...turns],final_metrics:{...lastMetrics},done:s?.doneEvent || null,error:s?.failure || null,timing_note:'PARTIAL browser backup, not the complete server result. source_start_s/source_end_s are input audio intervals, not word alignment or semantic latency. Add media_offset_s to compare against file playback time. client_elapsed_s excludes file upload/preparation and includes actual inference/network scheduling. server-file uploads the complete file but releases only the played prefix to the model; natural EOF reconciles small player/decoder duration differences. Browser progress events are not sample-accurate latency measurements.'};
+  return {
+    schema_version:2,export_scope:'browser_received_translation_and_recent_turns',complete:false,partial:true,
+    translation_truncated:false,turns_truncated:recordsTrimmed,total_received_turns:totalTurns,
+    total_received_translation_chars:translationCharacters,backend:config?.backend,model_label:config?.model_label,
+    session_id:s?.sessionId || null,source_language:s?.sourceLang || ui.sourceLang.value,
+    target_language:s?.targetLang || ui.targetLang.value,source_kind:s?.sourceKind || mode,
+    source_name:s?.sourceName || null,capture_mode:s?.captureMode || null,media_offset_s:s?.mediaOffset || 0,
+    started_at:s?.startedDate || null,ended_at:s?.endedAt || null,sample_rate:16000,
+    sent_audio_s:(s?.sentSamples || 0)/16000,chunk_seconds:s?.chunkSeconds,adaptive:s?.adaptive,
+    translation:currentTranslation,turns:[...turns],final_metrics:{...lastMetrics},done:s?.doneEvent || null,
+    error:s?.failure || null,
+    timing_note:'PARTIAL browser backup: all translation deltas received by this page, but only recent turn records. Not the complete server result; unreceived outputs and earlier records may be missing. source_start_s/source_end_s are input audio intervals, not word alignment or semantic latency. Add media_offset_s to compare against file playback time. client_elapsed_s excludes file upload/preparation and includes actual inference/network scheduling. server-file uploads the complete file but releases only the played prefix to the model; natural EOF reconciles small player/decoder duration differences. Browser progress events are not sample-accurate latency measurements.',
+  };
 }
 function downloadLink(url, kind, data, partial = false) {
   const link = document.createElement('a');
@@ -533,9 +599,9 @@ async function download(kind) {
     }
   } catch (error) {
     const reason = error.name === 'AbortError' ? '下载超时。' : error.message;
-    showError(`无法下载完整服务端结果：${reason} 页面只保留最近的译文和记录；可重试下载，或另存明确标注为 PARTIAL 的本地备份。`,'完整导出失败');
-    if ((data.translation || data.turns.length) && window.confirm('完整服务端结果暂时无法下载。是否保存本页面保留的局部备份？文件将标注 PARTIAL，可能缺少早期译文或未接收的结果，不能作为完整会话。')) {
-      const value = kind === 'txt' ? `【PARTIAL：仅浏览器保留的局部译文，不是完整会话】\n${data.translation}` : JSON.stringify(data,null,2);
+    showError(`无法下载完整服务端结果：${reason} 页面保留本次已收到的全部译文，但详细记录仅保留近期；可重试下载，或另存明确标注为 PARTIAL 的浏览器备份。`,'完整导出失败');
+    if ((data.translation || data.turns.length) && window.confirm('完整服务端结果暂时无法下载。是否保存浏览器备份？包含本页面本次已收到的全部译文和近期记录；可能缺少未接收的输出及早期详细记录，将标注 PARTIAL，不能代替完整服务端记录。')) {
+      const value = kind === 'txt' ? `【PARTIAL：本页面本次已收到的全部译文，可能缺少未收到的输出；非完整服务端结果】\n${data.translation}` : JSON.stringify(data,null,2);
       saveDownload(new Blob([value],{type:kind === 'txt' ? 'text/plain;charset=utf-8' : 'application/json;charset=utf-8'}),kind,data,true);
     }
   } finally {clearTimeout(timer);exportInProgress = false;updateControls();}
@@ -613,8 +679,11 @@ window.addEventListener('beforeunload',event => {
   if (busy()) {event.preventDefault();event.returnValue = '';}
 });
 window.addEventListener('pagehide',() => {
+  pageHidden = true; clearTimeout(pollTimer); pollTimer = null;
+  configRequest?.abort();
   if(session && !session.terminal){session.terminal = true;clearInterval(session.progressTimer);session.uploadRequest?.abort();releaseUploadedFile(session);if(session.ws?.readyState === WebSocket.OPEN){session.ws.send(JSON.stringify({type:'cancel'}));session.ws.close();}session.stream?.getTracks().forEach(track => track.stop());}
 });
+window.addEventListener('pageshow',event => {if(event.persisted){pageHidden = false;void loadConfig();}});
 setInterval(() => {
   const seconds = mode === 'file' ? ui.media.currentTime : (session?.sentSamples || 0)/16000;
   ui.sourceClock.textContent = time(seconds);

@@ -1,7 +1,8 @@
 """Single-GPU WebSocket application. Browser capture and inference run independently.
 
-Only complete, protocol-valid generations are committed. A disconnected client
-never frees the GPU admission slot until its in-flight generation has finished.
+Only complete, protocol-valid generations are committed. Several independent
+sessions share one model through a bounded scheduler. A disconnected client
+never frees its admission slot until its in-flight generation has finished.
 """
 from __future__ import annotations
 
@@ -10,7 +11,7 @@ import asyncio
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import functools
 import hmac
@@ -26,14 +27,15 @@ import uuid
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
 
-from .model import ContextLimit, ModelEngine, ModelOptions, ProtocolError, parse_reply
+from .model import ContextLimit, ModelBackendError, ModelEngine, ModelOptions, ProtocolError, parse_reply
 from .media import FileQueue, MAX_UPLOAD_BYTES, MediaError, MediaStore, decode_upload
 from .tls import TLSConfigError, prepare_local_tls, validate_tls_files
 from .results import ResultLimit, ResultStore
+from .scheduler import InferenceScheduler, SchedulerCancelled, SchedulerUnavailable
 
 RATE = 16000
 STATIC = Path(__file__).resolve().parent.parent / 'static'
@@ -50,6 +52,11 @@ class Settings:
     max_chunk_seconds: float = 3.0
     max_pending_seconds: float = 12.0
     max_session_seconds: float = 28800.0
+    max_sessions: int = 4
+    max_batch_size: int | None = None
+    batch_wait_ms: float = 10.0
+    slow_inference_seconds: float = 5.0
+    stalled_inference_seconds: float = 60.0
     token: str = ''
     allowed_origins: tuple[str, ...] = ()
     idle_timeout_seconds: float = 300.0
@@ -63,11 +70,28 @@ class Settings:
     result_retention_hours: float = 24.0
     ffmpeg: str | None = None
 
+    @property
+    def batch_size(self):
+        return self.max_sessions if self.max_batch_size is None else self.max_batch_size
+
     def validate(self):
         if self.backend not in ('mock', 'vllm'):
             raise ValueError('backend must be mock or vllm')
         if self.backend == 'vllm' and not self.model:
             raise ValueError('--model is required for vllm (use a merged local checkpoint)')
+        if type(self.max_sessions) is not int or self.max_sessions < 1:
+            raise ValueError('max_sessions must be a positive integer')
+        if type(self.batch_size) is not int or not 1 <= self.batch_size <= self.max_sessions:
+            raise ValueError('require 1 <= max_batch_size <= max_sessions')
+        if (isinstance(self.batch_wait_ms, bool) or not math.isfinite(self.batch_wait_ms)
+                or not 0 <= self.batch_wait_ms <= 100):
+            raise ValueError('batch_wait_ms must be finite and between 0 and 100')
+        for value in (self.slow_inference_seconds, self.stalled_inference_seconds):
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value <= 0):
+                raise ValueError('inference health thresholds must be finite and positive')
+        if self.stalled_inference_seconds <= self.slow_inference_seconds:
+            raise ValueError('stalled_inference_seconds must exceed slow_inference_seconds')
         if not self.directions or any(x not in ('en-zh', 'zh-en') for x in self.directions):
             raise ValueError('directions must contain en-zh and/or zh-en')
         numeric = (self.chunk_seconds, self.max_chunk_seconds, self.max_pending_seconds,
@@ -94,6 +118,40 @@ class ClientError(Exception):
     def __init__(self, code, message):
         super().__init__(message)
         self.code = code
+
+
+class ProcessingMonitor:
+    """Warn on sustained unprocessed audio, never on WAIT or missing text.
+
+    Includes the current queued/running turn. A transient burst is not a fault;
+    recovery has hysteresis to keep status from flashing at the threshold.
+    This monitor never changes audio, playback, chunking, or model behavior.
+    """
+    def __init__(self, chunk_seconds, *, sustain_seconds=5.0, clock=None):
+        self.threshold = max(3.0, chunk_seconds * 2)
+        self.recovery_threshold = self.threshold / 2
+        self.sustain_seconds = sustain_seconds
+        self.clock = clock or time.monotonic
+        self.started = None
+        self.slow = False
+
+    def update(self, unprocessed_seconds):
+        now = self.clock()
+        if unprocessed_seconds <= self.recovery_threshold:
+            self.started = None
+            self.slow = False
+        elif unprocessed_seconds >= self.threshold:
+            if self.started is None:
+                self.started = now
+            if now - self.started >= self.sustain_seconds:
+                self.slow = True
+        elif not self.slow:
+            # Before warning, require a continuous interval over the threshold.
+            self.started = None
+        return dict(state='slow' if self.slow else 'normal',
+                    message='处理速度暂时落后，正在处理积压音频。' if self.slow else '',
+                    backlog_seconds=max(0.0, unprocessed_seconds),
+                    sustained_seconds=max(0.0, now - self.started) if self.started is not None else 0.0)
 
 
 class PCMQueue:
@@ -227,21 +285,30 @@ def create_app(settings=None):
         app.state.media_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='flex-decode')
         if settings.temp_dir is not None:
             Path(settings.temp_dir).mkdir(parents=True, exist_ok=True)
-        app.state.media = MediaStore(max_slots=settings.max_uploads, temp_dir=settings.temp_dir)
+        app.state.media = MediaStore(max_slots=max(settings.max_uploads, settings.max_sessions), temp_dir=settings.temp_dir)
         app.state.results = ResultStore(temp_dir=settings.temp_dir, max_bytes=settings.max_result_bytes,
-                                       ttl_seconds=settings.result_retention_hours * 3600)
+                                       ttl_seconds=settings.result_retention_hours * 3600,
+                                       max_sessions=max(8, settings.max_sessions))
         expiry_task = None
-        app.state.active = None
+        app.state.active_sessions = set()
+        app.state.scheduler = None
         app.state.status = 'loading'
         app.state.error = None
         options = settings.model_options or ModelOptions(model=settings.model,
                                                          max_chunk_seconds=settings.max_chunk_seconds)
+        options = replace(options, max_batch_size=settings.batch_size)
         app.state.model_options = options
         try:
             make = functools.partial(ModelEngine, options, backend=settings.backend)
             app.state.engine = await asyncio.get_running_loop().run_in_executor(app.state.executor, make)
             await asyncio.get_running_loop().run_in_executor(
                 app.state.executor, app.state.engine.warmup, min(1.0, settings.max_chunk_seconds))
+            app.state.scheduler = InferenceScheduler(
+                app.state.engine, app.state.executor, max_sessions=settings.max_sessions,
+                max_batch_size=settings.batch_size, batch_wait_ms=settings.batch_wait_ms,
+                slow_inference_seconds=settings.slow_inference_seconds,
+                stalled_inference_seconds=settings.stalled_inference_seconds)
+            app.state.scheduler.start()
             app.state.status = 'ready'
             async def expire_uploads():
                 while True:
@@ -253,6 +320,8 @@ def create_app(settings=None):
         finally:
             app.state.status = 'stopped'
             try:
+                if app.state.scheduler is not None:
+                    await app.state.scheduler.close()
                 if getattr(app.state, 'engine', None) is not None:
                     await asyncio.get_running_loop().run_in_executor(app.state.executor, app.state.engine.close)
             finally:
@@ -265,6 +334,13 @@ def create_app(settings=None):
                 app.state.results.close()
 
     app = FastAPI(title='FLEX Live', lifespan=lifespan, docs_url=None, redoc_url=None)
+
+    def capacity():
+        count = len(app.state.active_sessions)
+        return dict(active_sessions=count, max_sessions=settings.max_sessions,
+                    available_sessions=max(0, settings.max_sessions - count),
+                    busy=count >= settings.max_sessions,
+                    engine_health=app.state.scheduler.health())
 
     @app.middleware('http')
     async def headers(request, call_next):
@@ -280,7 +356,7 @@ def create_app(settings=None):
         return response
 
     @app.get('/api/config')
-    def config():
+    async def config():
         return dict(backend=settings.backend, model_label=Path(settings.model).name or 'Protocol demo',
                     directions=settings.directions, sample_rate=RATE,
                     chunk_seconds=settings.chunk_seconds, max_chunk_seconds=settings.max_chunk_seconds,
@@ -291,7 +367,10 @@ def create_app(settings=None):
                     context_policy=app.state.model_options.context_policy,
                     history_window_seconds=app.state.model_options.history_window_seconds,
                     history_retain_seconds=app.state.model_options.history_retain_seconds,
-                    status=app.state.status, busy=app.state.active is not None)
+                    max_batch_size=settings.batch_size, batch_wait_ms=settings.batch_wait_ms,
+                    slow_inference_seconds=settings.slow_inference_seconds,
+                    stalled_inference_seconds=settings.stalled_inference_seconds,
+                    status=app.state.status, **capacity())
 
     def require_media_access(request):
         if not origin_allowed(request, settings):
@@ -364,8 +443,9 @@ def create_app(settings=None):
         return dict(deleted=True)
 
     @app.get('/api/health')
-    def health():
-        return dict(status=app.state.status, backend=settings.backend, busy=app.state.active is not None)
+    async def health():
+        data = dict(status=app.state.status, backend=settings.backend, **capacity())
+        return JSONResponse(data, status_code=200 if data['engine_health']['accepting'] else 503)
 
     @app.get('/api/sessions/{session_id}/export')
     async def export_result(session_id: str, request: Request, format: str = 'json'):
@@ -407,10 +487,12 @@ def create_app(settings=None):
         preview_complete = True
         last_tag = None
         failure = None
+        early_error_sent = False
         model_session = None
         aborted = asyncio.Event()
         disconnected = False
         uploaded = None
+        processing_monitor = ProcessingMonitor(settings.chunk_seconds)
 
         async def send(event_type, **fields):
             event = dict(type=event_type, session_id=session_id,
@@ -442,8 +524,10 @@ def create_app(settings=None):
                         pending_audio_s=buffer.pending / RATE,
                         unprocessed_audio_s=(buffer.received - processed) / RATE,
                         in_flight=in_flight,
+                        inference_state=app.state.scheduler.state(session_id),
+                        processing_health=processing_monitor.update((buffer.received - processed) / RATE),
                         input_finished=buffer.closed,
-                        context=getattr(model_session, 'context_metadata', {}))
+                        context=getattr(model_session, 'context_metadata', {}), **capacity())
 
         def result_summary():
             summary = dict(translation_chars=translation_chars, turn_count=turn_count,
@@ -454,7 +538,7 @@ def create_app(settings=None):
             return summary
 
         async def receive():
-            nonlocal failure, disconnected
+            nonlocal failure, disconnected, early_error_sent
             try:
                 # A completed receive can race with cancellation inside
                 # asyncio.wait_for on older Python versions. The explicit stop
@@ -496,7 +580,18 @@ def create_app(settings=None):
             except Exception as exc:
                 failure = exc
                 aborted.set()
+                app.state.scheduler.cancel_pending(session_id)
                 buffer.finish()
+                # Stop browser capture promptly on an input/session fault, even
+                # if the shared GPU is still busy. This is NOT a done event:
+                # admission/history remain owned until real thread completion.
+                if not disconnected:
+                    code = (exc.code if isinstance(exc, (ClientError, MediaError)) else
+                            'timeout' if isinstance(exc, (TimeoutError, asyncio.TimeoutError)) else
+                            'server_error')
+                    with suppress(Exception):
+                        await send('error', code=code, message=str(exc), **stats())
+                        early_error_sent = True
 
         async def process(model_session, start):
             nonlocal processed, in_flight, failure, last_tag, translation_chars, turn_count, preview_complete
@@ -517,17 +612,13 @@ def create_app(settings=None):
                     in_flight = True
                     await send('status', **stats())
                     submitted = time.monotonic()
-                    # Do not cancel this future on disconnect: generation owns the GPU.
-                    future = asyncio.get_running_loop().run_in_executor(
-                        app.state.executor, model_session.generate, model_audio)
-                    try:
-                        result = await asyncio.shield(future)
-                    except asyncio.CancelledError:
-                        await asyncio.shield(future)
-                        raise
-                    finished = time.monotonic()
+                    # A cancelled queued job can be removed immediately. A job
+                    # already in a GPU batch retains ownership until that batch
+                    # returns; the scheduler never calls the shared engine concurrently.
+                    scheduled = await app.state.scheduler.generate(session_id, model_session, model_audio)
                     if aborted.is_set():
                         return  # Never commit or publish after cancellation.
+                    result = scheduled.result
                     try:
                         if result.finish_reason != 'stop':
                             raise ProtocolError(f'Generation ended with {result.finish_reason!r}; no partial output committed.')
@@ -564,11 +655,15 @@ def create_app(settings=None):
                                source_start_s=sample_start / RATE, source_end_s=processed / RATE,
                                media_offset_s=start['media_offset_s'], audio_seconds=len(audio) / RATE,
                                model_audio_seconds=len(model_audio) / RATE,
-                               service_s=finished - submitted, queue_wait_s=max(0, submitted - arrived),
+                               service_s=scheduled.service_s, queue_wait_s=max(0, submitted - arrived),
+                               scheduler_wait_s=scheduled.queue_wait_s, batch_size=scheduled.batch_size,
                                prompt_tokens=result.prompt_tokens, **stats())
                     turn += 1
             except Exception as exc:
-                failure = exc
+                # The receiver's cancellation/disconnect reason is authoritative
+                # when it removed this job from the scheduler's pending queue.
+                if not (aborted.is_set() and failure is not None):
+                    failure = exc
                 aborted.set()
                 buffer.finish()
             finally:
@@ -590,9 +685,14 @@ def create_app(settings=None):
                 start = validate_start(json.loads(raw), settings)
             except (ValueError, TypeError) as exc:
                 raise ClientError('bad_start', str(exc)) from exc
-            if app.state.active is not None:
-                raise ClientError('busy', 'GPU is in use by another session. Wait for it to finish.')
-            app.state.active = session_id  # Atomic: no await between check and acquire.
+            model_health = app.state.scheduler.health()
+            if not model_health['accepting']:
+                code = ('engine_stalled' if model_health['state'] == 'stalled' else
+                        'engine_failed' if model_health['state'] == 'failed' else 'engine_unavailable')
+                raise ClientError(code, model_health['message'] or '模型服务暂不可用，请稍后重试。')
+            if len(app.state.active_sessions) >= settings.max_sessions:
+                raise ClientError('busy', f'All {settings.max_sessions} simultaneous session slots are in use. Retry after one session finishes.')
+            app.state.active_sessions.add(session_id)  # Atomic check + acquire, no await.
             owned = True
             journal = SessionLog(settings.log_dir, session_id)
             result_store = app.state.results.create(session_id)
@@ -602,11 +702,13 @@ def create_app(settings=None):
                 start['adaptive'] = False
             else:
                 buffer = PCMQueue(settings.max_pending_seconds, settings.max_session_seconds)
+            processing_monitor = ProcessingMonitor(start['chunk_seconds'])
             model_session = app.state.engine.new_session(start['target_lang'])
             file_fields = dict(file_mode='uploaded', **uploaded.public()) if uploaded else {}
             await send('ready', sample_rate=RATE, backend=settings.backend,
                        chunk_seconds=start['chunk_seconds'], max_chunk_seconds=settings.max_chunk_seconds,
                        max_session_seconds=settings.max_session_seconds, config=start,
+                       max_batch_size=settings.batch_size, **capacity(),
                        results_available=True, result_retention_hours=settings.result_retention_hours,
                        **{k: v for k, v in file_fields.items() if k != 'sample_rate'})
             reader = asyncio.create_task(receive())
@@ -619,6 +721,7 @@ def create_app(settings=None):
             if status in done:
                 failure = status.exception() or RuntimeError('status task ended unexpectedly')
                 aborted.set()
+                app.state.scheduler.cancel_pending(session_id)
                 buffer.finish()
             if worker in done:
                 aborted.set()
@@ -634,8 +737,10 @@ def create_app(settings=None):
                        final_wait=last_tag == 'WAIT', **result_summary(), **stats())
         except Exception as exc:
             failure = exc
-            if isinstance(exc, (ClientError, MediaError)):
+            if isinstance(exc, (ClientError, MediaError, SchedulerUnavailable)):
                 code = exc.code
+            elif isinstance(exc, ModelBackendError):
+                code = 'engine_failed'
             elif isinstance(exc, ContextLimit):
                 code = 'context_limit'
             elif isinstance(exc, ProtocolError):
@@ -647,12 +752,14 @@ def create_app(settings=None):
             else:
                 code = 'server_error'
                 LOG.exception('Session %s failed', session_id)
+            if not early_error_sent:
+                with suppress(Exception):
+                    await send('error', code=code, message=str(exc), **(stats() if buffer else capacity()))
             with suppress(Exception):
-                await send('error', code=code, message=str(exc), **(stats() if buffer else {}))
-            with suppress(Exception):
-                await send('done', reason=code, **result_summary(), **(stats() if buffer else {}))
+                await send('done', reason=code, **result_summary(), **(stats() if buffer else capacity()))
         finally:
             aborted.set()
+            app.state.scheduler.cancel_pending(session_id)
             if buffer:
                 buffer.finish()
             # Do not release admission while an old model generation is still alive.
@@ -673,8 +780,8 @@ def create_app(settings=None):
                     app.state.media.discard(uploaded.media_id, allow_claimed=True)
                 except Exception:
                     LOG.exception('Could not remove temporary upload for %s', session_id)
-            if owned and app.state.active == session_id:
-                app.state.active = None
+            if owned:
+                app.state.active_sessions.discard(session_id)
             if journal:
                 try:
                     journal.close()
@@ -714,6 +821,13 @@ def main():
     parser.add_argument('--max-chunk-seconds', type=float, default=3.0)
     parser.add_argument('--max-pending-seconds', type=float, default=12.0)
     parser.add_argument('--max-session-seconds', type=float, default=28800.0, help='Total input duration cap; default 8 hours, separate from rolling model context')
+    parser.add_argument('--max-sessions', type=int, default=4, help='Maximum independent simultaneous sessions sharing one model (default 4)')
+    parser.add_argument('--max-batch-size', type=int, default=None, help='Ready turns per GPU call; default max-sessions, use 1 for serialized compatibility')
+    parser.add_argument('--batch-wait-ms', type=float, default=10, help='Maximum ready-turn collection window, milliseconds (0..100)')
+    parser.add_argument('--slow-inference-seconds', type=float, default=5,
+                        help='Warn when a running model batch exceeds this duration; no cancellation (default 5)')
+    parser.add_argument('--stalled-inference-seconds', type=float, default=60,
+                        help='Suspected stall: reject new work but retain running GPU ownership (default 60)')
     parser.add_argument('--context-policy', choices=['rolling', 'stop'], default='rolling')
     parser.add_argument('--history-window-seconds', type=float, default=120.0)
     parser.add_argument('--history-retain-seconds', type=float, default=60.0)
@@ -761,6 +875,9 @@ def main():
                         allowed_origins=tuple(args.allow_origin), chunk_seconds=args.chunk_seconds,
                         max_chunk_seconds=args.max_chunk_seconds, max_pending_seconds=args.max_pending_seconds,
                         max_session_seconds=args.max_session_seconds, model_options=options, ffmpeg=args.ffmpeg,
+                        max_sessions=args.max_sessions, max_batch_size=args.max_batch_size, batch_wait_ms=args.batch_wait_ms,
+                        slow_inference_seconds=args.slow_inference_seconds,
+                        stalled_inference_seconds=args.stalled_inference_seconds,
                         max_upload_bytes=args.max_upload_mb * 1024 * 1024,
                         upload_timeout_seconds=args.upload_timeout_seconds, decode_timeout_seconds=args.decode_timeout_seconds,
                         temp_dir=args.temp_dir, max_result_bytes=args.max_result_mb * 1024 * 1024,

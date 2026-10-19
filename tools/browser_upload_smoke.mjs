@@ -176,7 +176,8 @@ async function openPage(origin, secure) {
   const configuration = await page.evaluate(async () => (await fetch('/api/config')).json());
   assert.equal(configuration.backend, 'mock', 'Refusing to run against a real model.');
   assert.equal(configuration.status, 'ready', 'The mock server must be ready.');
-  assert.equal(configuration.busy, false, 'The server already has an active session.');
+  assert.equal(configuration.active_sessions ?? Number(configuration.busy), 0,
+    'The server already has an active session; use an isolated mock for this test.');
   assert.equal(configuration.file_mode, 'uploaded', 'Server does not support uploaded files.');
   const capabilities = await page.evaluate(() => ({ secure: window.isSecureContext,
     getUserMedia: Boolean(navigator.mediaDevices?.getUserMedia) }));

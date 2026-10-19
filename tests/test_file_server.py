@@ -179,7 +179,7 @@ def test_file_offset_and_manual_finish_only_release_observed_interval(app_factor
 
 
 def test_file_cancel_retains_gpu_and_file_until_generation_exits(app_factory):
-    app, engine = app_factory(engine_options=dict(block=True))
+    app, engine = app_factory(engine_options=dict(block=True), max_sessions=1)
     with TestClient(app) as client:
         item = upload(client)
         directory = app.state.media.uploads[item['media_id']].directory
@@ -248,11 +248,11 @@ def test_file_disconnect_keeps_resources_until_inflight_model_finishes(app_facto
             async def tick():
                 await asyncio.sleep(.05)
             client.portal.call(tick)
-            assert directory.exists() and app.state.active
+            assert directory.exists() and app.state.active_sessions
             engine.release.set()
             async def released():
                 for _ in range(100):
-                    if app.state.active is None:
+                    if not app.state.active_sessions:
                         return
                     await asyncio.sleep(.01)
                 raise AssertionError('admission not released')

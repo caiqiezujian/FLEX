@@ -136,7 +136,13 @@ def test_health_config_and_security_headers(app_factory):
         assert config['sample_rate'] == RATE and not config['busy']
         assert response.headers['x-content-type-options'] == 'nosniff'
         assert "frame-ancestors 'none'" in response.headers['content-security-policy']
-        assert client.get('/api/health').json() == dict(status='ready', backend='mock', busy=False)
+        health = client.get('/api/health')
+        assert health.status_code == 200
+        payload = health.json()
+        engine_health = payload.pop('engine_health')
+        assert engine_health['state'] == 'ready' and engine_health['accepting']
+        assert payload == dict(status='ready', backend='mock', busy=False,
+                               active_sessions=0, max_sessions=4, available_sessions=4)
 
 
 @pytest.mark.parametrize('source,target', [('en', 'zh'), ('zh', 'en')])
@@ -219,7 +225,7 @@ def test_same_or_explicitly_allowed_origin(app_factory, origin, allowed):
 
 
 def test_only_one_client_owns_single_gpu(app_factory):
-    app, engine = app_factory()
+    app, engine = app_factory(max_sessions=1)
     with TestClient(app) as client, client.websocket_connect('/ws') as first:
         connect_ready(first)
         assert client.get('/api/health').json()['busy']
@@ -349,7 +355,7 @@ def test_context_limit_is_explicit_and_preserves_committed_prefix(app_factory):
 
 
 def test_cancel_during_generation_retains_gpu_slot_until_worker_exits(app_factory):
-    app, engine = app_factory(engine_options=dict(block=True))
+    app, engine = app_factory(engine_options=dict(block=True), max_sessions=1)
     with TestClient(app) as client, client.websocket_connect('/ws') as first:
         connect_ready(first)
         send_audio(first, np.zeros(RATE, dtype=np.int16))
@@ -366,7 +372,7 @@ def test_cancel_during_generation_retains_gpu_slot_until_worker_exits(app_factor
 
 
 def test_disconnect_during_generation_does_not_release_gpu_early(app_factory):
-    app, engine = app_factory(engine_options=dict(block=True))
+    app, engine = app_factory(engine_options=dict(block=True), max_sessions=1)
     with TestClient(app) as client, client.websocket_connect('/ws') as first:
         connect_ready(first)
         send_audio(first, np.zeros(RATE, dtype=np.int16))
@@ -379,7 +385,7 @@ def test_disconnect_during_generation_does_not_release_gpu_early(app_factory):
 
         async def wait_released():
             for _ in range(100):
-                if app.state.active is None:
+                if not app.state.active_sessions:
                     return
                 await asyncio.sleep(.01)
             raise AssertionError('GPU session slot was not released after generation completed')
@@ -423,7 +429,7 @@ def test_disconnect_after_finish_cancels_draining_before_commit(app_factory):
 
         async def wait_released():
             for _ in range(100):
-                if app.state.active is None:
+                if not app.state.active_sessions:
                     return
                 await asyncio.sleep(.01)
             raise AssertionError('GPU slot not released after EOF disconnect')

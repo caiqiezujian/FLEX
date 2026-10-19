@@ -50,6 +50,15 @@ class ContextLimit(RuntimeError):
     """Session reached its explicit context/audio-turn budget."""
 
 
+class ModelBackendError(RuntimeError):
+    """A shared inference call failed; admission may need to be stopped.
+
+    Unlike per-session preparation, decoding, or protocol errors, this marks
+    an exception from the shared llm.generate call or an invalid batch result
+    count. Its __cause__ preserves the original backend exception for logging.
+    """
+
+
 def parse_reply(reply):
     """Validate one action while preserving every translation-delta whitespace."""
     if not isinstance(reply, str):
@@ -88,6 +97,7 @@ class ModelOptions:
     context_policy: str = 'rolling'
     history_window_seconds: float = 120.0
     history_retain_seconds: float = 60.0
+    max_batch_size: int = 1
 
     def __post_init__(self):
         if self.dtype not in ('auto', 'bfloat16', 'float16'):
@@ -102,7 +112,7 @@ class ModelOptions:
                      'history_window_seconds', 'history_retain_seconds'):
             if not math.isfinite(getattr(self, name)):
                 raise ValueError(f'{name} must be finite')
-        for name in ('max_model_len', 'max_audio_turns', 'max_tokens'):
+        for name in ('max_model_len', 'max_audio_turns', 'max_tokens', 'max_batch_size'):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f'{name} must be a positive integer')
@@ -209,6 +219,7 @@ class ModelEngine:
             'context_policy': self.options.context_policy,
             'history_window_seconds': self.options.history_window_seconds,
             'history_retain_seconds': self.options.history_retain_seconds,
+            'max_batch_size': self.options.max_batch_size,
             'mock': backend == 'mock',
         }
         if backend == 'mock':
@@ -245,7 +256,7 @@ class ModelEngine:
         self.llm = LLM(
             model=opts.model, dtype=opts.dtype, tensor_parallel_size=1,
             gpu_memory_utilization=opts.gpu_memory_utilization,
-            max_model_len=opts.max_model_len, max_num_seqs=1,
+            max_model_len=opts.max_model_len, max_num_seqs=opts.max_batch_size,
             enforce_eager=opts.enforce_eager, enable_prefix_caching=opts.prefix_caching,
             limit_mm_per_prompt={
                 'audio': {'count': opts.max_audio_turns,
@@ -268,6 +279,71 @@ class ModelEngine:
         if target_lang not in ('zh', 'en'):
             raise ValueError('target_lang must be zh or en')
         return ModelSession(self, target_lang)
+
+    def generate_batch(self, items):
+        """Generate at most one pending turn per private session in one call.
+
+        Call only on the engine's serial worker. vLLM's synchronous generate
+        returns results in input order; this is bounded microbatching, not an
+        AsyncLLM or a promise of real-time throughput. Preparation/decoding
+        failures affect only their corresponding item. A backend batch failure
+        returns ModelBackendError for every submitted item without committing
+        or retrying any of them; its cause retains the original exception.
+        The caller still validates/commits each returned Generation, just as for
+        ModelSession.generate. Pending replies are never published here.
+        """
+        items = list(items)
+        if not items:
+            return []
+        if len(items) > self.options.max_batch_size:
+            return [ValueError('batch exceeds configured max_batch_size') for _ in items]
+        if self._closed:
+            return [RuntimeError('model engine is closed') for _ in items]
+        results = [None] * len(items)
+        sessions = [item[0] if isinstance(item, (tuple, list)) and len(item) == 2
+                    else None for item in items]
+        # Reject ALL occurrences of a duplicate before preparing either turn.
+        # Otherwise two replies could race to occupy one session's pending slot.
+        counts = {}
+        for session in sessions:
+            counts[id(session)] = counts.get(id(session), 0) + 1
+        prepared = []
+        for index, (item, session) in enumerate(zip(items, sessions)):
+            try:
+                if not isinstance(session, ModelSession) or session.engine is not self:
+                    raise ValueError('batch item must use a session owned by this engine')
+                if counts[id(session)] != 1:
+                    raise ValueError('duplicate session in batch')
+                value = session._prepare_generation(item[1])
+                prepared.append((index, session, value))
+            except Exception as exc:
+                results[index] = exc
+        if not prepared:
+            return results
+        if self.backend == 'mock':
+            for index, session, value in prepared:
+                try:
+                    results[index] = session._finish_generation(value)
+                except Exception as exc:
+                    results[index] = exc
+            return results
+        try:
+            outputs = self.llm.generate([value[3] for _, _, value in prepared],
+                                        self.sampling, use_tqdm=False)
+            if len(outputs) != len(prepared):
+                raise RuntimeError('backend batch output count does not match request count')
+        except Exception as exc:
+            error = ModelBackendError(f'shared inference backend failed: {exc}')
+            error.__cause__ = exc
+            for index, _, _ in prepared:
+                results[index] = error
+            return results
+        for (index, session, value), output in zip(prepared, outputs):
+            try:
+                results[index] = session._finish_generation(value, output)
+            except Exception as exc:
+                results[index] = exc
+        return results
 
     def close(self):
         """Release vLLM worker resources after every session/inference has ended.
@@ -458,6 +534,13 @@ class ModelSession:
         return snapshot
 
     def generate(self, audio):
+        result = self.engine.generate_batch([(self, audio)])[0]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def _prepare_generation(self, audio):
+        """Build a private prospective request; do not mutate session state."""
         if self._closed or self.engine._closed:
             raise RuntimeError('model session is closed')
         if self._pending is not None:
@@ -468,7 +551,7 @@ class ModelSession:
                  if engine.backend == 'mock' else engine.audio_expansion(audio))
         plan = self._prepare_window(audio, extra)
         if engine.backend == 'mock':
-            result = self._mock_generate(audio, plan, extra)
+            return audio, extra, plan, None, None
         else:
             ids = plan.history + engine.audio_turn + engine.asst_head
             expected_tokens = len(ids) + plan.audio_extra_tokens + extra
@@ -477,7 +560,19 @@ class ModelSession:
                                    f'> max_model_len={opts.max_model_len}; session stopped')
             request = engine.TokensPrompt(
                 prompt_token_ids=ids, multi_modal_data={'audio': plan.audios + [audio]})
-            output = engine.llm.generate([request], engine.sampling, use_tqdm=False)[0]
+            return audio, extra, plan, request, expected_tokens
+
+    def _finish_generation(self, prepared, output=None):
+        """Decode one output into this session's pending slot, never commit it."""
+        if self._closed or self.engine._closed:
+            raise RuntimeError('model session is closed')
+        if self._pending is not None:
+            raise RuntimeError('previous generation must be committed or session closed')
+        audio, extra, plan, _, expected_tokens = prepared
+        engine = self.engine
+        if engine.backend == 'mock':
+            result = self._mock_generate(audio, plan, extra)
+        else:
             completion = output.outputs[0]
             token_ids = list(completion.token_ids)
             while token_ids and token_ids[-1] in engine.stop_ids:

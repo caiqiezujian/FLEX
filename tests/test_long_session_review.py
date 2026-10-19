@@ -16,7 +16,7 @@ from test_server import app_factory, connect_ready, frame, receive_until, send_a
 
 async def wait_for_release(app):
     for _ in range(100):
-        if app.state.active is None:
+        if not app.state.active_sessions:
             return
         await asyncio.sleep(.01)
     raise AssertionError('session resources were not released')
@@ -67,7 +67,7 @@ def test_cancelled_inflight_turn_is_absent_from_export(app_factory):
         async def process_cancel():
             await asyncio.sleep(.03)
         client.portal.call(process_cancel)
-        assert app.state.active == ready['session_id']
+        assert ready['session_id'] in app.state.active_sessions
         engine.release.set()
         done = receive_until(ws, 'done')[-1]
         assert done['reason'] == 'cancelled'

@@ -18,6 +18,8 @@ def test_long_session_cli_settings_reach_model_and_result_store(monkeypatch, tmp
         '--max-session-seconds', '36000', '--context-policy', 'rolling',
         '--history-window-seconds', '90', '--history-retain-seconds', '45',
         '--max-upload-mb', '2048', '--max-result-mb', '64', '--result-retention-hours', '12',
+        '--max-sessions', '4', '--max-batch-size', '3', '--batch-wait-ms', '5',
+        '--slow-inference-seconds', '6', '--stalled-inference-seconds', '45',
     ])
     captured = {}
     monkeypatch.setattr(uvicorn, 'run', lambda app, **options: captured.update(app=app, **options))
@@ -30,6 +32,10 @@ def test_long_session_cli_settings_reach_model_and_result_store(monkeypatch, tmp
         assert config['context_policy'] == 'rolling'
         assert config['max_upload_bytes'] == 2048 * 1024 * 1024
         assert config['result_retention_hours'] == 12
+        assert config['max_sessions'] == 4 and config['available_sessions'] == 4
+        assert config['max_batch_size'] == 3 and config['batch_wait_ms'] == 5
+        assert captured['app'].state.model_options.max_batch_size == 3
+        assert config['slow_inference_seconds'] == 6 and config['stalled_inference_seconds'] == 45
         store = captured['app'].state.results
         assert store.max_bytes == 64 * 1024 * 1024
         assert store.ttl_seconds == 12 * 3600
