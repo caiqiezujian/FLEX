@@ -193,6 +193,21 @@ def test_one_engine_two_directions_and_shutdown(fake_vllm, monkeypatch):
         engine.new_session('zh')
 
 
+@pytest.mark.parametrize('image_slots', [0, 1])
+def test_image_initialization_option_does_not_add_image_input(fake_vllm, image_slots):
+    options, observed, _ = fake_vllm
+    engine = ModelEngine(replace(options, image_slots=image_slots))
+    try:
+        assert observed.llms[0].kwargs['limit_mm_per_prompt']['image'] == image_slots
+        assert engine.metadata['image_slots'] == image_slots
+        session = engine.new_session('zh')
+        session.generate(np.zeros(16000, np.float32))
+        assert set(observed.requests[-1]['multi_modal_data']) == {'audio'}
+        session.close()
+    finally:
+        engine.close()
+
+
 def test_exact_expansion_cached_only_on_commit(fake_vllm):
     options, observed, tok = fake_vllm
     engine = ModelEngine(options)
@@ -325,6 +340,7 @@ def test_invalid_audio_rejected(audio):
     {'max_audio_turns': 0}, {'max_tokens': True}, {'max_model_len': 100},
     {'gpu_memory_utilization': 1}, {'max_chunk_seconds': float('nan')},
     {'max_chunk_seconds': 9}, {'mm_processor_cache_gb': -1},
+    {'image_slots': -1}, {'image_slots': 2}, {'image_slots': True}, {'image_slots': 1.0},
 ])
 def test_invalid_options_rejected(changes):
     with pytest.raises(ValueError):

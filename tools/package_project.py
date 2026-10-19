@@ -9,7 +9,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, default=root.parent / 'FLEX-Web.zip')
     args = parser.parse_args()
-    top_files = {'run.py', 'infer_audio.py', 'start_server.sh', 'README.md', 'requirements.txt',
+    top_files = {'run.py', 'infer_audio.py', 'start_server.sh', 'run_infer.sh', 'README.md', 'requirements.txt',
                  'requirements-dev.txt', 'requirements-infer.txt', '.gitignore', '.gitattributes',
                  'CONTRIBUTING.md', 'SECURITY.md', '.github/workflows/tests.yml'}
     folders = {'flex_web', 'static', 'tests', 'docs', 'tools'}

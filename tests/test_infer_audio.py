@@ -317,6 +317,10 @@ def test_invalid_generation_is_journaled_never_committed_or_printed(tmp_path, ba
     assert case.state.read_samples == 2 * SAMPLE_RATE
     assert case.session.closed
     assert case.output.events[-1]['type'] == 'rejected_turn'
+    rejected = case.output.events[-1]
+    assert rejected['response'] == (bad.reply if isinstance(bad, Generation) else bad)
+    assert rejected['token_ids'] == [1]
+    assert rejected['message']
     assert not any(event['type'] == 'done' for event in case.output.events)
 
 
@@ -383,6 +387,7 @@ def audio_arg(tmp_path):
     ['--max-tokens', '0'], ['--gpu-memory-utilization', '1'],
     ['--gpu-memory-utilization', 'nan'], ['--mm-processor-cache-gb', '-1'],
     ['--direction', 'en-ja'], ['--protocol-form', 'invented'],
+    ['--image-slots', '-1'], ['--image-slots', '2'],
 ])
 def test_parse_args_rejects_unsafe_values(audio_arg, extra):
     with pytest.raises(SystemExit) as caught:
@@ -407,6 +412,7 @@ def test_parse_args_safe_defaults_and_explicit_real_local_checkpoint(audio_arg, 
     assert first.direction == 'en-zh'
     assert first.chunk_seconds == 1.0
     assert first.pace == 'realtime'
+    assert first.image_slots == cli.model_options(first).image_slots == 1
     assert first.output_dir != second.output_dir
     assert not first.output_dir.exists()
     checkpoint = tmp_path / 'checkpoint'
@@ -419,6 +425,11 @@ def test_parse_args_safe_defaults_and_explicit_real_local_checkpoint(audio_arg, 
     assert not options.prefix_caching
 
 
+def test_image_workaround_can_be_disabled_for_fixed_vllm(audio_arg):
+    args = cli.parse_args(audio_arg + ['--image-slots', '0'])
+    assert cli.model_options(args).image_slots == 0
+
+
 def test_main_mock_success_writes_transcript_and_explicit_mock_metadata(tmp_path):
     path = write_wav(tmp_path / 'input.wav', [0] * SAMPLE_RATE)
     destination = tmp_path / 'result'
@@ -427,12 +438,17 @@ def test_main_mock_success_writes_transcript_and_explicit_mock_metadata(tmp_path
     events = [json.loads(line) for line in (destination / 'events.jsonl').read_text('utf-8').splitlines()]
     assert events[0]['type'] == 'start'
     assert events[0]['mock'] is True
+    assert events[0]['image_slots'] == 1
+    assert events[1]['type'] == 'model_ready'
+    assert events[1]['mock'] is True
     assert events[-1]['type'] == 'done'
     assert events[-1]['complete_input'] is True
     transcript = (destination / 'translation.txt').read_text('utf-8')
     assert transcript
     assert '<|' not in transcript
     assert transcript == ''.join(event['delta'] for event in events if event['type'] == 'turn')
+    assert all(isinstance(event['token_ids'], list)
+               for event in events if event['type'] == 'turn')
 
 
 def test_main_model_initialization_error_has_nonzero_exit_and_no_fake_translation(

@@ -1,4 +1,4 @@
-"""Local, text-only Qwen3-Omni inference for the browser FLEX application.
+"""Local, text-only Qwen3-Omni inference shared by file and Web entry points.
 
 The server owns one ModelEngine on one serial worker thread. Creating a session
 changes only its private conversation, never loads another model. Audio is mono
@@ -82,12 +82,15 @@ class ModelOptions:
     enforce_eager: bool = True
     prefix_caching: bool = True
     seed: int = 42
+    image_slots: int = 0
 
     def __post_init__(self):
         if self.dtype not in ('auto', 'bfloat16', 'float16'):
             raise ValueError('dtype must be auto, bfloat16 or float16')
         if self.protocol_form not in ('auto', 'text', 'special'):
             raise ValueError('protocol_form must be auto, text or special')
+        if type(self.image_slots) is not int or self.image_slots not in (0, 1):
+            raise ValueError('image_slots must be 0 or 1')
         for name in ('gpu_memory_utilization', 'max_chunk_seconds', 'mm_processor_cache_gb'):
             if not math.isfinite(getattr(self, name)):
                 raise ValueError(f'{name} must be finite')
@@ -153,8 +156,8 @@ def load_tokenizer_checked(model, form):
 class ModelEngine:
     """One local checkpoint, two supported directions, fresh private histories.
 
-    Construct and call from a serial executor, not FastAPI's event-loop thread.
-    The surrounding server admits one active session at a time. vLLM is not
+    Construct and call serially: the file CLI uses its main thread, while the
+    Web server uses one worker, never FastAPI's event-loop thread. vLLM is not
     imported when backend='mock', allowing CPU-only development and tests.
     """
 
@@ -172,6 +175,7 @@ class ModelEngine:
             'max_model_len': self.options.max_model_len,
             'max_audio_turns': self.options.max_audio_turns,
             'max_chunk_seconds': self.options.max_chunk_seconds,
+            'image_slots': self.options.image_slots,
             'mock': backend == 'mock',
         }
         if backend == 'mock':
@@ -202,6 +206,9 @@ class ModelEngine:
         if vllm.__version__ != '0.11.1':
             LOG.warning('This adapter targets vLLM 0.11.1; actual version is %s. '
                         'Verify native Qwen3-Omni/preprocessor compatibility.', vllm.__version__)
+        if opts.image_slots:
+            LOG.info('Keeping one image slot enabled for Qwen3-Omni initialization compatibility; '
+                     'requests remain audio-only. This can increase GPU memory usage.')
         self.llm = LLM(
             model=opts.model, dtype=opts.dtype, tensor_parallel_size=1,
             gpu_memory_utilization=opts.gpu_memory_utilization,
@@ -210,7 +217,7 @@ class ModelEngine:
             limit_mm_per_prompt={
                 'audio': {'count': opts.max_audio_turns,
                           'length': round(opts.max_chunk_seconds * SAMPLE_RATE)},
-                'image': 0, 'video': 0},
+                'image': opts.image_slots, 'video': 0},
             mm_processor_cache_gb=opts.mm_processor_cache_gb, seed=opts.seed)
         # Never preprocess separately through the live engine's mirrored MM
         # sender cache. This independent, uncached counter touches only new audio.

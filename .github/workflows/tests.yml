@@ -32,11 +32,14 @@ jobs:
         run: python -m pytest -q tests --tb=short
       - name: Test PCM and AudioWorklet
         run: node static/test_pcm.mjs
-      - name: Test HTTP file capture compatibility
+      - name: Test historical capture adapter
         run: node static/test_capture.mjs
+      - name: Test uploaded-file playback progress
+        run: node static/test_file_playback.mjs
       - name: Check command-line entry point
         run: |
           python run.py --help
           python infer_audio.py --help
+          bash run_infer.sh --help
       - name: Check whitespace
         run: git diff --check

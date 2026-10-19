@@ -21,16 +21,17 @@ python run.py --backend mock --host 127.0.0.1 --port 8000
 python -m pytest -q tests
 node static/test_pcm.mjs
 node static/test_capture.mjs
+node static/test_file_playback.mjs
 python run.py --help
 python infer_audio.py --help
 git diff --check
 ```
 
-Python 测试不加载 checkpoint，不要求 GPU；`tests/test_infer_audio.py` 覆盖独立文件推理。Node 测试覆盖重采样、PCM 编码、AudioWorklet 与 HTTP 文件兼容采集的暂停/结束/取消；本地曾在 Node 18.17 验证，持续集成使用 Node 22。GitHub Actions 同时检查 Python 3.10、3.11；具体通过状态以对应运行记录为准。
+Python 测试不加载 checkpoint，不要求 GPU；`tests/test_infer_audio.py` 覆盖独立文件推理，上传媒体测试覆盖鉴权、解码、逐块释放和清理。Node 测试覆盖重采样、PCM 编码、AudioWorklet、文件播放进度和历史兼容适配器；新文件模式不再使用历史兼容适配器。持续集成使用 Node 22；具体通过状态以对应运行记录为准。
 
 涉及界面或音频链路的变更还需手动检查：
 
-1. 选择浏览器可播放的短音视频，确认只在实际播放时发送音频。
+1. 选择浏览器可播放的短音视频，确认先上传、后播放，模型只收到已播放的音频前缀；文件 WS 不应发送二进制 PCM。
 2. 检查暂停/恢复、自然结束及手动结束后的尾块处理。
 3. 确认正文只有新增译文，WAIT 不追加内容，FLEX/DIRECT 标签保留在时间线。
 4. 检查 TXT / JSON 导出、双向切换与小屏布局。
@@ -46,10 +47,10 @@ Python 测试不加载 checkpoint，不要求 GPU；`tests/test_infer_audio.py` 
 ```bash
 python run.py --backend mock --host 127.0.0.1 --port 8000 --no-log
 # 另一个终端执行；Playwright 需已安装在 Node 模块搜索路径中。
-node tools/browser_http_smoke.mjs --base-url http://127.0.0.1:8000
+node tools/browser_upload_smoke.mjs --base-url http://127.0.0.1:8000
 ```
 
-脚本只接受本地 mock 服务，自动生成合成 WAV 并清理，不接触模型权重或用户麦克风。使用非安全测试域名 `flex-http.test`（仅在测试浏览器内映射 127.0.0.1），不设置安全豁免 flags；覆盖普通 HTTP 文件采集与 localhost AudioWorklet。`--fixture /path/to/test.mp4` 可测试自备的合成视频；不要提供私密媒体。可用 `FLEX_PLAYWRIGHT_MODULE` 指定 Playwright 包的绝对路径，用 `FLEX_BROWSER_EXECUTABLE` 指定已安装的 Chrome/Edge。启用服务认证时，另在测试终端设置相同的 `FLEX_ACCESS_TOKEN`。
+脚本只接受本地 mock 服务，自动生成合成 WAV 并清理，不接触模型权重或用户麦克风。使用非安全测试域名 `flex-http.test`（仅在测试浏览器内映射 127.0.0.1），不设置安全豁免 flags；文件模式在 HTTP 与 localhost 都不应创建 AudioContext/采集器。人为阻塞主线程后应继续完成文件，而不是把“成功停止”当作本需求的通过标准。`--fixture /path/to/test.mp4` 可测试自备的合成视频；不要提供私密媒体。可用 `FLEX_PLAYWRIGHT_MODULE` 指定 Playwright 包的绝对路径，用 `FLEX_BROWSER_EXECUTABLE` 指定已安装的 Chrome/Edge。启用服务认证时，另在测试终端设置相同的 `FLEX_ACCESS_TOKEN`。旧 `browser_http_smoke.mjs` 仅保留为历史采集实现的测试记录，不用于当前文件上传模式验收。
 
 ## 必须保留的行为
 

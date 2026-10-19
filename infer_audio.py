@@ -226,9 +226,12 @@ def run_stream(args, engine, reader, output, state, *, clock=time.monotonic,
                     raise ProtocolError(f'finish_reason={result.finish_reason!r}; output not committed')
                 token_tag, delta = parse_reply(result.reply)
                 session.commit(model_audio, result)
-            except ProtocolError:
+            except ProtocolError as exc:
                 output.event('rejected_turn', source_start_s=source_start, source_end_s=source_end,
-                             response=result.reply, finish_reason=result.finish_reason)
+                             response=result.reply, token_ids=list(result.token_ids),
+                             finish_reason=result.finish_reason, message=str(exc))
+                LOG.error('Rejected model reply: %r; token_ids=%s; finish_reason=%r',
+                          result.reply, result.token_ids, result.finish_reason)
                 raise
             completed = clock()
             state.turns += 1
@@ -236,7 +239,8 @@ def run_stream(args, engine, reader, output, state, *, clock=time.monotonic,
             state.last_tag = token_tag[2:-2]
             state.deltas.append(delta)
             event = dict(turn_id=state.turns, tag=state.last_tag, delta=delta,
-                         response=result.reply, source_start_s=source_start, source_end_s=source_end,
+                         response=result.reply, token_ids=list(result.token_ids),
+                         source_start_s=source_start, source_end_s=source_end,
                          model_audio_s=len(model_audio) / SAMPLE_RATE,
                          service_s=completed - dispatch, generation_finished_elapsed_s=completed - start,
                          dispatch_lag_s=max(0.0, dispatch - start - source_end)
@@ -281,6 +285,9 @@ def parse_args(argv=None):
     p.add_argument('--max-audio-turns', type=int, default=256)
     p.add_argument('--max-tokens', type=int, default=160)
     p.add_argument('--mm-processor-cache-gb', type=float, default=2.0)
+    p.add_argument('--image-slots', type=int, choices=(0, 1), default=1,
+                   help='1: keep vision initialization enabled to avoid affected Qwen3-Omni '
+                        'meta/CUDA failures; input is still audio-only. 0: disable on fixed builds')
     p.add_argument('--no-prefix-caching', action='store_true')
     p.add_argument('--no-warmup', action='store_true', help='Skip the discarded pre-clock warmup')
     args = p.parse_args(argv)
@@ -311,7 +318,7 @@ def model_options(args):
                         max_tokens=args.max_tokens, protocol_form=args.protocol_form,
                         max_chunk_seconds=args.chunk_seconds,
                         mm_processor_cache_gb=args.mm_processor_cache_gb,
-                        prefix_caching=not args.no_prefix_caching)
+                        prefix_caching=not args.no_prefix_caching, image_slots=args.image_slots)
 
 
 def main(argv=None):
@@ -326,6 +333,7 @@ def main(argv=None):
                              source_name=args.audio.name, direction=args.direction,
                              model_name=Path(args.model).name if args.model else None,
                              protocol_form=args.protocol_form, max_model_len=args.max_model_len,
+                             image_slots=args.image_slots,
                              max_audio_turns=args.max_audio_turns, max_tokens=args.max_tokens,
                              chunk_seconds=args.chunk_seconds, pace=args.pace,
                              max_audio_seconds=args.max_audio_seconds)
@@ -338,6 +346,7 @@ def main(argv=None):
                     stack.callback(engine.close)
                     if not args.no_warmup:
                         engine.warmup(min(1.0, args.chunk_seconds))
+                    output.event('model_ready', **engine.metadata)
                     LOG.info('Model ready. Starting %s file replay; no audio playback/TTS.', args.pace)
                     run_stream(args, engine, reader, output, state)
                 LOG.info('Finished: %d turns, %.3fs audio. Translation: %s',

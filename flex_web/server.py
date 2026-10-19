@@ -25,11 +25,12 @@ from urllib.parse import urlsplit
 import uuid
 
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .model import ContextLimit, ModelEngine, ModelOptions, ProtocolError, parse_reply
+from .media import FileQueue, MAX_UPLOAD_BYTES, MediaError, MediaStore, decode_upload
 
 RATE = 16000
 STATIC = Path(__file__).resolve().parent.parent / 'static'
@@ -50,6 +51,10 @@ class Settings:
     allowed_origins: tuple[str, ...] = ()
     idle_timeout_seconds: float = 300.0
     model_options: ModelOptions | None = None
+    max_upload_bytes: int = MAX_UPLOAD_BYTES
+    max_uploads: int = 4
+    upload_timeout_seconds: float = 120.0
+    ffmpeg: str | None = None
 
     def validate(self):
         if self.backend not in ('mock', 'vllm'):
@@ -66,6 +71,10 @@ class Settings:
             raise ValueError('require 0.5 <= chunk_seconds <= max_chunk_seconds <= 6')
         if self.max_pending_seconds < self.max_chunk_seconds:
             raise ValueError('max_pending_seconds must be >= max_chunk_seconds')
+        if (type(self.max_upload_bytes) is not int or self.max_upload_bytes <= 0
+                or type(self.max_uploads) is not int or self.max_uploads <= 0
+                or not math.isfinite(self.upload_timeout_seconds) or self.upload_timeout_seconds <= 0):
+            raise ValueError('upload limits must be finite and positive')
 
 
 class ClientError(Exception):
@@ -170,9 +179,14 @@ def validate_start(data, settings):
         raise ClientError('bad_start', 'adaptive must be a boolean.')
     if data.get('source_kind') not in ('file', 'microphone'):
         raise ClientError('bad_start', 'source_kind must be file or microphone.')
+    media_id = data.get('media_id')
+    if media_id is not None and (data['source_kind'] != 'file' or not isinstance(media_id, str)
+                                 or len(media_id) != 32 or any(c not in '0123456789abcdef' for c in media_id)):
+        raise ClientError('bad_start', 'media_id must identify an uploaded file.')
     return dict(source_lang=source, target_lang=target, chunk_seconds=chunk,
                 adaptive=data.get('adaptive', True), source_kind=data['source_kind'],
-                source_name=str(data.get('source_name', ''))[:256], media_offset_s=offset)
+                source_name=str(data.get('source_name', ''))[:256], media_offset_s=offset,
+                media_id=media_id)
 
 
 def origin_allowed(ws, settings):
@@ -186,7 +200,7 @@ def origin_allowed(ws, settings):
     except ValueError:
         return False
     # Browser default: same host AND matching transport security, not arbitrary CORS.
-    scheme = 'https' if ws.url.scheme == 'wss' else 'http'
+    scheme = 'https' if ws.url.scheme in ('wss', 'https') else 'http'
     return parsed.scheme == scheme and parsed.netloc == ws.headers.get('host') and not parsed.path
 
 
@@ -197,6 +211,9 @@ def create_app(settings=None):
     @asynccontextmanager
     async def lifespan(app):
         app.state.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='flex-gpu')
+        app.state.media_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='flex-decode')
+        app.state.media = MediaStore(max_slots=settings.max_uploads)
+        expiry_task = None
         app.state.active = None
         app.state.status = 'loading'
         app.state.error = None
@@ -208,6 +225,11 @@ def create_app(settings=None):
             await asyncio.get_running_loop().run_in_executor(
                 app.state.executor, app.state.engine.warmup, min(1.0, settings.max_chunk_seconds))
             app.state.status = 'ready'
+            async def expire_uploads():
+                while True:
+                    await asyncio.sleep(30)
+                    app.state.media.expire()
+            expiry_task = asyncio.create_task(expire_uploads())
             yield
         finally:
             app.state.status = 'stopped'
@@ -216,6 +238,11 @@ def create_app(settings=None):
                     await asyncio.get_running_loop().run_in_executor(app.state.executor, app.state.engine.close)
             finally:
                 app.state.executor.shutdown(wait=True, cancel_futures=True)
+                if expiry_task:
+                    expiry_task.cancel()
+                    await asyncio.gather(expiry_task, return_exceptions=True)
+                app.state.media_executor.shutdown(wait=True, cancel_futures=True)
+                app.state.media.close()
 
     app = FastAPI(title='FLEX Live', lifespan=lifespan, docs_url=None, redoc_url=None)
 
@@ -239,7 +266,75 @@ def create_app(settings=None):
                     chunk_seconds=settings.chunk_seconds, max_chunk_seconds=settings.max_chunk_seconds,
                     max_pending_seconds=settings.max_pending_seconds,
                     max_session_seconds=settings.max_session_seconds, auth_required=bool(settings.token),
+                    file_mode='uploaded', max_upload_bytes=settings.max_upload_bytes,
                     status=app.state.status, busy=app.state.active is not None)
+
+    def require_media_access(request):
+        if not origin_allowed(request, settings):
+            raise HTTPException(403, detail=dict(code='origin', message='Cross-origin file upload is not allowed.'))
+        supplied = request.headers.get('authorization', '')
+        expected = f'Bearer {settings.token}'
+        if settings.token and not hmac.compare_digest(supplied.encode('utf-8'), expected.encode('utf-8')):
+            raise HTTPException(401, detail=dict(code='unauthorized', message='Invalid access token.'))
+
+    @app.post('/api/media')
+    async def upload_media(request: Request):
+        require_media_access(request)
+        item = None
+        decode_future = None
+        succeeded = False
+        try:
+            declared = request.headers.get('content-length')
+            if declared is not None:
+                try:
+                    length = int(declared)
+                except ValueError as exc:
+                    raise MediaError('upload_size', 'Invalid Content-Length.') from exc
+                if length < 0 or length > settings.max_upload_bytes:
+                    raise MediaError('upload_size', f'File exceeds upload limit ({settings.max_upload_bytes} bytes).', 413)
+            item = app.state.media.reserve(request.query_params.get('name', 'media'))
+            async def receive_file():
+                total = 0
+                with item.raw_path.open('xb') as output:
+                    async for piece in request.stream():
+                        total += len(piece)
+                        if total > settings.max_upload_bytes:
+                            raise MediaError('upload_size', f'File exceeds upload limit ({settings.max_upload_bytes} bytes).', 413)
+                        output.write(piece)
+                if not total:
+                    raise MediaError('empty_upload', 'Choose a non-empty audio or video file.')
+            await asyncio.wait_for(receive_file(), settings.upload_timeout_seconds)
+            decode_future = asyncio.get_running_loop().run_in_executor(
+                app.state.media_executor, functools.partial(
+                    decode_upload, item, settings.max_session_seconds, ffmpeg=settings.ffmpeg))
+            try:
+                await asyncio.shield(decode_future)
+            except asyncio.CancelledError:
+                # Do not delete an input while its decoding worker still owns it.
+                with suppress(Exception):
+                    await asyncio.shield(decode_future)
+                raise
+            item.ready = True
+            item.created = time.monotonic()
+            item.raw_path.unlink()  # Keep only bounded decoded audio for playback.
+            succeeded = True
+            return item.public()
+        except MediaError as exc:
+            raise HTTPException(exc.status, detail=dict(code=exc.code, message=str(exc))) from exc
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            raise HTTPException(408, detail=dict(code='upload_timeout', message='Upload timed out. Please retry with a smaller file.')) from exc
+        finally:
+            if item is not None and not succeeded:
+                app.state.media.discard(item.media_id, allow_claimed=True)
+
+    @app.delete('/api/media/{media_id}')
+    async def delete_media(media_id: str, request: Request):
+        require_media_access(request)
+        try:
+            app.state.media.discard(media_id)
+        except MediaError as exc:
+            raise HTTPException(exc.status, detail=dict(code=exc.code, message=str(exc))) from exc
+        return dict(deleted=True)
 
     @app.get('/api/health')
     def health():
@@ -269,6 +364,7 @@ def create_app(settings=None):
         model_session = None
         aborted = asyncio.Event()
         disconnected = False
+        uploaded = None
 
         async def send(event_type, **fields):
             event = dict(type=event_type, session_id=session_id,
@@ -313,7 +409,14 @@ def create_app(settings=None):
                         except ValueError as exc:
                             raise ClientError('bad_control', 'Control message must be valid JSON.') from exc
                         kind = data.get('type') if isinstance(data, dict) else None
+                        if kind == 'progress' and isinstance(buffer, FileQueue):
+                            buffer.advance(data.get('position_s'))
+                            continue
                         if kind == 'finish':
+                            if isinstance(buffer, FileQueue):
+                                if not isinstance(data.get('ended', False), bool):
+                                    raise ClientError('bad_control', 'ended must be a boolean.')
+                                buffer.advance(data.get('position_s'))
                             buffer.finish()
                             # Keep observing cancellation/disconnection while the
                             # worker drains. The worker closes the reader on EOF.
@@ -323,7 +426,7 @@ def create_app(settings=None):
                         if kind == 'ping':
                             await send('pong')
                         else:
-                            raise ClientError('bad_control', 'Expected finish, cancel or ping.')
+                            raise ClientError('bad_control', 'Expected progress (uploaded files), finish, cancel or ping.')
             except Exception as exc:
                 failure = exc
                 aborted.set()
@@ -358,9 +461,21 @@ def create_app(settings=None):
                     finished = time.monotonic()
                     if aborted.is_set():
                         return  # Never commit or publish after cancellation.
-                    if result.finish_reason != 'stop':
-                        raise ProtocolError(f'Generation ended with {result.finish_reason!r}; no partial output committed.')
-                    token_tag, delta = parse_reply(result.reply)
+                    try:
+                        if result.finish_reason != 'stop':
+                            raise ProtocolError(f'Generation ended with {result.finish_reason!r}; no partial output committed.')
+                        token_tag, delta = parse_reply(result.reply)
+                    except ProtocolError:
+                        rejected = dict(type='rejected_turn', session_id=session_id, turn_id=turn,
+                                        response=result.reply, token_ids=list(result.token_ids),
+                                        finish_reason=result.finish_reason,
+                                        source_start_s=sample_start / RATE,
+                                        source_end_s=(sample_start + len(audio)) / RATE)
+                        LOG.error('Rejected model output session=%s turn=%s finish=%r reply=%r token_ids=%r',
+                                  session_id, turn, result.finish_reason, result.reply, result.token_ids)
+                        if journal:
+                            journal.write(rejected)
+                        raise
                     tag = token_tag[2:-2]  # Wire/UI label; original token remains in model history.
                     model_session.commit(model_audio, result)
                     processed = sample_start + len(audio)
@@ -402,11 +517,18 @@ def create_app(settings=None):
             app.state.active = session_id  # Atomic: no await between check and acquire.
             owned = True
             journal = SessionLog(settings.log_dir, session_id)
-            buffer = PCMQueue(settings.max_pending_seconds, settings.max_session_seconds)
+            if start['media_id']:
+                uploaded = app.state.media.claim(start['media_id'])
+                buffer = FileQueue(uploaded, start['media_offset_s'], round(start['chunk_seconds'] * RATE))
+                start['adaptive'] = False
+            else:
+                buffer = PCMQueue(settings.max_pending_seconds, settings.max_session_seconds)
             model_session = app.state.engine.new_session(start['target_lang'])
+            file_fields = dict(file_mode='uploaded', **uploaded.public()) if uploaded else {}
             await send('ready', sample_rate=RATE, backend=settings.backend,
                        chunk_seconds=start['chunk_seconds'], max_chunk_seconds=settings.max_chunk_seconds,
-                       max_session_seconds=settings.max_session_seconds, config=start)
+                       max_session_seconds=settings.max_session_seconds, config=start,
+                       **{k: v for k, v in file_fields.items() if k != 'sample_rate'})
             reader = asyncio.create_task(receive())
             worker = asyncio.create_task(process(model_session, start))
             status = asyncio.create_task(ticker())
@@ -432,7 +554,7 @@ def create_app(settings=None):
                        final_wait=last_tag == 'WAIT', **stats())
         except Exception as exc:
             failure = exc
-            if isinstance(exc, ClientError):
+            if isinstance(exc, (ClientError, MediaError)):
                 code = exc.code
             elif isinstance(exc, ContextLimit):
                 code = 'context_limit'
@@ -462,6 +584,13 @@ def create_app(settings=None):
                     model_session.close()
                 except Exception:
                     LOG.exception('Could not release history for %s', session_id)
+            if isinstance(buffer, FileQueue):
+                buffer.close()
+            if uploaded is not None:
+                try:
+                    app.state.media.discard(uploaded.media_id, allow_claimed=True)
+                except Exception:
+                    LOG.exception('Could not remove temporary upload for %s', session_id)
             if owned and app.state.active == session_id:
                 app.state.active = None
             if journal:
@@ -499,6 +628,9 @@ def main():
     parser.add_argument('--protocol-form', choices=['auto', 'special', 'text'], default='auto')
     parser.add_argument('--mm-processor-cache-gb', type=float, default=2.0)
     parser.add_argument('--no-prefix-caching', action='store_true')
+    parser.add_argument('--image-slots', type=int, choices=[0, 1], default=1,
+                        help='Qwen3-Omni initialization compatibility: 1 retains vision initialization; input remains audio-only')
+    parser.add_argument('--ffmpeg', default=None, help='Optional FFmpeg executable path for uploaded audio/video decoding')
     args = parser.parse_args()
     token = os.environ.get(args.token_env, '')
     if args.host not in ('127.0.0.1', 'localhost', '::1') and not token:
@@ -512,12 +644,12 @@ def main():
                            gpu_memory_utilization=args.gpu_memory_utilization,
                            protocol_form=args.protocol_form, max_chunk_seconds=args.max_chunk_seconds,
                            mm_processor_cache_gb=args.mm_processor_cache_gb,
-                           prefix_caching=not args.no_prefix_caching)
+                           prefix_caching=not args.no_prefix_caching, image_slots=args.image_slots)
     settings = Settings(backend=args.backend, model=args.model, directions=tuple(args.directions),
                         log_dir=None if args.no_log else args.log_dir, token=token,
                         allowed_origins=tuple(args.allow_origin), chunk_seconds=args.chunk_seconds,
                         max_chunk_seconds=args.max_chunk_seconds, max_pending_seconds=args.max_pending_seconds,
-                        max_session_seconds=args.max_session_seconds, model_options=options)
+                        max_session_seconds=args.max_session_seconds, model_options=options, ffmpeg=args.ffmpeg)
     import uvicorn
     # A single worker is essential: each extra worker would load another GPU model.
     uvicorn.run(create_app(settings), host=args.host, port=args.port, workers=1,

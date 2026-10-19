@@ -36,10 +36,11 @@
           <div id="mediaStage" class="media-stage">
             <video id="media" controls playsinline preload="metadata" hidden></video>
             <div id="audioArtwork" class="audio-artwork" hidden><div class="audio-disc"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l11-2v13M9 8l11-2"/><ellipse cx="6" cy="18" rx="3" ry="2"/><ellipse cx="17" cy="16" rx="3" ry="2"/></svg></div><div class="audio-bars" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div><span>让声音，跨越语言</span></div>
-            <button id="dropZone" class="drop-zone"><span class="upload-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m-4 4 4-4 4 4M4 15v5h16v-5"/></svg></span><strong>放入一段音视频，开始同传</strong><span>拖放文件到这里，或点击选择</span><small>支持浏览器可播放的 MP4 / WebM / WAV / MP3 等格式</small><span class="local-file-note">文件在浏览器本地播放，仅已播放的音频送入服务器</span></button>
+            <button id="dropZone" class="drop-zone"><span class="upload-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m-4 4 4-4 4 4M4 15v5h16v-5"/></svg></span><strong>放入一段音视频，开始同传</strong><span>拖放文件到这里，或点击选择</span><small>支持浏览器可播放的 MP4 / WebM / WAV / MP3 等格式</small><span class="local-file-note">开始时上传完整文件，模型只接收已播放的音频</span></button>
           </div>
           <div class="media-info"><div class="file-description"><span id="fileType" class="file-type">MEDIA</span><div><strong id="fileName">尚未选择文件</strong><small id="fileDetails">可直接对照视频中的原始字幕</small></div></div><button id="chooseFile" class="button button-small">选择文件</button></div>
           <div class="source-options"><button id="chooseSubtitle" class="text-button" disabled>＋ 添加 VTT 字幕</button><span id="subtitleName">支持视频内嵌画面字幕与外部 WebVTT</span><button id="removeSubtitle" class="text-button" hidden>移除</button></div>
+          <p class="source-options">完整文件临时上传到当前服务器，会话结束后清理；模型只读取已播放的部分。</p>
           <input id="fileInput" type="file" accept="audio/*,video/*,.mkv,.mov,.mp4,.webm,.wav,.mp3,.m4a,.ogg,.flac" hidden>
           <input id="subtitleInput" type="file" accept=".vtt,text/vtt" hidden>
         </div>
@@ -57,7 +58,7 @@
     </section>
 
     <section class="session-bar" aria-label="会话控制和状态"><div class="transport"><button id="startButton" class="button button-primary" disabled><span>▶</span>开始同传</button><button id="pauseButton" class="button" disabled>暂停播放</button><button id="finishButton" class="button" disabled><span class="stop-icon"></span>结束同传</button></div><div class="metrics"><div><span>已接收音频</span><strong id="receivedMetric">0.0<small> s</small></strong></div><div><span>待推理音频</span><strong id="pendingMetric">0.0<small> s</small></strong></div><div><span>最近推理耗时</span><strong id="serviceMetric">—<small> s</small></strong></div><div><span>已处理音频</span><strong id="processedMetric">0.0<small> s</small></strong></div></div></section>
-    <footer class="workspace-footer"><span><i></i><span id="footerHint">模型在服务器本地运行，浏览器负责实时采集与展示。</span></span><span>音频时间 ≠ 语义延迟 · 保留真实逐轮记录</span></footer>
+    <footer class="workspace-footer"><span><i></i><span id="footerHint">模型在服务器本地运行，文件按播放进度逐块推理；麦克风需要 HTTPS / localhost。</span></span><span>音频时间 ≠ 语义延迟 · 保留真实逐轮记录</span></footer>
   </main>
   <script type="module" src="/static/app.js"></script>
 </body>

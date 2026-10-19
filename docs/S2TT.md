@@ -20,6 +20,14 @@ python infer_audio.py --help
 
 ## 2. 英→中
 
+最简单的入口（独立 special-token checkpoint）：
+
+```bash
+CUDA_VISIBLE_DEVICES=6 bash run_infer.sh /absolute/path/to/checkpoint-merged /absolute/path/to/english.wav --direction en-zh
+```
+
+启动脚本默认 1 秒分块、fast、special；尾随参数可以覆盖默认值。它不切换当前目录，所以相对路径保持原含义。无需运行 Web 服务。独立五文件包见 [快速使用说明](S2TT-QUICKSTART.md)，可用 `python tools/package_s2tt.py` 构建；包内将共享模型模块命名为 `flex_model.py`，不依赖原仓库。
+
 在仓库根目录执行：
 
 ```bash
@@ -74,10 +82,14 @@ CUDA_VISIBLE_DEVICES=0 python infer_audio.py \
 
 ## 6. 输出与限制
 
+`model_ready` 记录模型适配层的版本/配置；每轮 `turn` 和协议失败的 `rejected_turn` 也记录原始 `token_ids`。协议错误同时在终端显示原始回复，避免只得到泛化的前缀错误。
+
+文件入口默认 `--image-slots 1`，绕过受影响 vLLM 的 Qwen3-Omni 视觉禁用初始化问题；请求仍只有音频。它可能增加显存占用，已修复的版本可用 `--image-slots 0`。详见 [上游问题](https://github.com/vllm-project/vllm/issues/49384)。Web 入口默认值不随此文件入口改变。
+
 ```text
 outputs/en-zh-first/
   translation.txt   精确保留增量空白的纯译文，没有协议标签
-  events.jsonl      start、turn、done 或 error；无效响应记为 rejected_turn
+  events.jsonl      start、model_ready、turn、done 或 error；无效响应记为 rejected_turn
 ```
 
 `turn` 包含 `tag`、`delta`、原始 `response`、源音频起止位置、实际模型输入长度、`service_s`、`dispatch_lag_s` 和 prompt token 数。`generation_finished_elapsed_s` 是从回放起点到生成/提交检查完成的墙钟时间，不是字幕实际渲染时刻；日志写入及终端输出发生在其后。源音频区间是本轮输入块位置，不是译文内容的精确语义对齐。统计中的 `read_audio_s` 仅代表已经读取的前缀，不代表完整文件时长；发生错误时两者可能不同。

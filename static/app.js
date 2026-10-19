@@ -1,5 +1,5 @@
 import { makeAudioPacket } from './pcm-core.js';
-import { createFileCaptureAdapter, selectCaptureMode } from './capture-adapter.js';
+import { FilePlaybackClock } from './file-playback.js';
 
 const $ = id => document.getElementById(id);
 const ui = Object.fromEntries([
@@ -17,10 +17,10 @@ const BUSY_STATES = new Set(['connecting','live','paused','draining']);
 const MAX_NETWORK_BUFFER_BYTES = 256 * 1024;
 let config = null, mode = 'file', state = 'idle', selectedFile = null;
 let mediaUrl = null, subtitleUrl = null, subtitleTrack = null;
-let audioContext = null, mediaSource = null, monitor = null, workletLoaded = false;
+let audioContext = null, monitor = null, workletLoaded = false;
 let session = null, sessionNumber = 0, followOutput = true, pollTimer = null;
 let currentTranslation = '', turns = [], transcriptFragments = 0, lastMetrics = {};
-let lastExport = null;
+let lastExport = null, microphoneAdaptive = ui.adaptive.checked;
 
 function busy() { return BUSY_STATES.has(state); }
 function current(s) { return session === s; }
@@ -49,6 +49,9 @@ function updateControls() {
   ui.finishButton.disabled = !['connecting','live','paused'].includes(state);
   ui.finishButton.lastChild.textContent = state === 'connecting' ? '取消连接' : '结束同传';
   for (const element of [ui.fileMode,ui.micMode,ui.sourceLang,ui.targetLang,ui.swapLang,ui.chooseFile,ui.chunkSeconds,ui.adaptive,ui.authToken]) element.disabled = active;
+  ui.adaptive.disabled = active || mode === 'file';
+  ui.adaptive.checked = mode === 'microphone' && microphoneAdaptive;
+  ui.adaptiveHint.textContent = mode === 'file' ? '文件采用固定分块，页面卡顿不会改变切块或丢失音频' : `最多合并 ${config?.max_chunk_seconds || 3} 秒，保持顺序、不丢音频`;
   ui.dropZone.disabled = active;
   ui.chooseSubtitle.disabled = active || !selectedFile;
   ui.removeSubtitle.disabled = active;
@@ -61,7 +64,7 @@ function updateControls() {
   ui.micDescription.textContent = state === 'live' ? '正常说话即可，译文会逐步出现在右侧。' : '开始同传时，浏览器会请求麦克风权限。';
   ui.audioArtwork.classList.toggle('playing', mode === 'file' && !ui.media.paused);
   const labels = {idle:'等待开始',connecting:'准备音频与连接服务',live:'同传进行中',paused:'播放已暂停 · 处理已接收音频',draining:'正在处理剩余音频',done:'本次同传已结束',error:'会话已停止'};
-  statusLabel(labels[state] || state, state === 'live' ? 'live' : state === 'error' ? 'error' : '');
+  statusLabel(state === 'connecting' ? session?.preparationLabel || labels.connecting : labels[state] || state, state === 'live' ? 'live' : state === 'error' ? 'error' : '');
 }
 function setState(value) { state = value; updateControls(); }
 function setMode(value) {
@@ -165,10 +168,10 @@ async function loadConfig() {
   }
 }
 
-async function ensureAudioContext(sourceKind) {
-  // Reject microphone permission attempts before creating audio resources, but
-  // do not apply that browser restriction to a user-selected local file.
-  if (sourceKind === 'microphone' && !window.isSecureContext) {
+async function ensureAudioContext() {
+  // This function is exclusively for microphone input. File playback never
+  // constructs an AudioContext and works over ordinary intranet HTTP.
+  if (!window.isSecureContext) {
     throw new Error('普通远程 HTTP 不能请求麦克风权限。请选择音视频文件进行同传；麦克风模式需要 HTTPS 或 localhost。');
   }
   const AudioContextClass = window.AudioContext || window.webkitAudioContext;
@@ -178,13 +181,74 @@ async function ensureAudioContext(sourceKind) {
     monitor = audioContext.createGain(); monitor.connect(audioContext.destination);
   }
   await audioContext.resume();
-  const captureMode = selectCaptureMode({sourceKind,isSecureContext:window.isSecureContext,
-    hasWorklet:Boolean(audioContext.audioWorklet && window.AudioWorkletNode),
-    hasScriptProcessor:typeof audioContext.createScriptProcessor === 'function'});
-  if (captureMode === 'worklet' && !workletLoaded) {
+  if (!audioContext.audioWorklet || !window.AudioWorkletNode) throw new Error('麦克风模式需要支持 AudioWorklet 的近期版本 Chrome / Edge，以及 HTTPS 或 localhost。');
+  if (!workletLoaded) {
     await audioContext.audioWorklet.addModule('/static/capture-worklet.js'); workletLoaded = true;
   }
-  return captureMode;
+  return 'worklet';
+}
+function releaseUploadedFile(s) {
+  if (!s.mediaId || s.mediaClaimed || s.uploadReleased) return;
+  s.uploadReleased = true;
+  void fetch(`/api/media/${encodeURIComponent(s.mediaId)}`,{method:'DELETE',headers:s.authToken ? {Authorization:`Bearer ${s.authToken}`} : {},keepalive:true}).catch(() => {});
+}
+async function prepareUploadedFile(s) {
+  if (config.file_mode !== 'uploaded') throw new Error('服务器尚未启用文件上传同传。请更新并重启服务，然后刷新页面；不会退回不稳定的浏览器采集模式。');
+  ui.media.pause(); ui.media.playbackRate = 1;
+  s.captureMode = 'server-file'; s.preparationLabel = '正在上传文件 · 完成后准备音轨'; updateControls();
+  const result = await new Promise((resolve,reject) => {
+    const xhr = new XMLHttpRequest(); s.uploadRequest = xhr;
+    xhr.open('POST',`/api/media?name=${encodeURIComponent(s.sourceName)}`);
+    xhr.setRequestHeader('Content-Type','application/octet-stream');
+    if (s.authToken) xhr.setRequestHeader('Authorization',`Bearer ${s.authToken}`);
+    xhr.upload.onprogress = event => {
+      if (!current(s) || s.terminal) return;
+      s.preparationLabel = event.lengthComputable && event.loaded < event.total
+        ? `正在上传文件 · ${Math.floor(event.loaded/event.total*100)}%`
+        : '上传完成 · 服务器正在准备音轨';
+      updateControls();
+    };
+    xhr.onload = () => {
+      s.uploadRequest = null;
+      let body;
+      try { body = JSON.parse(xhr.responseText); } catch (_) { reject(new Error(`文件上传失败（HTTP ${xhr.status}），服务器未返回有效结果。`)); return; }
+      if (xhr.status < 200 || xhr.status >= 300) {
+        const detail = typeof body.detail === 'string' ? body.detail : body.detail?.message;
+        reject(new Error(detail || body.message || `文件上传失败（HTTP ${xhr.status}）。`)); return;
+      }
+      // Save the ID before checking cancellation so a late upload response is
+      // still deleted rather than leaving an unclaimed file on the server.
+      s.mediaId = body.media_id;
+      if (!current(s) || s.terminal) releaseUploadedFile(s);
+      resolve(body);
+    };
+    xhr.onerror = () => {s.uploadRequest = null;reject(new Error('文件上传连接中断，请检查网络后重试。'));};
+    xhr.onabort = () => {s.uploadRequest = null;reject(new Error('文件上传已取消。'));};
+    xhr.send(selectedFile);
+  });
+  if (!current(s) || s.terminal) return;
+  if (typeof result.media_id !== 'string' || !result.media_id || result.sample_rate !== 16000 || !Number.isSafeInteger(result.samples) || result.samples <= 0) throw new Error('服务器返回的音频准备结果不完整，请检查服务器版本。');
+  const duration = result.samples/16000;
+  if (!Number.isFinite(result.duration_s) || Math.abs(result.duration_s-duration) > 1/16000) throw new Error('服务器返回的音频时长与采样数不一致。');
+  s.fileClock = new FilePlaybackClock({offset:s.mediaOffset,duration,browserDuration:ui.media.duration});
+  if (Math.abs(ui.media.currentTime-s.mediaOffset) > 1/16000) throw new Error('文件准备期间播放位置发生了变化，请在新位置重新开始同传。');
+  s.preparationLabel = '音轨已准备 · 正在连接推理服务'; updateControls();
+}
+function filePosition(s, finishing = false) {
+  const position = s.fileClock.read(ui.media.currentTime,finishing && ui.media.ended);
+  s.sentSamples = Math.round((position-s.mediaOffset)*16000);
+  return position;
+}
+function sendFileProgress(s, force = false) {
+  if (!current(s) || s.terminal || !s.ready || s.sourceKind !== 'file' || !['live','paused'].includes(state)) return;
+  try {
+    const position = filePosition(s);
+    if (!force && position === s.lastPosition) return;
+    if (s.ws?.readyState !== WebSocket.OPEN) throw new Error('同传连接已断开，请重新开始。');
+    // Progress messages carry positions, not audio. After a delayed callback
+    // one update releases the missing prefix from the intact server-side file.
+    s.ws.send(JSON.stringify({type:'progress',position_s:position})); s.lastPosition = position;
+  } catch (error) {void failSession(s,error.message);}
 }
 function gate(s, operation) {
   if (!s.node) return Promise.resolve();
@@ -205,24 +269,16 @@ function sendPCM(s, samples) {
   s.ws.send(packet); s.sequence++; s.sentSamples += samples.length;
 }
 async function prepareCapture(s) {
-  s.captureMode = await ensureAudioContext(s.sourceKind);
+  if (s.sourceKind === 'file') {await prepareUploadedFile(s);return;}
+  s.captureMode = await ensureAudioContext();
   if (!current(s) || s.terminal) return;
-  if (mode === 'microphone') {
-    if (!navigator.mediaDevices?.getUserMedia) throw new Error('浏览器无法访问麦克风，请确认 HTTPS / localhost 以及麦克风权限。');
-    s.stream = await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false});
-    if (!current(s) || s.terminal) { s.stream.getTracks().forEach(track => track.stop()); return; }
-    s.source = audioContext.createMediaStreamSource(s.stream);
-    for (const track of s.stream.getAudioTracks()) track.addEventListener('ended',() => {if (!s.terminal && state === 'live') void failSession(s,'麦克风连接中断，请检查设备后重新开始。');});
-  } else {
-    ui.media.pause(); ui.media.playbackRate = 1;
-    if (!mediaSource) mediaSource = audioContext.createMediaElementSource(ui.media);
-    mediaSource.disconnect(); s.source = mediaSource;
-  }
-  monitor.gain.value = mode === 'microphone' ? 0 : 1;
-  s.node = s.captureMode === 'http-file'
-    ? createFileCaptureAdapter(audioContext,{media:ui.media,mediaOffset:s.mediaOffset,
-      frameSamples:1600,onError:error => {void failSession(s,error.message);}})
-    : new AudioWorkletNode(audioContext,'flex-capture',{numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[2],processorOptions:{sampleRate:16000,frameSamples:1600}});
+  if (!navigator.mediaDevices?.getUserMedia) throw new Error('浏览器无法访问麦克风，请确认 HTTPS / localhost 以及麦克风权限。');
+  s.stream = await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false});
+  if (!current(s) || s.terminal) { s.stream.getTracks().forEach(track => track.stop()); return; }
+  s.source = audioContext.createMediaStreamSource(s.stream);
+  for (const track of s.stream.getAudioTracks()) track.addEventListener('ended',() => {if (!s.terminal && state === 'live') void failSession(s,'麦克风连接中断，请检查设备后重新开始。');});
+  monitor.gain.value = 0;
+  s.node = new AudioWorkletNode(audioContext,'flex-capture',{numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[2],processorOptions:{sampleRate:16000,frameSamples:1600}});
   s.node.port.onmessage = ({data}) => {
     if (data.type === 'ack') { const ack = s.acks.get(data.requestId); if (ack) { s.acks.delete(data.requestId); ack.resolve(); } }
     if (data.type === 'pcm') sendPCM(s,new Int16Array(data.buffer));
@@ -230,22 +286,21 @@ async function prepareCapture(s) {
   };
   s.node.onprocessorerror = () => {void failSession(s,'浏览器音频处理线程发生错误，请重新开始会话。');};
   s.source.connect(s.node.inputNode || s.node); s.node.connect(monitor);
-  if (s.captureMode === 'http-file') {
-    ui.footerHint.textContent = '文件 HTTP 兼容模式 · 请保持页面在前台 · 麦克风仍需 HTTPS / localhost · HTTP 传输未加密';
-  }
 }
 async function cleanupCapture(s) {
   clearInterval(s.pingTimer);
+  clearInterval(s.progressTimer);
+  s.uploadRequest?.abort();
+  releaseUploadedFile(s);
   if (s.cleanupPromise) return s.cleanupPromise;
   s.cleanupPromise = (async () => {
-    if (mode === 'file') ui.media.pause();
+    if (s.sourceKind === 'file' && current(s)) ui.media.pause();
     if (s.node) {
       try { await gate(s,'cancel'); } catch (_) { /* Teardown still disconnects nodes. */ }
       s.node.port.onmessage = null; s.node.disconnect(); s.node.port.close(); s.node = null;
     }
     if (s.source) {try{s.source.disconnect();}catch(_){}s.source = null;}
     if (s.stream) {s.stream.getTracks().forEach(track => track.stop());s.stream = null;}
-    if (mediaSource && monitor) {try{mediaSource.disconnect();mediaSource.connect(monitor);monitor.gain.value = 1;}catch(_){}}
     for (const ack of s.acks.values()) ack.reject();
     s.acks.clear(); ui.micMeter.firstElementChild.style.width = '0%';
   })();
@@ -258,7 +313,7 @@ function openSocket(s) {
     s.startupTimer = startupTimer;
     ws.onopen = () => {
       if (s.terminal) {ws.close();return;}
-      ws.send(JSON.stringify({type:'start',source_lang:s.sourceLang,target_lang:s.targetLang,chunk_seconds:s.chunkSeconds,adaptive:s.adaptive,source_kind:s.sourceKind,source_name:s.sourceName,media_offset_s:s.mediaOffset,...(config.auth_required ? {token:ui.authToken.value} : {})}));
+      ws.send(JSON.stringify({type:'start',source_lang:s.sourceLang,target_lang:s.targetLang,chunk_seconds:s.chunkSeconds,adaptive:s.adaptive,source_kind:s.sourceKind,source_name:s.sourceName,media_offset_s:s.mediaOffset,...(s.mediaId ? {media_id:s.mediaId} : {}),...(s.authToken ? {token:s.authToken} : {})}));
     };
     ws.onmessage = ({data}) => {
       if (!current(s)) return;
@@ -276,6 +331,10 @@ function openSocket(s) {
         if (event.type === 'ready') {
           clearTimeout(startupTimer);
           if (event.sample_rate && event.sample_rate !== 16000) throw new Error('服务器音频采样率与浏览器协议不一致。');
+          if (s.sourceKind === 'file') {
+            if (event.file_mode !== 'uploaded' || event.media_id !== s.mediaId) throw new Error('服务器未确认上传文件会话，请更新并重启服务。');
+            s.mediaClaimed = true;
+          }
           s.sessionId = event.session_id; s.readyEvent = event; s.ready = true;
           s.pingTimer = setInterval(() => {if(!s.terminal && ws.readyState === WebSocket.OPEN)ws.send(JSON.stringify({type:'ping'}));},20000);
           resolve();
@@ -319,18 +378,21 @@ async function startSession() {
   if (mode === 'file' && (ui.media.ended || (Number.isFinite(ui.media.duration) && ui.media.currentTime >= ui.media.duration - .05))) ui.media.currentTime = 0;
   if (session) await cleanupCapture(session);
   clearTranscript(); ui.errorBox.hidden = true; ui.settings.open = false;
-  const s = {number:++sessionNumber,sourceLang:ui.sourceLang.value,targetLang:ui.targetLang.value,sourceKind:mode,sourceName:mode === 'file' ? selectedFile.name : 'microphone',mediaOffset:mode === 'file' ? ui.media.currentTime : 0,chunkSeconds:Number(ui.chunkSeconds.value),adaptive:ui.adaptive.checked,startedAt:performance.now(),startedDate:new Date().toISOString(),sequence:0,sentSamples:0,gateSequence:0,acks:new Map(),terminal:false,ready:false};
+  const s = {number:++sessionNumber,sourceLang:ui.sourceLang.value,targetLang:ui.targetLang.value,sourceKind:mode,sourceName:mode === 'file' ? selectedFile.name : 'microphone',mediaOffset:mode === 'file' ? ui.media.currentTime : 0,chunkSeconds:Number(ui.chunkSeconds.value),adaptive:mode === 'microphone' && ui.adaptive.checked,authToken:ui.authToken.value.trim(),startedAt:performance.now(),startedDate:new Date().toISOString(),sequence:0,sentSamples:0,gateSequence:0,acks:new Map(),terminal:false,ready:false};
   session = s; setState('connecting');
   try {
     await prepareCapture(s); if (!current(s) || s.terminal) return;
     await openSocket(s); if (!current(s) || s.terminal) return;
     s.startedAt = performance.now();
-    // For a file, 'playing' activates capture; buffering/paused render quanta
-    // must not become fabricated silent source audio.
     if (mode === 'microphone') await gate(s,'active');
     if (!current(s) || s.terminal) return;
     setState('live');
-    if (mode === 'file') await ui.media.play();
+    if (mode === 'file') {
+      s.progressTimer = setInterval(() => sendFileProgress(s),200);
+      ui.footerHint.textContent = '文件由服务器按播放进度读取 · 页面短暂卡顿可续接 · 麦克风仍需 HTTPS / localhost';
+      sendFileProgress(s,true);
+      await ui.media.play();
+    }
     updateControls();
   } catch (error) {
     const message = error.name === 'NotAllowedError' ? '浏览器拒绝了音频权限或自动播放。请允许麦克风 / 播放权限后重新开始。' : error.name === 'NotFoundError' ? '没有找到可用麦克风，请连接设备后重试。' : error.message;
@@ -342,28 +404,28 @@ async function finishSession() {
   if (!s || s.terminal || !['connecting','live','paused'].includes(state)) return;
   if (state === 'connecting') {await failSession(s,'连接准备已取消。','已取消');return;}
   setState('draining');
-  if (mode === 'file') ui.media.pause();
+  if (s.sourceKind === 'file') {clearInterval(s.progressTimer);ui.media.pause();}
   try {
     await gate(s,'finish');
     if (s.terminal) return;
     if (s.stream) s.stream.getTracks().forEach(track => track.stop());
     if (s.ws?.readyState !== WebSocket.OPEN) throw new Error('结束时服务器连接已断开，剩余音频无法确认。');
-    s.ws.send(JSON.stringify({type:'finish'}));
+    s.ws.send(JSON.stringify({type:'finish',...(s.sourceKind === 'file' ? {position_s:filePosition(s,true),ended:ui.media.ended} : {})}));
   } catch (error) {await failSession(s,error.message);}
 }
 async function pauseCapture() {
   const s = session;
   if (!s || s.terminal || mode !== 'file' || state !== 'live') return;
   setState('paused');
-  try {await gate(s,'pause');} catch (error) {await failSession(s,error.message);}
+  sendFileProgress(s,true);
 }
 async function resumeCapture() {
   const s = session;
   if (!s || s.terminal || mode !== 'file' || state !== 'paused') return;
-  try {await audioContext.resume();if(!s.terminal)setState('live');}catch(error){await failSession(s,error.message);}
+  setState('live'); sendFileProgress(s,true);
 }
 function exportData(s = session) {
-  return {schema_version:1,backend:config?.backend,model_label:config?.model_label,session_id:s?.sessionId || null,source_language:s?.sourceLang || ui.sourceLang.value,target_language:s?.targetLang || ui.targetLang.value,source_kind:s?.sourceKind || mode,source_name:s?.sourceName || null,capture_mode:s?.captureMode || null,media_offset_s:s?.mediaOffset || 0,started_at:s?.startedDate || null,ended_at:s?.endedAt || null,sample_rate:16000,sent_audio_s:(s?.sentSamples || 0)/16000,chunk_seconds:s?.chunkSeconds,adaptive:s?.adaptive,translation:currentTranslation,turns:[...turns],final_metrics:{...lastMetrics},done:s?.doneEvent || null,error:s?.failure || null,timing_note:'source_start_s/source_end_s are input audio intervals, not word alignment or semantic latency. Add media_offset_s to compare against file playback time. client_elapsed_s includes actual inference/network scheduling. http-file is a main-thread compatibility path, not a sample-accurate latency benchmark.'};
+  return {schema_version:1,backend:config?.backend,model_label:config?.model_label,session_id:s?.sessionId || null,source_language:s?.sourceLang || ui.sourceLang.value,target_language:s?.targetLang || ui.targetLang.value,source_kind:s?.sourceKind || mode,source_name:s?.sourceName || null,capture_mode:s?.captureMode || null,media_offset_s:s?.mediaOffset || 0,started_at:s?.startedDate || null,ended_at:s?.endedAt || null,sample_rate:16000,sent_audio_s:(s?.sentSamples || 0)/16000,chunk_seconds:s?.chunkSeconds,adaptive:s?.adaptive,translation:currentTranslation,turns:[...turns],final_metrics:{...lastMetrics},done:s?.doneEvent || null,error:s?.failure || null,timing_note:'source_start_s/source_end_s are input audio intervals, not word alignment or semantic latency. Add media_offset_s to compare against file playback time. client_elapsed_s excludes file upload/preparation and includes actual inference/network scheduling. server-file uploads the complete file but releases only the played prefix to the model; natural EOF reconciles small player/decoder duration differences. Browser progress events are not sample-accurate latency measurements.'};
 }
 function download(kind) {
   const data = session ? exportData(session) : lastExport;
@@ -394,6 +456,7 @@ function chooseFile(file) {
 ui.dismissError.onclick = () => {ui.errorBox.hidden = true;};
 ui.fileMode.onclick = () => setMode('file');ui.micMode.onclick = () => setMode('microphone');
 ui.sourceLang.onchange = () => updateDirection('source');ui.targetLang.onchange = () => updateDirection('target');
+ui.adaptive.onchange = () => {if(mode === 'microphone' && !busy())microphoneAdaptive = ui.adaptive.checked;};
 ui.swapLang.onclick = () => {ui.sourceLang.value = ui.targetLang.value;updateDirection('source');};
 ui.chooseFile.onclick = ui.dropZone.onclick = () => {if(!busy())ui.fileInput.click();};
 ui.fileInput.onchange = () => chooseFile(ui.fileInput.files[0]);
@@ -416,20 +479,20 @@ ui.media.addEventListener('pause',() => {ui.audioArtwork.classList.remove('playi
 ui.media.addEventListener('play',() => {ui.audioArtwork.classList.add('playing');if(state === 'connecting' || state === 'draining')ui.media.pause();else void resumeCapture();});
 ui.media.addEventListener('playing',() => {
   const s = session;
-  if (s && !s.terminal && state === 'live') {
+  if (s && s.sourceKind === 'file' && !s.terminal && state === 'live') {
     statusLabel('同传进行中','live');
-    void gate(s,'active').catch(error => failSession(s,error.message));
+    sendFileProgress(s,true);
   }
 });
 ui.media.addEventListener('waiting',() => {
   const s = session;
-  if (s && !s.terminal && state === 'live') {
-    statusLabel('媒体缓冲中 · 采集暂缓');
-    void gate(s,'pause').catch(error => failSession(s,error.message));
+  if (s && s.sourceKind === 'file' && !s.terminal && state === 'live') {
+    statusLabel('媒体缓冲中 · 已播放音频继续推理');
+    sendFileProgress(s,true);
   }
 });
 ui.media.addEventListener('ended',() => {if(['live','paused'].includes(state))void finishSession();});
-ui.media.addEventListener('seeking',() => {if(['live','paused'].includes(state))void failSession(session,'播放位置发生改变，当前因果上下文已终止。请在新位置重新开始同传，历史译文不会被修改。','跳转后需要新会话');});
+ui.media.addEventListener('seeking',() => {if(['live','paused'].includes(state) || (state === 'connecting' && session?.sourceKind === 'file' && Math.abs(ui.media.currentTime-session.mediaOffset) > 1/16000))void failSession(session,'播放位置发生改变，当前因果上下文已终止。请在新位置重新开始同传，历史译文不会被修改。','跳转后需要新会话');});
 ui.media.addEventListener('ratechange',() => {if(['live','paused'].includes(state) && ui.media.playbackRate !== 1)void failSession(session,'同传会话只支持 1× 实时播放。变速会破坏时序比较，本次会话已停止。','播放速率已改变');});
 ui.startButton.onclick = () => {void startSession();};
 ui.pauseButton.onclick = async () => {
@@ -446,13 +509,13 @@ window.addEventListener('beforeunload',event => {
   if (busy()) {event.preventDefault();event.returnValue = '';}
 });
 window.addEventListener('pagehide',() => {
-  if(session && !session.terminal){session.terminal = true;if(session.ws?.readyState === WebSocket.OPEN){session.ws.send(JSON.stringify({type:'cancel'}));session.ws.close();}session.stream?.getTracks().forEach(track => track.stop());}
+  if(session && !session.terminal){session.terminal = true;clearInterval(session.progressTimer);session.uploadRequest?.abort();releaseUploadedFile(session);if(session.ws?.readyState === WebSocket.OPEN){session.ws.send(JSON.stringify({type:'cancel'}));session.ws.close();}session.stream?.getTracks().forEach(track => track.stop());}
 });
 setInterval(() => {
   const seconds = mode === 'file' ? ui.media.currentTime : (session?.sentSamples || 0)/16000;
   ui.sourceClock.textContent = time(seconds);
   ui.clockDescription.textContent = mode === 'file'
-    ? (session?.captureMode === 'http-file' ? '源媒体播放时间 · HTTP 兼容采集' : '源媒体播放时间')
+    ? (session?.captureMode === 'server-file' ? '源媒体播放时间 · 服务器按进度读取' : '源媒体播放时间')
     : '已采集源音频';
 },200);
 updateControls();void loadConfig();
