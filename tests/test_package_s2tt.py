@@ -163,8 +163,8 @@ expected = ((np.arange(54000, dtype=np.int64) * 37) % 30001 - 15000).astype(np.i
 expected = expected.astype(np.float32) / 32768.0
 original_generate = flex_model.ModelSession._mock_generate
 
-def audited_generate(self, audio):
-    index = len(self.audios)
+def audited_generate(self, audio, plan, extra):
+    index = self.total_committed_turns
     assert index < 4, 'Unexpected extra inference round'
     chunk = expected[index * 16000:(index + 1) * 16000]
     chunk = np.pad(chunk, (0, 16000 - len(chunk)))
@@ -172,7 +172,7 @@ def audited_generate(self, audio):
     for previous_index, previous_audio in enumerate(self.audios):
         np.testing.assert_array_equal(
             previous_audio, expected[previous_index * 16000:(previous_index + 1) * 16000])
-    return original_generate(self, audio)
+    return original_generate(self, audio, plan, extra)
 
 flex_model.ModelSession._mock_generate = audited_generate
 sys.argv[0] = str(bundle / 'infer_audio.py')

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import logging
@@ -174,11 +174,12 @@ class RunState:
     processed_samples: int = 0
     read_samples: int = 0
     last_tag: str | None = None
-    deltas: list = field(default_factory=list)
+    translation_chars: int = 0
 
     def stats(self):
         return dict(turns=self.turns, processed_audio_s=self.processed_samples / SAMPLE_RATE,
-                    read_audio_s=self.read_samples / SAMPLE_RATE, last_tag=self.last_tag)
+                    read_audio_s=self.read_samples / SAMPLE_RATE, last_tag=self.last_tag,
+                    translation_chars=self.translation_chars)
 
 
 def run_stream(args, engine, reader, output, state, *, clock=time.monotonic,
@@ -194,6 +195,7 @@ def run_stream(args, engine, reader, output, state, *, clock=time.monotonic,
     duration_limit = round(args.max_audio_seconds * SAMPLE_RATE)
     session = engine.new_session(args.direction.split('-')[1])
     start = clock()
+    previous_rollovers = 0
     try:
         while True:
             audio = reader.read(chunk_samples)
@@ -237,7 +239,11 @@ def run_stream(args, engine, reader, output, state, *, clock=time.monotonic,
             state.turns += 1
             state.processed_samples = state.read_samples
             state.last_tag = token_tag[2:-2]
-            state.deltas.append(delta)
+            state.translation_chars += len(delta)
+            context = getattr(session, 'context_metadata', {})
+            if context.get('rollovers', 0) != previous_rollovers:
+                previous_rollovers = context['rollovers']
+                output.event('context_window', turn_id=state.turns, context=context)
             event = dict(turn_id=state.turns, tag=state.last_tag, delta=delta,
                          response=result.reply, token_ids=list(result.token_ids),
                          source_start_s=source_start, source_end_s=source_end,
@@ -245,7 +251,7 @@ def run_stream(args, engine, reader, output, state, *, clock=time.monotonic,
                          service_s=completed - dispatch, generation_finished_elapsed_s=completed - start,
                          dispatch_lag_s=max(0.0, dispatch - start - source_end)
                          if args.pace == 'realtime' else None,
-                         prompt_tokens=result.prompt_tokens)
+                         prompt_tokens=result.prompt_tokens, context=context)
             output.event('turn', **event)
             output.append(delta)
             if delta:
@@ -274,8 +280,11 @@ def parse_args(argv=None):
     p.add_argument('--pace', choices=('realtime', 'fast'), default='realtime',
                    help='realtime: simulate 1x audio arrival; fast: chunked inference without waiting')
     p.add_argument('--output-dir', type=Path, help='NEW directory for translation.txt and events.jsonl')
-    p.add_argument('--max-audio-seconds', type=float, default=180.0,
-                   help='Explicit file-session safety limit; longer input fails, not silently truncated')
+    p.add_argument('--max-audio-seconds', type=float, default=28800.0,
+                   help='Total input cap (default 8 hours), separate from rolling model context')
+    p.add_argument('--context-policy', choices=('rolling', 'stop'), default='rolling')
+    p.add_argument('--history-window-seconds', type=float, default=120.0)
+    p.add_argument('--history-retain-seconds', type=float, default=60.0)
     p.add_argument('--ffmpeg', default='ffmpeg', help='FFmpeg executable for non-native audio formats')
     p.add_argument('--backend', choices=('vllm', 'mock'), default='vllm')
     p.add_argument('--protocol-form', choices=('auto', 'special', 'text'), default='auto')
@@ -318,6 +327,8 @@ def model_options(args):
                         max_tokens=args.max_tokens, protocol_form=args.protocol_form,
                         max_chunk_seconds=args.chunk_seconds,
                         mm_processor_cache_gb=args.mm_processor_cache_gb,
+                        context_policy=args.context_policy, history_window_seconds=args.history_window_seconds,
+                        history_retain_seconds=args.history_retain_seconds,
                         prefix_caching=not args.no_prefix_caching, image_slots=args.image_slots)
 
 
@@ -336,6 +347,8 @@ def main(argv=None):
                              image_slots=args.image_slots,
                              max_audio_turns=args.max_audio_turns, max_tokens=args.max_tokens,
                              chunk_seconds=args.chunk_seconds, pace=args.pace,
+                             context_policy=args.context_policy, history_window_seconds=args.history_window_seconds,
+                             history_retain_seconds=args.history_retain_seconds,
                              max_audio_seconds=args.max_audio_seconds)
                 LOG.info('Outputs: %s', output.directory)
                 if args.backend == 'mock':

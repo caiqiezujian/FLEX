@@ -26,12 +26,14 @@ import uuid
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
+from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
 
 from .model import ContextLimit, ModelEngine, ModelOptions, ProtocolError, parse_reply
 from .media import FileQueue, MAX_UPLOAD_BYTES, MediaError, MediaStore, decode_upload
 from .tls import TLSConfigError, prepare_local_tls, validate_tls_files
+from .results import ResultLimit, ResultStore
 
 RATE = 16000
 STATIC = Path(__file__).resolve().parent.parent / 'static'
@@ -47,14 +49,18 @@ class Settings:
     chunk_seconds: float = 1.0
     max_chunk_seconds: float = 3.0
     max_pending_seconds: float = 12.0
-    max_session_seconds: float = 180.0
+    max_session_seconds: float = 28800.0
     token: str = ''
     allowed_origins: tuple[str, ...] = ()
     idle_timeout_seconds: float = 300.0
     model_options: ModelOptions | None = None
     max_upload_bytes: int = MAX_UPLOAD_BYTES
     max_uploads: int = 4
-    upload_timeout_seconds: float = 120.0
+    upload_timeout_seconds: float = 3600.0
+    decode_timeout_seconds: float = 1800.0
+    temp_dir: Path | None = None
+    max_result_bytes: int = 256 * 1024 * 1024
+    result_retention_hours: float = 24.0
     ffmpeg: str | None = None
 
     def validate(self):
@@ -72,10 +78,16 @@ class Settings:
             raise ValueError('require 0.5 <= chunk_seconds <= max_chunk_seconds <= 6')
         if self.max_pending_seconds < self.max_chunk_seconds:
             raise ValueError('max_pending_seconds must be >= max_chunk_seconds')
+        if self.max_session_seconds * RATE > 2**32 - 1:
+            raise ValueError('max_session_seconds exceeds the PCM transport sample-offset range (about 74 hours)')
         if (type(self.max_upload_bytes) is not int or self.max_upload_bytes <= 0
                 or type(self.max_uploads) is not int or self.max_uploads <= 0
                 or not math.isfinite(self.upload_timeout_seconds) or self.upload_timeout_seconds <= 0):
             raise ValueError('upload limits must be finite and positive')
+        if (not math.isfinite(self.decode_timeout_seconds) or self.decode_timeout_seconds <= 0
+                or not math.isfinite(self.result_retention_hours) or self.result_retention_hours <= 0
+                or type(self.max_result_bytes) is not int or self.max_result_bytes <= 0):
+            raise ValueError('decode/result limits must be finite and positive')
 
 
 class ClientError(Exception):
@@ -105,7 +117,7 @@ class PCMQueue:
             raise ClientError('sequence_gap', 'Audio sequence/sample offset is discontinuous; start a new session.')
         audio = np.frombuffer(packet, dtype='<i2', offset=8).astype(np.float32) / 32768.0
         if self.received + len(audio) > self.limit:
-            raise ClientError('session_limit', 'Session duration limit reached. Finish and start a new segment; history was not silently removed.')
+            raise ClientError('session_limit', 'Configured total session duration reached. Increase --max-session-seconds for a longer session; this is separate from the rolling model context.')
         if self.pending + len(audio) > self.capacity:
             raise ClientError('backlog_limit', 'Inference cannot keep up: pending audio limit reached. No queued audio was silently dropped; this session is stopping.')
         self.parts.append((audio, time.monotonic()))
@@ -213,13 +225,18 @@ def create_app(settings=None):
     async def lifespan(app):
         app.state.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='flex-gpu')
         app.state.media_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='flex-decode')
-        app.state.media = MediaStore(max_slots=settings.max_uploads)
+        if settings.temp_dir is not None:
+            Path(settings.temp_dir).mkdir(parents=True, exist_ok=True)
+        app.state.media = MediaStore(max_slots=settings.max_uploads, temp_dir=settings.temp_dir)
+        app.state.results = ResultStore(temp_dir=settings.temp_dir, max_bytes=settings.max_result_bytes,
+                                       ttl_seconds=settings.result_retention_hours * 3600)
         expiry_task = None
         app.state.active = None
         app.state.status = 'loading'
         app.state.error = None
         options = settings.model_options or ModelOptions(model=settings.model,
                                                          max_chunk_seconds=settings.max_chunk_seconds)
+        app.state.model_options = options
         try:
             make = functools.partial(ModelEngine, options, backend=settings.backend)
             app.state.engine = await asyncio.get_running_loop().run_in_executor(app.state.executor, make)
@@ -230,6 +247,7 @@ def create_app(settings=None):
                 while True:
                     await asyncio.sleep(30)
                     app.state.media.expire()
+                    app.state.results.expire()
             expiry_task = asyncio.create_task(expire_uploads())
             yield
         finally:
@@ -244,6 +262,7 @@ def create_app(settings=None):
                     await asyncio.gather(expiry_task, return_exceptions=True)
                 app.state.media_executor.shutdown(wait=True, cancel_futures=True)
                 app.state.media.close()
+                app.state.results.close()
 
     app = FastAPI(title='FLEX Live', lifespan=lifespan, docs_url=None, redoc_url=None)
 
@@ -268,6 +287,10 @@ def create_app(settings=None):
                     max_pending_seconds=settings.max_pending_seconds,
                     max_session_seconds=settings.max_session_seconds, auth_required=bool(settings.token),
                     file_mode='uploaded', max_upload_bytes=settings.max_upload_bytes,
+                    result_retention_hours=settings.result_retention_hours,
+                    context_policy=app.state.model_options.context_policy,
+                    history_window_seconds=app.state.model_options.history_window_seconds,
+                    history_retain_seconds=app.state.model_options.history_retain_seconds,
                     status=app.state.status, busy=app.state.active is not None)
 
     def require_media_access(request):
@@ -307,7 +330,8 @@ def create_app(settings=None):
             await asyncio.wait_for(receive_file(), settings.upload_timeout_seconds)
             decode_future = asyncio.get_running_loop().run_in_executor(
                 app.state.media_executor, functools.partial(
-                    decode_upload, item, settings.max_session_seconds, ffmpeg=settings.ffmpeg))
+                    decode_upload, item, settings.max_session_seconds,
+                    timeout=settings.decode_timeout_seconds, ffmpeg=settings.ffmpeg))
             try:
                 await asyncio.shield(decode_future)
             except asyncio.CancelledError:
@@ -324,6 +348,8 @@ def create_app(settings=None):
             raise HTTPException(exc.status, detail=dict(code=exc.code, message=str(exc))) from exc
         except (asyncio.TimeoutError, TimeoutError) as exc:
             raise HTTPException(408, detail=dict(code='upload_timeout', message='Upload timed out. Please retry with a smaller file.')) from exc
+        except OSError as exc:
+            raise HTTPException(507, detail=dict(code='media_storage', message='Temporary media storage failed. Check free disk space and --temp-dir on the server.')) from exc
         finally:
             if item is not None and not succeeded:
                 app.state.media.discard(item.media_id, allow_claimed=True)
@@ -341,6 +367,22 @@ def create_app(settings=None):
     def health():
         return dict(status=app.state.status, backend=settings.backend, busy=app.state.active is not None)
 
+    @app.get('/api/sessions/{session_id}/export')
+    async def export_result(session_id: str, request: Request, format: str = 'json'):
+        require_media_access(request)
+        if format not in ('txt', 'json'):
+            raise HTTPException(400, detail=dict(code='export_format', message='Use format=txt or format=json.'))
+        app.state.results.expire()
+        item = app.state.results.items.get(session_id)
+        if item is None:
+            raise HTTPException(404, detail=dict(code='result_missing', message='Session results expired or the server restarted. Download results before leaving the session.'))
+        snapshot = item.snapshot()
+        iterator = snapshot.iter_text() if format == 'txt' else snapshot.iter_json()
+        return StreamingResponse(iterator,
+                                 media_type='text/plain; charset=utf-8' if format == 'txt' else 'application/json',
+                                 headers={'Content-Disposition': f'attachment; filename="FLEX-{session_id}.{format}"'},
+                                 background=BackgroundTask(snapshot.close))
+
     @app.get('/')
     def index():
         return FileResponse(STATIC / 'index.html')
@@ -354,12 +396,15 @@ def create_app(settings=None):
         session_id = uuid.uuid4().hex
         owned = False
         journal = None
+        result_store = None
         tasks = []
         send_lock = asyncio.Lock()
         begin = time.monotonic()
         buffer = None
         processed, in_flight = 0, False
-        translation = []
+        translation = []  # Small backward-compatible final preview only.
+        translation_chars = turn_count = 0
+        preview_complete = True
         last_tag = None
         failure = None
         model_session = None
@@ -371,6 +416,16 @@ def create_app(settings=None):
             event = dict(type=event_type, session_id=session_id,
                          utc=datetime.now(timezone.utc).isoformat(),
                          server_elapsed_s=time.monotonic() - begin, **fields)
+            if result_store:
+                try:
+                    result_store.write(event)
+                except Exception:
+                    if event_type not in ('error', 'done'):
+                        raise
+                    # Preserve termination diagnostics even when the disk budget
+                    # cannot hold another event. Exported turns remain a valid prefix.
+                    result_store.metadata[event_type] = event
+                    LOG.exception('Could not persist final export event for %s', session_id)
             if journal:
                 try:
                     journal.write(event)
@@ -386,7 +441,17 @@ def create_app(settings=None):
                         processed_audio_s=processed / RATE,
                         pending_audio_s=buffer.pending / RATE,
                         unprocessed_audio_s=(buffer.received - processed) / RATE,
-                        in_flight=in_flight)
+                        in_flight=in_flight,
+                        input_finished=buffer.closed,
+                        context=getattr(model_session, 'context_metadata', {}))
+
+        def result_summary():
+            summary = dict(translation_chars=translation_chars, turn_count=turn_count,
+                           results_available=result_store is not None,
+                           translation_truncated=not preview_complete)
+            if preview_complete:
+                summary['translation'] = ''.join(translation)
+            return summary
 
         async def receive():
             nonlocal failure, disconnected
@@ -434,10 +499,11 @@ def create_app(settings=None):
                 buffer.finish()
 
         async def process(model_session, start):
-            nonlocal processed, in_flight, failure, last_tag
+            nonlocal processed, in_flight, failure, last_tag, translation_chars, turn_count, preview_complete
             base = round(start['chunk_seconds'] * RATE)
             maximum = round(settings.max_chunk_seconds * RATE)
             turn = 0
+            previous_rollovers = 0
             try:
                 while not aborted.is_set():
                     block = await buffer.take(base, maximum, start['adaptive'])
@@ -482,7 +548,18 @@ def create_app(settings=None):
                     processed = sample_start + len(audio)
                     last_tag = tag
                     in_flight = False
-                    translation.append(delta)
+                    translation_chars += len(delta)
+                    turn_count += 1
+                    if preview_complete and translation_chars <= 16384:
+                        if delta:
+                            translation.append(delta)
+                    else:
+                        preview_complete = False
+                        translation.clear()
+                    context = getattr(model_session, 'context_metadata', {})
+                    if context.get('rollovers', 0) != previous_rollovers:
+                        previous_rollovers = context['rollovers']
+                        await send('context_window', turn_id=turn, context=context)
                     await send('turn', turn_id=turn, tag=tag, delta=delta, response=result.reply,
                                source_start_s=sample_start / RATE, source_end_s=processed / RATE,
                                media_offset_s=start['media_offset_s'], audio_seconds=len(audio) / RATE,
@@ -518,6 +595,7 @@ def create_app(settings=None):
             app.state.active = session_id  # Atomic: no await between check and acquire.
             owned = True
             journal = SessionLog(settings.log_dir, session_id)
+            result_store = app.state.results.create(session_id)
             if start['media_id']:
                 uploaded = app.state.media.claim(start['media_id'])
                 buffer = FileQueue(uploaded, start['media_offset_s'], round(start['chunk_seconds'] * RATE))
@@ -529,6 +607,7 @@ def create_app(settings=None):
             await send('ready', sample_rate=RATE, backend=settings.backend,
                        chunk_seconds=start['chunk_seconds'], max_chunk_seconds=settings.max_chunk_seconds,
                        max_session_seconds=settings.max_session_seconds, config=start,
+                       results_available=True, result_retention_hours=settings.result_retention_hours,
                        **{k: v for k, v in file_fields.items() if k != 'sample_rate'})
             reader = asyncio.create_task(receive())
             worker = asyncio.create_task(process(model_session, start))
@@ -551,8 +630,8 @@ def create_app(settings=None):
             await asyncio.gather(reader, status, return_exceptions=True)
             if failure:
                 raise failure
-            await send('done', reason='finished', translation=''.join(translation), last_tag=last_tag,
-                       final_wait=last_tag == 'WAIT', **stats())
+            await send('done', reason='finished', last_tag=last_tag,
+                       final_wait=last_tag == 'WAIT', **result_summary(), **stats())
         except Exception as exc:
             failure = exc
             if isinstance(exc, (ClientError, MediaError)):
@@ -561,6 +640,8 @@ def create_app(settings=None):
                 code = 'context_limit'
             elif isinstance(exc, ProtocolError):
                 code = 'model_protocol'
+            elif isinstance(exc, ResultLimit):
+                code = 'result_limit'
             elif isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
                 code = 'timeout'
             else:
@@ -569,7 +650,7 @@ def create_app(settings=None):
             with suppress(Exception):
                 await send('error', code=code, message=str(exc), **(stats() if buffer else {}))
             with suppress(Exception):
-                await send('done', reason=code, translation=''.join(translation), **(stats() if buffer else {}))
+                await send('done', reason=code, **result_summary(), **(stats() if buffer else {}))
         finally:
             aborted.set()
             if buffer:
@@ -599,6 +680,11 @@ def create_app(settings=None):
                     journal.close()
                 except Exception:
                     LOG.exception('Could not close event log for %s', session_id)
+            if result_store:
+                try:
+                    result_store.finish()
+                except Exception:
+                    LOG.exception('Could not close result spool for %s', session_id)
             with suppress(Exception):
                 await ws.close(code=1000 if not failure and not disconnected else 1011)
 
@@ -627,7 +713,10 @@ def main():
     parser.add_argument('--chunk-seconds', type=float, default=1.0)
     parser.add_argument('--max-chunk-seconds', type=float, default=3.0)
     parser.add_argument('--max-pending-seconds', type=float, default=12.0)
-    parser.add_argument('--max-session-seconds', type=float, default=180.0)
+    parser.add_argument('--max-session-seconds', type=float, default=28800.0, help='Total input duration cap; default 8 hours, separate from rolling model context')
+    parser.add_argument('--context-policy', choices=['rolling', 'stop'], default='rolling')
+    parser.add_argument('--history-window-seconds', type=float, default=120.0)
+    parser.add_argument('--history-retain-seconds', type=float, default=60.0)
     parser.add_argument('--max-model-len', type=int, default=8192)
     parser.add_argument('--max-audio-turns', type=int, default=256)
     parser.add_argument('--max-tokens', type=int, default=160)
@@ -639,6 +728,12 @@ def main():
     parser.add_argument('--image-slots', type=int, choices=[0, 1], default=1,
                         help='Qwen3-Omni initialization compatibility: 1 retains vision initialization; input remains audio-only')
     parser.add_argument('--ffmpeg', default=None, help='Optional FFmpeg executable path for uploaded audio/video decoding')
+    parser.add_argument('--max-upload-mb', type=int, default=4096, help='Per-upload disk limit in MiB')
+    parser.add_argument('--upload-timeout-seconds', type=float, default=3600)
+    parser.add_argument('--decode-timeout-seconds', type=float, default=1800)
+    parser.add_argument('--temp-dir', type=Path, default=None, help='Temporary media/results directory; choose a disk with space for long files')
+    parser.add_argument('--max-result-mb', type=int, default=256, help='Temporary result budget per session in MiB; does not silently truncate exports')
+    parser.add_argument('--result-retention-hours', type=float, default=24)
     args = parser.parse_args()
     if args.https_host and (args.ssl_certfile or args.ssl_keyfile):
         parser.error('Use either --https-host or --ssl-certfile + --ssl-keyfile, not both')
@@ -658,12 +753,18 @@ def main():
                            gpu_memory_utilization=args.gpu_memory_utilization,
                            protocol_form=args.protocol_form, max_chunk_seconds=args.max_chunk_seconds,
                            mm_processor_cache_gb=args.mm_processor_cache_gb,
+                           context_policy=args.context_policy, history_window_seconds=args.history_window_seconds,
+                           history_retain_seconds=args.history_retain_seconds,
                            prefix_caching=not args.no_prefix_caching, image_slots=args.image_slots)
     settings = Settings(backend=args.backend, model=args.model, directions=tuple(args.directions),
                         log_dir=None if args.no_log else args.log_dir, token=token,
                         allowed_origins=tuple(args.allow_origin), chunk_seconds=args.chunk_seconds,
                         max_chunk_seconds=args.max_chunk_seconds, max_pending_seconds=args.max_pending_seconds,
-                        max_session_seconds=args.max_session_seconds, model_options=options, ffmpeg=args.ffmpeg)
+                        max_session_seconds=args.max_session_seconds, model_options=options, ffmpeg=args.ffmpeg,
+                        max_upload_bytes=args.max_upload_mb * 1024 * 1024,
+                        upload_timeout_seconds=args.upload_timeout_seconds, decode_timeout_seconds=args.decode_timeout_seconds,
+                        temp_dir=args.temp_dir, max_result_bytes=args.max_result_mb * 1024 * 1024,
+                        result_retention_hours=args.result_retention_hours)
     # Validate deployment/TLS before loading the GPU model. Default HTTP is unchanged.
     settings.validate()
     tls_options = {}

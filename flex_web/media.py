@@ -21,7 +21,7 @@ import wave
 import numpy as np
 
 RATE = 16000
-MAX_UPLOAD_BYTES = 256 * 1024 * 1024
+MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024
 
 
 class MediaError(Exception):
@@ -55,8 +55,10 @@ class Upload:
 
 class MediaStore:
     """Event-loop-owned reservations; decoding is delegated to bounded workers."""
-    def __init__(self, max_slots=4, ttl_seconds=600):
-        self.temporary = tempfile.TemporaryDirectory(prefix='flex-media-')
+    def __init__(self, max_slots=4, ttl_seconds=600, *, temp_dir=None):
+        # Long recordings belong on a configured disk, not necessarily /tmp
+        # (which can be a small RAM-backed filesystem on deployment hosts).
+        self.temporary = tempfile.TemporaryDirectory(prefix='flex-media-', dir=temp_dir)
         self.root = Path(self.temporary.name)
         self.uploads = {}
         self.max_slots, self.ttl_seconds = max_slots, ttl_seconds
@@ -131,7 +133,7 @@ def _container(path):
     raise MediaError('unsupported_media', 'Unsupported or invalid media. Choose WAV, MP3, MP4/M4A, WebM/MKV, OGG, FLAC, AAC, AIFF or AVI; playlists are not accepted.')
 
 
-def decode_upload(item, max_seconds, timeout=60, *, ffmpeg=None):
+def decode_upload(item, max_seconds, timeout=1800, *, ffmpeg=None):
     """Write bounded 16k mono PCM16; reject overlong or empty media explicitly."""
     limit = round(max_seconds * RATE)
     container = _container(item.raw_path)
@@ -228,12 +230,19 @@ class FileQueue:
             raise MediaError('backward_seek', 'Backward seeking is not supported in an append-only session. Start a new session at that position.')
         if available > self.received:
             released = time.monotonic()
-            # At most one timestamp per fixed inference chunk, regardless of
-            # progress-message frequency. Preserve the original availability
-            # time even while newer progress arrives behind a slow model turn.
-            while self.next_boundary <= available:
-                self.availability.append((self.next_boundary, released))
-                self.next_boundary += self.chunk_samples
+            # A delayed progress update can release hours of disk-backed audio.
+            # Store its fixed-chunk boundaries as one inclusive range instead
+            # of allocating one tuple per chunk. Later updates must not replace
+            # the original availability time of an older queued chunk.
+            if self.next_boundary <= available:
+                last = available // self.chunk_samples * self.chunk_samples
+                if (self.availability and self.availability[-1][2] == released
+                        and self.availability[-1][1] + self.chunk_samples == self.next_boundary):
+                    first, _, stamp = self.availability[-1]
+                    self.availability[-1] = (first, last, stamp)
+                else:
+                    self.availability.append((self.next_boundary, last, released))
+                self.next_boundary = last + self.chunk_samples
             self.pending += available - self.received
             self.received = available
             self.released_at = released
@@ -259,7 +268,13 @@ class FileQueue:
         self.pending -= size
         arrived = self.released_at
         while self.availability and self.availability[0][0] <= self.taken:
-            _, arrived = self.availability.popleft()
+            first, last, arrived = self.availability[0]
+            if last <= self.taken:
+                self.availability.popleft()
+            else:
+                first += ((self.taken - first) // self.chunk_samples + 1) * self.chunk_samples
+                self.availability[0] = (first, last, arrived)
+                break
         audio = np.frombuffer(data, dtype='<i2').astype(np.float32) / 32768.0
         return start, audio, arrived
 

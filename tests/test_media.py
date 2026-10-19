@@ -3,6 +3,7 @@ import asyncio
 import io
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 import wave
 
 import numpy as np
@@ -80,24 +81,54 @@ def test_playlists_and_non_media_never_reach_ffmpeg(store, monkeypatch, data):
     assert failure.value.code == 'unsupported_media'
 
 
-def test_ffmpeg_command_is_bounded_and_preserves_audio_timestamps(store, monkeypatch):
+@pytest.mark.parametrize('max_seconds', [3, 8 * 60 * 60])
+def test_ffmpeg_command_is_bounded_and_preserves_audio_timestamps(store, monkeypatch, max_seconds):
     monkeypatch.setattr(media.shutil, 'which', lambda _: '/usr/bin/ffmpeg')
     command = []
     def fake_run(args, **kwargs):
         command.extend(args)
-        assert kwargs['timeout'] == 60
+        assert kwargs['timeout'] == 1800
         Path(args[-1]).write_bytes(b'\0\0' * 500)
         return type('Result', (), {'returncode': 0})()
     monkeypatch.setattr(media.subprocess, 'run', fake_run)
     item = store.reserve('attacker-selected-name.mp4')
     item.raw_path.write_bytes(b'\0\0\0\x18ftypisom' + b'\0' * 30)
-    media.decode_upload(item, 3)
+    media.decode_upload(item, max_seconds)
     assert command[command.index('-protocol_whitelist') + 1] == 'file,pipe'
     assert command[command.index('-f') + 1] == 'mov'
     assert 'aresample=async=1:first_pts=0' in command
-    assert command[command.index('-fs') + 1] == str((3 * 16000 + 1) * 2)
+    assert command[command.index('-fs') + 1] == str((max_seconds * 16000 + 1) * 2)
+    assert command[command.index('-t') + 1] == str(max_seconds + 1)
     assert command[command.index('-i') + 1] == str(item.raw_path)
     assert item.samples == 500
+
+
+def test_media_store_uses_configured_temporary_disk(tmp_path):
+    parent = tmp_path / 'large-recordings'
+    parent.mkdir()
+    store = media.MediaStore(temp_dir=parent)
+    try:
+        root = store.root
+        assert root.parent == parent
+        item = store.reserve('meeting.mp4')
+        assert item.directory.is_dir()
+    finally:
+        store.close()
+    assert parent.is_dir() and not root.exists()
+    assert media.MAX_UPLOAD_BYTES == 4 * 1024 ** 3
+
+
+def test_configured_decoder_timeout_is_forwarded_and_reported(store, monkeypatch):
+    monkeypatch.setattr(media.shutil, 'which', lambda _: '/usr/bin/ffmpeg')
+    def timed_out(args, **kwargs):
+        assert kwargs['timeout'] == 37
+        raise media.subprocess.TimeoutExpired(args, kwargs['timeout'])
+    monkeypatch.setattr(media.subprocess, 'run', timed_out)
+    item = store.reserve('meeting.mp3')
+    item.raw_path.write_bytes(b'ID3' + b'\0' * 30)
+    with pytest.raises(media.MediaError) as failure:
+        media.decode_upload(item, 8 * 60 * 60, timeout=37)
+    assert failure.value.code == 'decode_timeout'
 
 
 def test_ffmpeg_missing_is_actionable(store, monkeypatch):
@@ -251,6 +282,74 @@ def test_progress_frequency_does_not_create_unbounded_availability_records(store
                 queue.advance(sample / 16000)
             assert len(queue.availability) == 1
             assert queue.received == 16000
+        finally:
+            queue.close()
+    asyncio.run(scenario())
+
+
+def test_hours_of_progress_use_one_timestamp_range_without_loading_audio(monkeypatch):
+    # A virtual sparse PCM file has the metadata of an eight-hour recording,
+    # but materializes only the individual chunks requested by FileQueue.
+    class SparsePCM(io.BytesIO):
+        def __init__(self, length):
+            super().__init__()
+            self.length = length
+            self.read_sizes = []
+
+        def read(self, size=-1):
+            assert 0 <= size <= media.RATE * 2
+            self.read_sizes.append(size)
+            size = min(size, self.length - self.tell())
+            self.seek(size, io.SEEK_CUR)
+            return b'\0' * size
+
+    async def scenario():
+        total = 8 * 60 * 60 * media.RATE
+        handle = SparsePCM(total * 2)
+        item = SimpleNamespace(samples=total, pcm_path=SimpleNamespace(open=lambda mode: handle))
+        clock = [100.0]
+        monkeypatch.setattr(media.time, 'monotonic', lambda: clock[0])
+        queue = media.FileQueue(item)
+        try:
+            queue.advance(4 * 60 * 60)
+            assert len(queue.availability) == 1
+            assert not handle.read_sizes  # Releasing a prefix never reads it.
+            clock[0] = 200.0
+            queue.advance(8 * 60 * 60)
+            assert len(queue.availability) == 2
+            assert queue.received == queue.pending == total
+            for index in range(4):
+                start, audio, arrived = await queue.take(media.RATE, media.RATE * 3, True)
+                assert start == index * media.RATE and len(audio) == media.RATE
+                assert arrived == 100.0
+                assert np.count_nonzero(audio) == 0
+            assert queue.availability[0] == (5 * media.RATE, 4 * 60 * 60 * media.RATE, 100.0)
+            assert len(queue.availability) == 2
+            assert sum(handle.read_sizes) == 4 * media.RATE * 2
+        finally:
+            queue.close()
+        assert handle.closed
+    asyncio.run(scenario())
+
+
+def test_range_timestamps_remain_exact_across_two_second_chunks_and_tail(store, monkeypatch):
+    async def scenario():
+        item = make_upload(store, np.zeros(9 * media.RATE))
+        queue = media.FileQueue(item, chunk_samples=2 * media.RATE)
+        clock = [10.0]
+        monkeypatch.setattr(media.time, 'monotonic', lambda: clock[0])
+        try:
+            queue.advance(6.5)
+            assert len(queue.availability) == 1
+            clock[0] = 20.0
+            queue.advance(8.5)
+            queue.finish()
+            chunks = []
+            while (chunk := await queue.take(2 * media.RATE, 3 * media.RATE, False)) is not None:
+                chunks.append((chunk[0], len(chunk[1]), chunk[2]))
+            assert [stamp for _, _, stamp in chunks] == [10, 10, 10, 20, 20]
+            assert [length for _, length, _ in chunks] == [32000, 32000, 32000, 32000, 8000]
+            assert not queue.availability
         finally:
             queue.close()
     asyncio.run(scenario())

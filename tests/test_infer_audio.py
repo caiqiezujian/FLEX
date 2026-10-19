@@ -276,7 +276,7 @@ def test_wait_commits_history_but_text_only_appends_exact_deltas(tmp_path):
     case.run()
     assert [result.reply for _, result in case.session.committed] == replies
     assert case.output.text == case.stdout.getvalue() == 'He is the first to admit it.\n'
-    assert case.state.deltas == ['He is the first', '', ' to admit it.\n']
+    assert case.state.translation_chars == len('He is the first to admit it.\n')
     assert [event['tag'] for event in case.output.events[:-1]] == ['FLEX', 'WAIT', 'DIRECT']
     assert case.output.events[-1]['complete_input'] is True
     assert case.output.events[-1]['final_wait'] is False

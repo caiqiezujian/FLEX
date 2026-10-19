@@ -23,7 +23,7 @@ def test_upload_auth_origin_and_config(app_factory):
     with TestClient(app) as client:
         config = client.get('/api/config').json()
         assert config['file_mode'] == 'uploaded'
-        assert config['max_upload_bytes'] == 256 * 1024 * 1024
+        assert config['max_upload_bytes'] == 4 * 1024 * 1024 * 1024
         assert client.post('/api/media', content=b'123').status_code == 401
         assert client.post('/api/media', content=b'123',
                            headers={'Authorization': 'Bearer wrong-token'}).status_code == 401

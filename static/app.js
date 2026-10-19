@@ -8,19 +8,27 @@ const ui = Object.fromEntries([
   'fileMode','micMode','fileArea','micArea','mediaStage','media','audioArtwork','dropZone','fileType','fileName','fileDetails',
   'chooseFile','chooseSubtitle','subtitleName','removeSubtitle','fileInput','subtitleInput','micTitle','micDescription','micMeter',
   'captureDot','sourceClock','clockDescription','targetBadge','exportTxt','exportJson','sessionStatus','latestTag','transcriptViewport',
-  'transcriptEmpty','transcript','translationCount','followButton','turnCount','turnList','startButton','pauseButton','finishButton',
+  'transcriptEmpty','transcript','historyNotice','translationCount','followButton','turnCount','turnList','startButton','pauseButton','finishButton',
   'receivedMetric','pendingMetric','serviceMetric','processedMetric','footerHint'
 ].map(id => [id, $(id)]));
 
 const languageNames = { en: '英语', zh: '中文' };
 const BUSY_STATES = new Set(['connecting','live','paused','draining']);
 const MAX_NETWORK_BUFFER_BYTES = 256 * 1024;
+// The server keeps the full append-only result on disk. The browser is a
+// bounded live view, including when a microphone session lasts for hours.
+const MAX_VISIBLE_FRAGMENTS = 500;
+const MAX_VISIBLE_CHARACTERS = 60000;
+const MAX_RECENT_TURNS = 200;
+const MAX_RECENT_RECORD_CHARACTERS = 120000;
 let config = null, mode = 'file', state = 'idle', selectedFile = null;
 let mediaUrl = null, subtitleUrl = null, subtitleTrack = null;
 let audioContext = null, monitor = null, workletLoaded = false;
 let session = null, sessionNumber = 0, followOutput = true, pollTimer = null;
 let currentTranslation = '', turns = [], transcriptFragments = 0, lastMetrics = {};
 let lastExport = null, microphoneAdaptive = ui.adaptive.checked;
+let totalTurns = 0, translationCharacters = 0, recentRecordCharacters = 0, recordsTrimmed = false;
+let visibleFragments = [], transcriptTrimmed = false, windowRollovers = 0, exportInProgress = false;
 
 function busy() { return BUSY_STATES.has(state); }
 function current(s) { return session === s; }
@@ -31,6 +39,11 @@ function time(value, tenths = true) {
   return `${hours ? `${hours}:` : ''}${String(minutes).padStart(2,'0')}:${rest.toFixed(tenths ? 1 : 0).padStart(tenths ? 4 : 2,'0')}`;
 }
 function formatBytes(bytes) { return bytes < 1024 * 1024 ? `${(bytes / 1024).toFixed(0)} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`; }
+function sessionLimitLabel() {
+  const seconds = Number(config?.max_session_seconds);
+  if (!Number.isFinite(seconds) || seconds <= 0) return '持续会话';
+  return seconds >= 3600 ? `最长 ${Number((seconds/3600).toFixed(1))} 小时` : `最长 ${seconds} 秒`;
+}
 function showError(message, title = '会话提示') {
   ui.errorTitle.textContent = title;
   ui.errorMessage.textContent = String(message);
@@ -55,16 +68,22 @@ function updateControls() {
   ui.dropZone.disabled = active;
   ui.chooseSubtitle.disabled = active || !selectedFile;
   ui.removeSubtitle.disabled = active;
-  ui.clearButton.disabled = active || !turns.length;
-  ui.exportTxt.disabled = !currentTranslation;
-  ui.exportJson.disabled = !turns.length && !lastExport;
+  ui.clearButton.disabled = active || !totalTurns;
+  const hasServerResult = Boolean(session?.sessionId);
+  ui.exportTxt.disabled = exportInProgress || (!hasServerResult && !currentTranslation);
+  ui.exportJson.disabled = exportInProgress || (!hasServerResult && !turns.length && !lastExport);
   ui.captureDot.classList.toggle('active', state === 'live');
   ui.micArea.querySelector('.microphone-stage').classList.toggle('active', state === 'live' && mode === 'microphone');
   ui.micTitle.textContent = state === 'live' ? '正在录音' : '麦克风就绪';
   ui.micDescription.textContent = state === 'live' ? '' : '开始时需要麦克风授权';
   ui.audioArtwork.classList.toggle('playing', mode === 'file' && !ui.media.paused);
   const labels = {idle:'等待开始',connecting:'正在准备',live:'同传进行中',paused:'播放已暂停',draining:'处理剩余音频',done:'同传已结束',error:'会话已停止'};
-  statusLabel(state === 'connecting' ? session?.preparationLabel || labels.connecting : labels[state] || state, state === 'live' ? 'live' : state === 'error' ? 'error' : '');
+  let label = state === 'connecting' ? session?.preparationLabel || labels.connecting : labels[state] || state;
+  if (state === 'live') {
+    if ((lastMetrics.pending_audio_s || 0) >= Math.max(3, (session?.chunkSeconds || 1) * 2)) label = '正在处理积压音频';
+    else if (session?.lastTag === 'WAIT') label = '等待后续音频';
+  }
+  statusLabel(label, state === 'live' ? 'live' : state === 'error' ? 'error' : '');
 }
 function setState(value) { state = value; updateControls(); }
 function setMode(value) {
@@ -89,9 +108,12 @@ function updateDirection(source) {
 function clearTranscript() {
   if (busy()) return;
   currentTranslation = ''; turns = []; transcriptFragments = 0; lastExport = null; lastMetrics = {};
+  visibleFragments = []; totalTurns = 0; translationCharacters = 0; recentRecordCharacters = 0;
+  transcriptTrimmed = false; recordsTrimmed = false; windowRollovers = 0; session = null;
   ui.transcript.replaceChildren(); ui.turnList.replaceChildren();
   const hint = document.createElement('p'); hint.className = 'no-turns'; hint.textContent = '暂无记录'; ui.turnList.append(hint);
   ui.transcriptEmpty.hidden = false; ui.translationCount.textContent = '0 个输出片段'; ui.turnCount.textContent = '0 轮';
+  ui.historyNotice.hidden = true;
   ui.latestTag.className = 'tag tag-neutral'; ui.latestTag.textContent = '—';
   followOutput = true; ui.followButton.hidden = true;
   renderMetrics({received_audio_s:0,processed_audio_s:0,pending_audio_s:0});
@@ -102,39 +124,85 @@ function renderMetric(element, value) {
   element.replaceChildren(document.createTextNode(Number(value || 0).toFixed(1)), Object.assign(document.createElement('small'), {textContent:' s'}));
 }
 function renderMetrics(data) {
-  lastMetrics = {...lastMetrics,...data};
+  // Do not accidentally retain a legacy done.translation or entire turn in
+  // this long-lived metrics object.
+  for (const key of ['received_audio_s','processed_audio_s','pending_audio_s','service_s','turn_count','translation_chars','context']) {
+    if (data[key] !== undefined) lastMetrics[key] = data[key];
+  }
   renderMetric(ui.receivedMetric,lastMetrics.received_audio_s);
   renderMetric(ui.processedMetric,lastMetrics.processed_audio_s);
   renderMetric(ui.pendingMetric,lastMetrics.pending_audio_s);
   ui.pendingMetric.classList.toggle('warning', (lastMetrics.pending_audio_s || 0) > 3);
+  if (data.context?.rollovers !== undefined) windowRollovers = Number(data.context.rollovers) || 0;
+  updateRecordCounts();
+  if (state === 'live') updateControls();
+}
+function updateRecordCounts() {
+  ui.translationCount.textContent = `${transcriptFragments} 个输出片段${transcriptTrimmed ? ` · 显示最近 ${visibleFragments.length} 段` : ''}`;
+  ui.turnCount.textContent = `${totalTurns} 轮${recordsTrimmed ? ` · 最近 ${turns.length} 轮` : ''}${windowRollovers ? ` · 窗口滚动 ${windowRollovers} 次` : ''}`;
+  ui.historyNotice.hidden = !transcriptTrimmed;
+}
+function appendResearchRow(row) {
+  if (ui.turnList.querySelector('.no-turns')) ui.turnList.replaceChildren();
+  ui.turnList.append(row);
+  while (ui.turnList.children.length > MAX_RECENT_TURNS) ui.turnList.firstElementChild.remove();
+}
+function appendContextWindow(data) {
+  renderMetrics(data);
+  const context = data.context || {};
+  const row = document.createElement('div'); row.className = 'turn-row context-window';
+  const text = document.createElement('p');
+  text.textContent = `上下文窗口已滚动${context.retained_turns !== undefined ? ` · 保留 ${context.retained_turns} 轮` : ''}${context.retained_audio_seconds !== undefined ? ` / ${Number(context.retained_audio_seconds).toFixed(1)} 秒音频` : ''}`;
+  row.append(text); appendResearchRow(row);
+}
+function compactDone(event) {
+  const {translation, ...summary} = event;
+  // The full transcript belongs to the export endpoint, never browser state.
+  return summary;
 }
 function appendTurn(data, s) {
   if (!['WAIT','FLEX','DIRECT'].includes(data.tag) || typeof data.delta !== 'string') throw new Error('服务器返回了无法识别的标签或译文格式。');
   if ((data.tag === 'WAIT' && data.delta) || (data.tag !== 'WAIT' && !data.delta.trim())) throw new Error('服务器输出违反 WAIT / FLEX / DIRECT 协议，会话已停止。');
   const record = {...data, client_received_at:new Date().toISOString(), client_elapsed_s:(performance.now()-s.startedAt)/1000, media_time_s:mode === 'file' ? ui.media.currentTime : null};
-  turns.push(record);
+  const recordSize = JSON.stringify(record).length;
+  if (recordSize <= MAX_RECENT_RECORD_CHARACTERS) {
+    turns.push(record); recentRecordCharacters += recordSize;
+  } else recordsTrimmed = true;
+  while (turns.length > MAX_RECENT_TURNS || recentRecordCharacters > MAX_RECENT_RECORD_CHARACTERS) {
+    recentRecordCharacters -= JSON.stringify(turns.shift()).length; recordsTrimmed = true;
+  }
+  totalTurns++; s.lastTag = data.tag;
   ui.latestTag.className = `tag tag-${data.tag.toLowerCase()}`; ui.latestTag.textContent = data.tag;
   if (data.tag !== 'WAIT') {
-    currentTranslation += data.delta;
+    translationCharacters += [...data.delta].length;
     const span = document.createElement('span'); span.className = `fragment ${data.tag.toLowerCase()}`;
-    span.textContent = data.delta;
+    // A single unusually large output is bounded too. The visible suffix is
+    // explicitly marked partial; server exports still contain the full delta.
+    const visibleDelta = data.delta.length > MAX_VISIBLE_CHARACTERS ? data.delta.slice(-MAX_VISIBLE_CHARACTERS) : data.delta;
+    if (visibleDelta !== data.delta) transcriptTrimmed = true;
+    span.textContent = visibleDelta;
     span.title = `${data.tag} · 输入 ${time(data.source_start_s + s.mediaOffset)} – ${time(data.source_end_s + s.mediaOffset)} · 推理 ${Number(data.service_s).toFixed(2)} s`;
-    ui.transcript.append(span); ui.transcriptEmpty.hidden = true; transcriptFragments++;
+    ui.transcript.append(span); visibleFragments.push(visibleDelta); currentTranslation += visibleDelta;
+    const beforeTrimHeight = ui.transcriptViewport.scrollHeight;
+    while (visibleFragments.length > MAX_VISIBLE_FRAGMENTS || currentTranslation.length > MAX_VISIBLE_CHARACTERS) {
+      currentTranslation = currentTranslation.slice(visibleFragments.shift().length);
+      ui.transcript.firstElementChild.remove(); transcriptTrimmed = true;
+    }
+    if (!followOutput) ui.transcriptViewport.scrollTop = Math.max(0,ui.transcriptViewport.scrollTop + ui.transcriptViewport.scrollHeight-beforeTrimHeight);
+    ui.transcriptEmpty.hidden = true; transcriptFragments++;
     if (followOutput) requestAnimationFrame(() => { ui.transcriptViewport.scrollTop = ui.transcriptViewport.scrollHeight; });
   }
-  if (turns.length === 1) ui.turnList.replaceChildren();
   const row = document.createElement('div'); row.className = `turn-row ${data.tag.toLowerCase()}`;
   const header = document.createElement('div'); header.className = 'turn-row-header';
   const tag = document.createElement('span'); tag.className = `tag tag-${data.tag.toLowerCase()}`; tag.textContent = data.tag;
   const timing = document.createElement('time'); timing.textContent = `${time(data.source_start_s+s.mediaOffset)} – ${time(data.source_end_s+s.mediaOffset)}`;
   header.append(tag,timing);
   const latency = document.createElement('span'); latency.className = 'turn-latency'; latency.textContent = `推理 ${Number(data.service_s).toFixed(2)}s · 提交前等待 ${Number(data.queue_wait_s).toFixed(2)}s`;
-  const text = document.createElement('p'); text.textContent = data.tag === 'WAIT' ? '等待后续音频' : data.delta;
-  row.append(header,latency,text); ui.turnList.append(row);
-  ui.translationCount.textContent = `${transcriptFragments} 个输出片段`;
-  ui.turnCount.textContent = `${turns.length} 轮`;
+  const text = document.createElement('p'); text.textContent = data.tag === 'WAIT' ? '等待后续音频' : data.delta.length > 4000 ? `${data.delta.slice(0,4000)}…（完整输出见导出）` : data.delta;
+  row.append(header,latency,text); appendResearchRow(row);
+  updateRecordCounts();
   renderMetric(ui.serviceMetric,data.service_s);
-  renderMetrics({processed_audio_s:data.source_end_s});
+  renderMetrics({processed_audio_s:data.source_end_s,...(data.context ? {context:data.context} : {})});
   updateControls();
 }
 
@@ -159,7 +227,7 @@ async function loadConfig() {
     if (config.status === 'error') showError(config.error || '请检查服务器日志和本地模型路径。','模型尚未就绪');
     if (config.status === 'loading') pollTimer = setTimeout(loadConfig,3000);
     else pollTimer = null;
-    ui.footerHint.textContent = `最长 ${config.max_session_seconds || 180} 秒 · 单会话`;
+    ui.footerHint.textContent = `${sessionLimitLabel()} · 单会话`;
     updateControls();
   } catch (error) {
     config = null; ui.serverStatus.className = 'server-status error'; ui.serverStatus.replaceChildren(document.createElement('i'),document.createTextNode('服务未连接'));
@@ -323,7 +391,7 @@ function openSocket(s) {
           // A server may send its accepted-prefix accounting after an error.
           // Preserve it without turning an errored session into a success.
           if (event.type === 'done' || event.type === 'status') {
-            if (event.type === 'done') s.doneEvent = event;
+            if (event.type === 'done') s.doneEvent = compactDone(event);
             renderMetrics(event); lastExport = exportData(s);
           }
           return;
@@ -340,11 +408,12 @@ function openSocket(s) {
           resolve();
         } else if (event.type === 'turn') appendTurn(event,s);
         else if (event.type === 'status') renderMetrics(event);
+        else if (event.type === 'context_window') appendContextWindow(event);
         else if (event.type === 'error') {renderMetrics(event);reject(new Error(event.message || event.code)); void failSession(s,event.message || event.code,event.code || '服务器返回错误',false);}
         else if (event.type === 'done') {
-          clearTimeout(startupTimer); s.terminal = true; s.doneEvent = event; s.endedAt = new Date().toISOString();
+          clearTimeout(startupTimer); s.terminal = true; s.doneEvent = compactDone(event); s.endedAt = new Date().toISOString();
           renderMetrics(event);
-          if (typeof event.translation === 'string' && event.translation !== currentTranslation) showError('服务器结束记录与已显示的增量译文不一致。页面保留原始逐轮输出，请检查 JSON 导出和服务日志。','结束记录不一致');
+          if ((Number.isSafeInteger(event.turn_count) && event.turn_count !== totalTurns) || (Number.isSafeInteger(event.translation_chars) && event.translation_chars !== translationCharacters)) showError('服务器结束计数与本页面接收的输出不一致，请通过 JSON 导出检查完整服务端记录。','结束记录检查');
           else if (event.final_wait) showError('最后一轮为 WAIT。已处理所有接收的音频，但系统没有强制补译；请检查是否有未译完的尾句。','尾句检查');
           lastExport = exportData(s);
           void cleanupCapture(s).finally(() => {if(current(s)){setState('done');updateControls();}});
@@ -389,10 +458,10 @@ async function startSession() {
     setState('live');
     if (mode === 'file') {
       s.progressTimer = setInterval(() => sendFileProgress(s),200);
-      ui.footerHint.textContent = `固定 ${s.chunkSeconds} 秒分块 · 最长 ${config.max_session_seconds || 180} 秒`;
+      ui.footerHint.textContent = `固定 ${s.chunkSeconds} 秒分块 · ${sessionLimitLabel()}`;
       sendFileProgress(s,true);
       await ui.media.play();
-    }
+    } else ui.footerHint.textContent = `${s.chunkSeconds} 秒基础分块 · ${sessionLimitLabel()}`;
     updateControls();
   } catch (error) {
     const message = error.name === 'NotAllowedError' ? '浏览器拒绝了音频权限或自动播放。请允许麦克风 / 播放权限后重新开始。' : error.name === 'NotFoundError' ? '没有找到可用麦克风，请连接设备后重试。' : error.message;
@@ -425,16 +494,51 @@ async function resumeCapture() {
   setState('live'); sendFileProgress(s,true);
 }
 function exportData(s = session) {
-  return {schema_version:1,backend:config?.backend,model_label:config?.model_label,session_id:s?.sessionId || null,source_language:s?.sourceLang || ui.sourceLang.value,target_language:s?.targetLang || ui.targetLang.value,source_kind:s?.sourceKind || mode,source_name:s?.sourceName || null,capture_mode:s?.captureMode || null,media_offset_s:s?.mediaOffset || 0,started_at:s?.startedDate || null,ended_at:s?.endedAt || null,sample_rate:16000,sent_audio_s:(s?.sentSamples || 0)/16000,chunk_seconds:s?.chunkSeconds,adaptive:s?.adaptive,translation:currentTranslation,turns:[...turns],final_metrics:{...lastMetrics},done:s?.doneEvent || null,error:s?.failure || null,timing_note:'source_start_s/source_end_s are input audio intervals, not word alignment or semantic latency. Add media_offset_s to compare against file playback time. client_elapsed_s excludes file upload/preparation and includes actual inference/network scheduling. server-file uploads the complete file but releases only the played prefix to the model; natural EOF reconciles small player/decoder duration differences. Browser progress events are not sample-accurate latency measurements.'};
+  return {schema_version:2,export_scope:'browser_tail_only',complete:false,partial:true,translation_truncated:transcriptTrimmed,turns_truncated:recordsTrimmed,total_received_turns:totalTurns,total_received_translation_chars:translationCharacters,backend:config?.backend,model_label:config?.model_label,session_id:s?.sessionId || null,source_language:s?.sourceLang || ui.sourceLang.value,target_language:s?.targetLang || ui.targetLang.value,source_kind:s?.sourceKind || mode,source_name:s?.sourceName || null,capture_mode:s?.captureMode || null,media_offset_s:s?.mediaOffset || 0,started_at:s?.startedDate || null,ended_at:s?.endedAt || null,sample_rate:16000,sent_audio_s:(s?.sentSamples || 0)/16000,chunk_seconds:s?.chunkSeconds,adaptive:s?.adaptive,translation:currentTranslation,turns:[...turns],final_metrics:{...lastMetrics},done:s?.doneEvent || null,error:s?.failure || null,timing_note:'PARTIAL browser backup, not the complete server result. source_start_s/source_end_s are input audio intervals, not word alignment or semantic latency. Add media_offset_s to compare against file playback time. client_elapsed_s excludes file upload/preparation and includes actual inference/network scheduling. server-file uploads the complete file but releases only the played prefix to the model; natural EOF reconciles small player/decoder duration differences. Browser progress events are not sample-accurate latency measurements.'};
 }
-function download(kind) {
-  const data = session ? exportData(session) : lastExport;
+function downloadLink(url, kind, data, partial = false) {
+  const link = document.createElement('a');
+  link.href = url; link.download = `FLEX-${partial ? 'PARTIAL-' : ''}${data.source_language}-${data.target_language}-${(data.started_at || new Date().toISOString()).replace(/[:.]/g,'-')}.${kind}`;
+  document.body.append(link);link.click();link.remove();
+}
+function saveDownload(blob, kind, data, partial = false) {
+  const url = URL.createObjectURL(blob);
+  downloadLink(url,kind,data,partial);setTimeout(() => URL.revokeObjectURL(url),1000);
+}
+async function download(kind) {
+  if (exportInProgress) return;
+  const s = session, data = s ? exportData(s) : lastExport;
   if (!data) return;
-  const value = kind === 'txt' ? currentTranslation : JSON.stringify(data,null,2);
-  const blob = new Blob([value],{type:kind === 'txt' ? 'text/plain;charset=utf-8' : 'application/json;charset=utf-8'});
-  const url = URL.createObjectURL(blob), link = document.createElement('a');
-  link.href = url; link.download = `FLEX-${data.source_language}-${data.target_language}-${(data.started_at || new Date().toISOString()).replace(/[:.]/g,'-')}.${kind}`;
-  document.body.append(link);link.click();link.remove();setTimeout(() => URL.revokeObjectURL(url),1000);
+  exportInProgress = true; updateControls();
+  const controller = new AbortController(), timer = setTimeout(() => controller.abort(),120000);
+  try {
+    if (!s?.sessionId) throw new Error('本次会话还没有服务端结果编号。');
+    const url = `/api/sessions/${encodeURIComponent(s.sessionId)}/export?format=${kind}`;
+    const response = await fetch(url,{headers:s.authToken ? {Authorization:`Bearer ${s.authToken}`} : {},cache:'no-store',signal:controller.signal});
+    if (!response.ok) {
+      let detail = '';
+      try {const body = await response.json();detail = typeof body.detail === 'string' ? body.detail : body.message || '';} catch (_) { /* HTTP code remains useful. */ }
+      throw new Error(detail || (response.status === 404 ? '服务端会话结果已过期或服务已重新启动。' : `HTTP ${response.status}`));
+    }
+    if (!s.authToken) {
+      // The normal intranet mode needs no bearer header: check availability,
+      // then let the browser's download manager stream straight to disk. Do
+      // not materialize an hours-long JSON export in JavaScript memory.
+      await response.body?.cancel();
+      downloadLink(url,kind,data);
+    } else {
+      // Native downloads cannot attach Authorization. Only this optional
+      // authenticated mode temporarily buffers the selected export as a Blob.
+      saveDownload(await response.blob(),kind,data);
+    }
+  } catch (error) {
+    const reason = error.name === 'AbortError' ? '下载超时。' : error.message;
+    showError(`无法下载完整服务端结果：${reason} 页面只保留最近的译文和记录；可重试下载，或另存明确标注为 PARTIAL 的本地备份。`,'完整导出失败');
+    if ((data.translation || data.turns.length) && window.confirm('完整服务端结果暂时无法下载。是否保存本页面保留的局部备份？文件将标注 PARTIAL，可能缺少早期译文或未接收的结果，不能作为完整会话。')) {
+      const value = kind === 'txt' ? `【PARTIAL：仅浏览器保留的局部译文，不是完整会话】\n${data.translation}` : JSON.stringify(data,null,2);
+      saveDownload(new Blob([value],{type:kind === 'txt' ? 'text/plain;charset=utf-8' : 'application/json;charset=utf-8'}),kind,data,true);
+    }
+  } finally {clearTimeout(timer);exportInProgress = false;updateControls();}
 }
 function removeSubtitle() {
   if (subtitleTrack) {subtitleTrack.remove();subtitleTrack = null;}

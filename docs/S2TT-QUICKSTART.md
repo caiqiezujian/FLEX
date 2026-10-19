@@ -79,7 +79,9 @@ outputs/s2tt_.../
 
 文件入口默认 `--image-slots 1`，保留一个图像初始化名额，以绕过受影响 vLLM 中 Qwen3-Omni 关闭视觉时的 `meta / cuda` 启动错误。实际请求始终只传音频，不上传图片。它可能增加显存占用；已修复的 vLLM 可显式使用 `--image-slots 0`。上游问题与修复：[Issue #49384](https://github.com/vllm-project/vllm/issues/49384)、[PR #49397](https://github.com/vllm-project/vllm/pull/49397)。此适配层原本面向 vLLM 0.11.1 接口，不承诺所有版本都兼容；请先使用你现有可工作的环境。
 
-默认最长音频 180 秒、最多 256 个音频轮、上下文 8192、每轮输出最多 160 token。上下文或轮数可能先到上限，不保证每段 180 秒都能完成。可分别用 `--max-audio-seconds`、`--max-audio-turns`、`--max-model-len`、`--max-tokens` 调整。程序不悄悄清空历史，也不丢弃 WAIT 历史来假装支持无限长音频。
+默认最长音频 8 小时（`--max-audio-seconds 28800`），模型窗口最多 256 轮、8192 token，每轮输出最多 160 token。默认 `--context-policy rolling`：模型历史音频达到 120 秒、token 或轮数预算不足时，保留 system，移除最早完整音频+响应轮次，目标保留近期 60 秒（token 预算可能要求更短）。全局源时间与译文不重置，滚动事件写入 JSONL；完整译文持续落盘，不无限增长内存。
+
+`--history-window-seconds` / `--history-retain-seconds` 可调整 120 / 60 秒默认值。`--context-policy stop` 可恢复原先触顶停止、全历史保留的对照模式。滚动是应用层资源管理，不是原生 KV 驱逐，也不保证移出的音频已经完整翻译；长距离指代、术语与漏译仍需真实模型长音频验收，不把 DIRECT 当作安全清空信号。
 
 出错时退出码为 1，Ctrl+C 为 130，保存的只是已提交前缀；正常读到 EOF 为 0，最终 WAIT 另行标记。不要把错误前的部分译文当成完整结果。
 

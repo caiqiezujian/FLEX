@@ -3,7 +3,9 @@
 The server owns one ModelEngine on one serial worker thread. Creating a session
 changes only its private conversation, never loads another model. Audio is mono
 float32 at 16 kHz. WAIT consumes an audio turn just like FLEX/DIRECT; all three
-responses remain in history. Context exhaustion is explicit, not a sliding reset.
+responses remain in the recent context window. Rolling windows remove complete
+old turns together; they do not alter committed translations or infer semantic
+coverage from an action tag. The optional stop policy preserves the old baseline.
 
 The vLLM adapter follows the existing standalone inference script and targets the
 native vLLM 0.11.1 API. GPU dependencies are imported only in the real backend.
@@ -83,15 +85,21 @@ class ModelOptions:
     prefix_caching: bool = True
     seed: int = 42
     image_slots: int = 0
+    context_policy: str = 'rolling'
+    history_window_seconds: float = 120.0
+    history_retain_seconds: float = 60.0
 
     def __post_init__(self):
         if self.dtype not in ('auto', 'bfloat16', 'float16'):
             raise ValueError('dtype must be auto, bfloat16 or float16')
         if self.protocol_form not in ('auto', 'text', 'special'):
             raise ValueError('protocol_form must be auto, text or special')
+        if self.context_policy not in ('rolling', 'stop'):
+            raise ValueError('context_policy must be rolling or stop')
         if type(self.image_slots) is not int or self.image_slots not in (0, 1):
             raise ValueError('image_slots must be 0 or 1')
-        for name in ('gpu_memory_utilization', 'max_chunk_seconds', 'mm_processor_cache_gb'):
+        for name in ('gpu_memory_utilization', 'max_chunk_seconds', 'mm_processor_cache_gb',
+                     'history_window_seconds', 'history_retain_seconds'):
             if not math.isfinite(getattr(self, name)):
                 raise ValueError(f'{name} must be finite')
         for name in ('max_model_len', 'max_audio_turns', 'max_tokens'):
@@ -106,6 +114,8 @@ class ModelOptions:
             raise ValueError('mm_processor_cache_gb must be non-negative')
         if self.max_model_len <= self.max_tokens:
             raise ValueError('max_model_len must exceed max_tokens')
+        if not 0 < self.history_retain_seconds < self.history_window_seconds:
+            raise ValueError('history durations require 0 < retain < window seconds')
 
 
 @dataclass
@@ -115,6 +125,26 @@ class Generation:
     prompt_tokens: int
     finish_reason: str
     audio_extra_tokens: int = 0
+
+
+@dataclass(frozen=True)
+class CommittedTurn:
+    """One indivisible audio/assistant pair; tokens are never re-encoded."""
+
+    audio: np.ndarray
+    token_ids: tuple
+    audio_extra_tokens: int
+
+
+@dataclass(frozen=True)
+class _WindowPlan:
+    """Prospective context, applied only when its generation commits."""
+
+    remove_count: int
+    history: list
+    audios: list
+    audio_extra_tokens: int
+    reasons: tuple = ()
 
 
 def load_tokenizer_checked(model, form):
@@ -176,6 +206,9 @@ class ModelEngine:
             'max_audio_turns': self.options.max_audio_turns,
             'max_chunk_seconds': self.options.max_chunk_seconds,
             'image_slots': self.options.image_slots,
+            'context_policy': self.options.context_policy,
+            'history_window_seconds': self.options.history_window_seconds,
+            'history_retain_seconds': self.options.history_retain_seconds,
             'mock': backend == 'mock',
         }
         if backend == 'mock':
@@ -277,7 +310,13 @@ class ModelEngine:
 
 
 class ModelSession:
-    """Transactionally retain committed turns, including WAIT, without rollback."""
+    """Bounded recent context, independent of the full append-only transcript.
+
+    The window is an application-level prompt reconstruction, not native KV
+    eviction. Dropping a turn says nothing about semantic translation coverage:
+    WAIT, FLEX and DIRECT are treated identically. Long-audio quality must be
+    evaluated on the actual checkpoint, particularly near window boundaries.
+    """
 
     def __init__(self, engine, target_lang):
         self.engine = engine
@@ -285,7 +324,15 @@ class ModelSession:
         self.system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
             target_lang={'zh': '中文', 'en': '英文'}[target_lang])
         self.audios = []
+        self._turns = []
         self.committed_audio_extra_tokens = 0
+        self.total_committed_turns = 0
+        self._total_audio_samples = 0
+        self._retained_audio_samples = 0
+        self._dropped_audio_samples = 0
+        self._dropped_turns = 0
+        self._rollovers = 0
+        self._last_rollover = None
         self._closed = False
         self._pending = None
         if engine.backend == 'vllm':
@@ -293,6 +340,111 @@ class ModelSession:
                             + engine.enc(self.system_prompt) + engine.tail)
         else:
             self.history = []
+        self._system_tokens = tuple(self.history)
+
+    @property
+    def context_metadata(self):
+        """A bounded-size audit snapshot; counters remain monotonic on rollover.
+
+        retained_context_tokens counts the committed expanded context only, not
+        the next input, generation head or output reserve. Mock counts are
+        synthetic and cannot be used for GPU sizing.
+        """
+        tokens = len(self.history) + self.committed_audio_extra_tokens
+        if self.engine.backend == 'mock' and not self._closed:
+            tokens += 200
+        return {
+            'policy': self.engine.options.context_policy,
+            'rollovers': self._rollovers,
+            'dropped_turns': self._dropped_turns,
+            'dropped_audio_seconds': self._dropped_audio_samples / SAMPLE_RATE,
+            'retained_turns': len(self._turns),
+            'retained_audio_seconds': self._retained_audio_samples / SAMPLE_RATE,
+            'retained_context_tokens': tokens,
+            'total_committed_turns': self.total_committed_turns,
+            'total_committed_audio_seconds': self._total_audio_samples / SAMPLE_RATE,
+            'last_rollover': (None if self._last_rollover is None else
+                              {**self._last_rollover,
+                               'reasons': list(self._last_rollover['reasons'])}),
+        }
+
+    def _turn_tokens(self, turn):
+        if self.engine.backend == 'vllm':
+            return (self.engine.audio_turn + self.engine.asst_head
+                    + list(turn.token_ids) + self.engine.tail)
+        return list(turn.token_ids)
+
+    def _prepare_window(self, audio, extra):
+        """Plan a whole-turn trim without mutating committed state.
+
+        We reserve the incoming audio and maximum reply before choosing the
+        window. A single impossible request fails without discarding history.
+        On rollover, time, token and turn low-water marks avoid trimming one
+        old turn on every subsequent request. System tokens are never removed.
+        """
+        opts, engine = self.engine.options, self.engine
+        if engine.backend == 'vllm':
+            base = len(self._system_tokens) + len(engine.audio_turn) + len(engine.asst_head)
+            closing_tokens = len(engine.tail)
+        else:
+            base = 200
+            closing_tokens = 0
+        # The committed assistant terminator also lives in the next request's
+        # history. Reserving it keeps even a maximum-length valid reply inside
+        # the context bound, rather than briefly overshooting after commit.
+        bare_required = base + extra + opts.max_tokens + closing_tokens
+        if bare_required > opts.max_model_len:
+            raise ContextLimit(
+                f'expanded prompt={base + extra} + max_tokens={opts.max_tokens} '
+                f'+ closing_tokens={closing_tokens} '
+                f'> max_model_len={opts.max_model_len} even without audio history; '
+                'incoming audio cannot fit; no history was removed')
+        window_samples = round(opts.history_window_seconds * SAMPLE_RATE)
+        if opts.context_policy == 'rolling' and len(audio) > window_samples:
+            raise ContextLimit('incoming audio exceeds history_window_seconds; '
+                               'no history was removed')
+        historical_cost = (len(self.history) - len(self._system_tokens)
+                           + self.committed_audio_extra_tokens)
+        reasons = []
+        if len(self._turns) + 1 > opts.max_audio_turns:
+            reasons.append('turn_limit')
+        if bare_required + historical_cost > opts.max_model_len:
+            reasons.append('token_limit')
+        if (opts.context_policy == 'rolling'
+                and self._retained_audio_samples + len(audio) > window_samples):
+            reasons.append('audio_window')
+        if not reasons:
+            return _WindowPlan(0, self.history, self.audios,
+                               self.committed_audio_extra_tokens)
+        if opts.context_policy == 'stop':
+            raise ContextLimit(
+                'context stop policy reached ' + ', '.join(reasons)
+                + '; no history was removed; start a new session')
+
+        ratio = opts.history_retain_seconds / opts.history_window_seconds
+        # Targets include the new input. The indivisible incoming turn always
+        # fits even if it alone exceeds the preferred (not hard) retain target.
+        sample_target = max(len(audio), round(opts.history_retain_seconds * SAMPLE_RATE))
+        turn_target = max(1, math.floor(opts.max_audio_turns * ratio))
+        old_token_target = math.floor((opts.max_model_len - bare_required) * ratio)
+        retained_samples = self._retained_audio_samples
+        retained_cost = historical_cost
+        remove_count = 0
+        while remove_count < len(self._turns) and (
+                retained_samples + len(audio) > sample_target
+                or len(self._turns) - remove_count + 1 > turn_target
+                or retained_cost > old_token_target):
+            turn = self._turns[remove_count]
+            retained_samples -= len(turn.audio)
+            retained_cost -= len(self._turn_tokens(turn)) + turn.audio_extra_tokens
+            remove_count += 1
+
+        kept = self._turns[remove_count:]
+        history = list(self._system_tokens)
+        for turn in kept:
+            history.extend(self._turn_tokens(turn))
+        return _WindowPlan(remove_count, history, [turn.audio for turn in kept],
+                           sum(turn.audio_extra_tokens for turn in kept), tuple(reasons))
 
     def _check_audio(self, audio):
         audio = np.asarray(audio, dtype=np.float32)
@@ -301,7 +453,9 @@ class ModelSession:
         if len(audio) > round(self.engine.options.max_chunk_seconds * SAMPLE_RATE):
             raise ValueError('audio exceeds configured max_chunk_seconds')
         # Keep a private immutable snapshot; producer buffers may be reused.
-        return audio.copy()
+        snapshot = audio.copy()
+        snapshot.setflags(write=False)
+        return snapshot
 
     def generate(self, audio):
         if self._closed or self.engine._closed:
@@ -309,22 +463,20 @@ class ModelSession:
         if self._pending is not None:
             raise RuntimeError('previous generation must be committed or session closed')
         opts, engine = self.engine.options, self.engine
-        if len(self.audios) >= opts.max_audio_turns:
-            raise ContextLimit('max_audio_turns reached; no history was silently removed')
         audio = self._check_audio(audio)
+        extra = (max(0, math.ceil(len(audio) / SAMPLE_RATE * 13) - 1)
+                 if engine.backend == 'mock' else engine.audio_expansion(audio))
+        plan = self._prepare_window(audio, extra)
         if engine.backend == 'mock':
-            result = self._mock_generate(audio)
+            result = self._mock_generate(audio, plan, extra)
         else:
-            ids = self.history + engine.audio_turn + engine.asst_head
-            if len(ids) + opts.max_tokens > opts.max_model_len:
-                raise ContextLimit('text/layout tokens exhaust context; start a new session')
-            extra = engine.audio_expansion(audio)
-            expected_tokens = len(ids) + self.committed_audio_extra_tokens + extra
+            ids = plan.history + engine.audio_turn + engine.asst_head
+            expected_tokens = len(ids) + plan.audio_extra_tokens + extra
             if expected_tokens + opts.max_tokens > opts.max_model_len:
                 raise ContextLimit(f'expanded prompt={expected_tokens} + max_tokens={opts.max_tokens} '
                                    f'> max_model_len={opts.max_model_len}; session stopped')
             request = engine.TokensPrompt(
-                prompt_token_ids=ids, multi_modal_data={'audio': self.audios + [audio]})
+                prompt_token_ids=ids, multi_modal_data={'audio': plan.audios + [audio]})
             output = engine.llm.generate([request], engine.sampling, use_tqdm=False)[0]
             completion = output.outputs[0]
             token_ids = list(completion.token_ids)
@@ -338,12 +490,12 @@ class ModelSession:
                 raise RuntimeError(f'context expansion mismatch: counted={expected_tokens}, '
                                    f'engine={prompt_tokens}; reply NOT committed')
             result = Generation(reply, token_ids, prompt_tokens, completion.finish_reason, extra)
-        self._pending = (result, audio)
+        self._pending = (result, audio, plan)
         return result
 
-    def _mock_generate(self, audio):
+    def _mock_generate(self, audio, plan, extra):
         """Deterministic protocol exercise, deliberately not speech recognition."""
-        turn = len(self.audios)
+        turn = self.total_committed_turns
         stage = turn % 3
         if stage == 1:
             reply = '<|WAIT|>'
@@ -354,8 +506,7 @@ class ModelSession:
             reply = ('<|FLEX|>[DEMO] Audio received; ' if stage == 0
                      else '<|DIRECT|> this is a transport test, not a translation. ')
         # Mock token counts are synthetic and must not be used for GPU sizing.
-        extra = max(0, math.ceil(len(audio) / SAMPLE_RATE * 13) - 1)
-        prompt_tokens = 200 + len(self.history) + self.committed_audio_extra_tokens + extra
+        prompt_tokens = 200 + len(plan.history) + plan.audio_extra_tokens + extra
         opts = self.engine.options
         if prompt_tokens + opts.max_tokens > opts.max_model_len:
             raise ContextLimit('mock context budget reached; start a new session')
@@ -375,14 +526,40 @@ class ModelSession:
         supplied = np.asarray(audio, dtype=np.float32)
         if not np.array_equal(snapshot, supplied):
             raise ValueError('commit audio differs from generated audio')
-        if self.engine.backend == 'vllm':
-            # Keep actual generated token IDs, not decode/strip/re-encoded text.
-            self.history += (self.engine.audio_turn + self.engine.asst_head
-                             + list(generation.token_ids) + self.engine.tail)
-        else:
-            self.history += list(generation.token_ids)
+        plan = self._pending[2]
+        # Window changes and the new reply are one transaction. Backend errors,
+        # truncation, invalid protocol, or mismatched audio leave old history
+        # intact; no rollback can change a translation already shown to users.
+        if plan.remove_count:
+            dropped = self._turns[:plan.remove_count]
+            dropped_samples = sum(len(turn.audio) for turn in dropped)
+            self._turns = self._turns[plan.remove_count:]
+            self.history = list(plan.history)
+            self.audios = list(plan.audios)
+            self.committed_audio_extra_tokens = plan.audio_extra_tokens
+            self._retained_audio_samples -= dropped_samples
+            self._dropped_turns += plan.remove_count
+            self._dropped_audio_samples += dropped_samples
+            self._rollovers += 1
+            self._last_rollover = {
+                'at_turn': self.total_committed_turns + 1,
+                'reasons': list(plan.reasons),
+                'dropped_turns': plan.remove_count,
+                'dropped_audio_seconds': dropped_samples / SAMPLE_RATE,
+            }
+            LOG.info('Context rollover=%s before turn=%s reasons=%s dropped_turns=%s '
+                     'dropped_audio_seconds=%.3f retained_old_turns=%s',
+                     self._rollovers, self.total_committed_turns + 1, plan.reasons,
+                     plan.remove_count, dropped_samples / SAMPLE_RATE, len(self._turns))
+        # Keep actual generated token IDs, not decode/strip/re-encoded text.
+        turn = CommittedTurn(snapshot, tuple(generation.token_ids), generation.audio_extra_tokens)
+        self.history.extend(self._turn_tokens(turn))
         self.audios.append(snapshot)
+        self._turns.append(turn)
         self.committed_audio_extra_tokens += generation.audio_extra_tokens
+        self.total_committed_turns += 1
+        self._total_audio_samples += len(snapshot)
+        self._retained_audio_samples += len(snapshot)
         self._pending = None
 
     def close(self):
@@ -390,5 +567,8 @@ class ModelSession:
         self._closed = True
         self._pending = None
         self.audios.clear()
+        self._turns.clear()
         self.history.clear()
+        self._system_tokens = ()
         self.committed_audio_extra_tokens = 0
+        self._retained_audio_samples = 0

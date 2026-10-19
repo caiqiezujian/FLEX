@@ -45,6 +45,9 @@ button, input, select, summary { font-size: 15px; }
 .microphone-stage strong { font-size: 18px; color: #445c4c; }
 .microphone-stage p { font-size: 14px; color: #65786a; }
 .notice { font-size: 15px; }
+.history-notice { margin: 0 0 12px; font-size: 14px; color: #65736b; }
+.turn-row.context-window { background: #f3f6f4; }
+.turn-row.context-window p { margin: 0; color: #65736b; }
 @media (max-width: 650px) {
   .brand { font-size: 21px; }
   .brand > span { font-size: 16px; }

@@ -22,6 +22,7 @@ python -m pytest -q tests
 node static/test_pcm.mjs
 node static/test_capture.mjs
 node static/test_file_playback.mjs
+node static/test_long_session.mjs
 python run.py --help
 python infer_audio.py --help
 git diff --check
@@ -74,7 +75,8 @@ Python TLS 测试另行覆盖真实 OpenSSL 生成、SAN、可信/不可信握�
 - WAIT 是模型策略，不是错误兜底，不自动重放同一段音频。
 - 原始协议响应进入历史；前端显示纯译文不能改变模型历史。
 - 同一模型串行推理；取消/断连后，在途请求结束前不能释放会话名额。
-- 队列、上下文与会话长度都有明确上限；不能静默丢帧或清空历史。
+- 队列、上下文与会话长度都有明确上限；滚动只能按完整音频+响应轮次、保留 system，成功 commit 才应用，并记录统计。不能静默丢输入帧或根据 DIRECT 清空历史。
+- 页面仅保留近期结果，完整导出必须从服务器磁盘读取；取消/失败不可标记为完整成功。加速 6 小时等效测试不能冒充真实 GPU 6 小时连续验收。
 - 不添加或重排 checkpoint 的 tokenizer token，不自动修改用户模型文件。
 - 认证信息不能出现在 URL、事件日志、导出或错误报告中。
 

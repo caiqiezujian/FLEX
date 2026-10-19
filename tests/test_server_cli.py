@@ -11,6 +11,32 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from flex_web import server
 
 
+def test_long_session_cli_settings_reach_model_and_result_store(monkeypatch, tmp_path):
+    monkeypatch.delenv('FLEX_ACCESS_TOKEN', raising=False)
+    monkeypatch.setattr(sys, 'argv', [
+        'run.py', '--backend', 'mock', '--no-log', '--temp-dir', str(tmp_path),
+        '--max-session-seconds', '36000', '--context-policy', 'rolling',
+        '--history-window-seconds', '90', '--history-retain-seconds', '45',
+        '--max-upload-mb', '2048', '--max-result-mb', '64', '--result-retention-hours', '12',
+    ])
+    captured = {}
+    monkeypatch.setattr(uvicorn, 'run', lambda app, **options: captured.update(app=app, **options))
+    server.main()
+    with TestClient(captured['app']) as client:
+        config = client.get('/api/config').json()
+        assert config['max_session_seconds'] == 36000
+        assert config['history_window_seconds'] == 90
+        assert config['history_retain_seconds'] == 45
+        assert config['context_policy'] == 'rolling'
+        assert config['max_upload_bytes'] == 2048 * 1024 * 1024
+        assert config['result_retention_hours'] == 12
+        store = captured['app'].state.results
+        assert store.max_bytes == 64 * 1024 * 1024
+        assert store.ttl_seconds == 12 * 3600
+        assert store.root.parent == tmp_path
+    assert not list(tmp_path.iterdir())
+
+
 @pytest.mark.parametrize('token_env', ['FLEX_ACCESS_TOKEN', 'FLEX_TEST_CUSTOM_TOKEN'])
 @pytest.mark.parametrize('token', [None, ''])
 @pytest.mark.parametrize('host', ['0.0.0.0', '10.0.0.8'])

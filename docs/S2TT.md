@@ -76,7 +76,7 @@ CUDA_VISIBLE_DEVICES=0 python infer_audio.py \
 3. FLEX / DIRECT：验证协议后立即追加新增译文；两者都不允许事后回改。
 4. 少于一块的最后尾音仍处理一次。短于 `min(1 秒, chunk 长度)` 时仅为模型输入补静音，真实源音频时长不增加。
 5. 文件结束不额外构造一个静音轮强迫翻译。最后仍为 WAIT 时明确警告：输入处理完毕不等于最后一句语义一定翻译完整。
-6. 超长、格式错误、上下文不足或截断生成会报错退出，保留已提交前缀。错误不会伪装成 WAIT，失败响应不会写入纯译文。
+6. 超过总输入预算、格式错误、单块仍无法放入上下文或截断生成会报错退出，保留已提交前缀。错误不会伪装成 WAIT，失败响应不会写入纯译文。
 
 预热使用独立会话，发生在文件回放时钟开始之前，不进入真实翻译历史。排查问题时可以加 `--no-warmup`。
 
@@ -89,7 +89,7 @@ CUDA_VISIBLE_DEVICES=0 python infer_audio.py \
 ```text
 outputs/en-zh-first/
   translation.txt   精确保留增量空白的纯译文，没有协议标签
-  events.jsonl      start、model_ready、turn、done 或 error；无效响应记为 rejected_turn
+  events.jsonl      start、model_ready、turn、context_window、done 或 error；无效响应记为 rejected_turn
 ```
 
 `turn` 包含 `tag`、`delta`、原始 `response`、源音频起止位置、实际模型输入长度、`service_s`、`dispatch_lag_s` 和 prompt token 数。`generation_finished_elapsed_s` 是从回放起点到生成/提交检查完成的墙钟时间，不是字幕实际渲染时刻；日志写入及终端输出发生在其后。源音频区间是本轮输入块位置，不是译文内容的精确语义对齐。统计中的 `read_audio_s` 仅代表已经读取的前缀，不代表完整文件时长；发生错误时两者可能不同。
@@ -100,13 +100,17 @@ outputs/en-zh-first/
 
 | 参数 | 默认值 | 说明 |
 |---|---:|---|
-| `--max-audio-seconds` | 180 | 输入超过此会话预算会显式失败，不把前缀冒充完整翻译 |
+| `--max-audio-seconds` | 28800 | 输入总预算（8 小时），超过显式失败，不把前缀冒充完整翻译 |
 | `--max-model-len` | 8192 | 模型上下文预算，包含音频展开 token |
-| `--max-audio-turns` | 256 | 音频轮数上限，不自动删除历史 |
+| `--max-audio-turns` | 256 | 当前窗口音频轮数上限，不是全会话总轮数 |
+| `--context-policy` | `rolling` | 自动滚动；`stop` 保留旧触顶停止行为 |
+| `--history-window-seconds` / `--history-retain-seconds` | 120 / 60 | 窗口音频上限 / 滚动后的保留目标（秒） |
 | `--max-tokens` | 160 | 每轮生成上限；截断不能当作成功 |
 | `--gpu-memory-utilization` | 0.90 | vLLM 显存配置 |
 
-实际可能先触发上下文或轮数上限，不保证每段 180 秒音频都能处理。增大上限会增加计算和内存压力；不能用简单清空历史来处理模型仍未翻译的内容。
+默认按完整音频+原始响应轮次滚动，system 保留；token/轮数可在音频达到 120 秒前先触发，必要时保留少于 60 秒。只在新响应验证并成功提交后应用裁剪，不按 WAIT/FLEX/DIRECT 标签决定清空。`turn.context` 与 `context_window` 记录累计统计，全局源时间轴和轮次不重置。纯译文始终增量写入磁盘，不保留无限增长的内存副本。
+
+这只是应用层有界上下文，不是底层 KV 驱逐或原生流式编码。旧音频和回复离开模型窗口可能影响指代、术语和尚未表达的语义；120/60 是工程默认值，需要真实 checkpoint 长音频评估，不保证无漏译。严格全历史对照使用 `--context-policy stop`，上下文/轮数触顶仍停止。详见 [Web 长会话边界](../README.md#5-目前的真实边界)。
 
 日志包含文件名、译文、错误信息，可能含私人路径；只应在受控环境保存和分享。默认 `outputs/` 已被 `.gitignore` 排除，自定义输出目录需自行保护。
 

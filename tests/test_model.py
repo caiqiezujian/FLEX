@@ -304,7 +304,7 @@ def test_commit_is_single_transaction_and_audio_is_copied():
 
 
 def test_turn_limit_and_isolated_session_reset():
-    engine = ModelEngine(ModelOptions(max_audio_turns=1), 'mock')
+    engine = ModelEngine(ModelOptions(max_audio_turns=1, context_policy='stop'), 'mock')
     session = engine.new_session('zh')
     audio = np.zeros(16000, np.float32)
     result = session.generate(audio)
@@ -341,7 +341,180 @@ def test_invalid_audio_rejected(audio):
     {'gpu_memory_utilization': 1}, {'max_chunk_seconds': float('nan')},
     {'max_chunk_seconds': 9}, {'mm_processor_cache_gb': -1},
     {'image_slots': -1}, {'image_slots': 2}, {'image_slots': True}, {'image_slots': 1.0},
+    {'context_policy': 'reset'}, {'history_window_seconds': float('inf')},
+    {'history_retain_seconds': float('nan')}, {'history_retain_seconds': 0},
+    {'history_window_seconds': 60}, {'history_retain_seconds': 121},
 ])
 def test_invalid_options_rejected(changes):
     with pytest.raises(ValueError):
         ModelOptions(**changes)
+
+
+def test_rollover_rebuilds_matching_audio_and_original_token_ids(fake_vllm):
+    options, observed, tok = fake_vllm
+    engine = ModelEngine(replace(options, max_audio_turns=4))
+    session = engine.new_session('en')
+    system_ids = list(session.history)
+    committed = []
+    for index in range(5):
+        audio = np.full(16000, index, np.float32)
+        generation = session.generate(audio)
+        # The reply token stream is preserved exactly, including protocol IDs
+        # and leading whitespace. No decode/re-encode context reconstruction.
+        original = list(generation.token_ids)
+        session.commit(audio, generation)
+        committed.append(original)
+    expected = (system_ids + engine.audio_turn + engine.asst_head + committed[3] + engine.tail
+                + engine.audio_turn + engine.asst_head + committed[4] + engine.tail)
+    assert session.history == expected
+    assert session.history.count(PROTOCOL_IDS[1]) == system_ids.count(PROTOCOL_IDS[1]) + 2
+    assert len(session.audios) == 2
+    assert [audio[0] for audio in session.audios] == [3, 4]
+    assert [audio[0] for audio in observed.requests[-1]['multi_modal_data']['audio']] == [3, 4]
+    assert session.committed_audio_extra_tokens == 18
+    assert session.context_metadata['rollovers'] == 1
+    assert session.context_metadata['dropped_turns'] == 3
+    assert session.context_metadata['retained_context_tokens'] == len(expected) + 18
+    assert session.context_metadata['total_committed_turns'] == 5
+    assert session.context_metadata['last_rollover']['reasons'] == ['turn_limit']
+    assert all(not audio.flags.writeable for audio in session.audios)
+
+
+def test_window_keeps_noncanonical_generated_tokens_without_reencoding(fake_vllm, monkeypatch):
+    options, observed, tok = fake_vllm
+    engine = ModelEngine(replace(options, max_audio_turns=4))
+    session = engine.new_session('en')
+    audio = np.zeros(16000, np.float32)
+    original_encode = tok.encode
+    for _ in range(4):
+        generation = session.generate(audio)
+        session.commit(audio, generation)
+    # A decoder can normalize several tokenizations to the same string. Make
+    # re-encoding an old decoded reply invalid, while new model output is still
+    # generated through the fake backend's original exact token sequence.
+    original_generate = engine.llm.generate
+
+    def checked_generate(*args, **kwargs):
+        monkeypatch.setattr(tok, 'encode', original_encode)
+        result = original_generate(*args, **kwargs)
+        monkeypatch.setattr(tok, 'encode', lambda *a, **k: pytest.fail('re-encoded history'))
+        return result
+
+    monkeypatch.setattr(tok, 'encode', lambda *a, **k: pytest.fail('re-encoded history'))
+    monkeypatch.setattr(engine.llm, 'generate', checked_generate)
+    generation = session.generate(audio)
+    expected = original_encode('<|DIRECT|> leading space')
+    session.commit(audio, generation)
+    assert [list(turn.token_ids) for turn in session._turns] == [expected, expected]
+
+
+def test_rollover_respects_exact_expanded_token_budget(fake_vllm):
+    options, observed, _ = fake_vllm
+    engine = ModelEngine(options)
+    session = engine.new_session('en')
+    audio = np.zeros(16000, np.float32)
+    first = session.generate(audio)
+    session.commit(audio, first)
+    turn_cost = len(engine.audio_turn + engine.asst_head + first.token_ids + engine.tail) + 9
+    bare = len(session._system_tokens) + len(engine.audio_turn) + len(engine.asst_head) + 9
+    # Exactly two historic turns fit; rollover must not happen at equality.
+    engine.options = replace(options, max_model_len=bare + options.max_tokens
+                             + len(engine.tail) + 2 * turn_cost)
+    for _ in range(2):
+        generation = session.generate(audio)
+        assert generation.prompt_tokens + options.max_tokens <= engine.options.max_model_len
+        session.commit(audio, generation)
+        assert session.context_metadata['rollovers'] == 0
+    generation = session.generate(audio)
+    assert generation.prompt_tokens + options.max_tokens <= engine.options.max_model_len
+    assert session.context_metadata['rollovers'] == 0  # planning is not committing
+    session.commit(audio, generation)
+    assert session.context_metadata['rollovers'] == 1
+    assert session.context_metadata['last_rollover']['reasons'] == ['token_limit']
+    assert len(session.audios) == 2
+    assert len(observed.requests[-1]['multi_modal_data']['audio']) == 2
+
+
+@pytest.mark.parametrize('failure', ['backend', 'truncated', 'bad_audio', 'protocol'])
+def test_failed_rolling_turn_never_discards_committed_history(fake_vllm, monkeypatch, failure):
+    options, observed, _ = fake_vllm
+    engine = ModelEngine(replace(options, max_audio_turns=1))
+    session = engine.new_session('en')
+    audio = np.zeros(16000, np.float32)
+    first = session.generate(audio)
+    session.commit(audio, first)
+    history, old_audio, metadata = list(session.history), session.audios[0], session.context_metadata
+    if failure == 'backend':
+        def fail(*args, **kwargs):
+            raise RuntimeError('backend failure')
+        monkeypatch.setattr(engine.llm, 'generate', fail)
+        with pytest.raises(RuntimeError, match='backend failure'):
+            session.generate(audio)
+    else:
+        if failure == 'truncated':
+            observed.finish_reason = 'length'
+        generation = session.generate(audio)
+        if failure == 'protocol':
+            generation.reply = 'invalid reply'
+        if failure == 'bad_audio':
+            supplied = np.ones(16000, np.float32)
+        else:
+            supplied = audio
+        with pytest.raises((ProtocolError, ValueError)):
+            session.commit(supplied, generation)
+    assert session.history == history
+    assert len(session.audios) == 1 and session.audios[0] is old_audio
+    assert session.context_metadata == metadata
+
+
+def test_impossible_incoming_chunk_does_not_trim_history(fake_vllm):
+    options, observed, _ = fake_vllm
+    engine = ModelEngine(options)
+    session = engine.new_session('en')
+    audio = np.zeros(16000, np.float32)
+    generation = session.generate(audio)
+    session.commit(audio, generation)
+    history, metadata = list(session.history), session.context_metadata
+    bare = len(session._system_tokens) + len(engine.audio_turn) + len(engine.asst_head) + 9
+    engine.options = replace(options, max_model_len=bare + options.max_tokens - 1)
+    with pytest.raises(ContextLimit, match='incoming audio cannot fit'):
+        session.generate(audio)
+    assert session.history == history
+    assert session.context_metadata == metadata
+    assert len(observed.requests) == 1
+
+
+def test_stop_policy_ignores_rolling_time_window(fake_vllm):
+    options, _, _ = fake_vllm
+    engine = ModelEngine(replace(options, context_policy='stop',
+                                 history_window_seconds=2, history_retain_seconds=1))
+    session = engine.new_session('en')
+    audio = np.zeros(16000, np.float32)
+    for _ in range(4):
+        generation = session.generate(audio)
+        session.commit(audio, generation)
+    assert session.context_metadata['retained_audio_seconds'] == 4
+    assert session.context_metadata['rollovers'] == 0
+
+
+def test_maximum_valid_reply_reserves_committed_closing_tokens(fake_vllm, monkeypatch):
+    options, _, tok = fake_vllm
+    engine = ModelEngine(options)
+    session = engine.new_session('en')
+    bare = len(session.history) + len(engine.audio_turn) + len(engine.asst_head) + 9
+    engine.options = replace(options, max_model_len=bare + options.max_tokens + len(engine.tail))
+    original_generate = engine.llm.generate
+
+    def maximum_reply(*args, **kwargs):
+        outputs = original_generate(*args, **kwargs)
+        outputs[0].outputs[0].token_ids = tok.encode('<|DIRECT|>' + 'a' * (options.max_tokens - 1))
+        return outputs
+
+    monkeypatch.setattr(engine.llm, 'generate', maximum_reply)
+    audio = np.zeros(16000, np.float32)
+    for _ in range(2):
+        generation = session.generate(audio)
+        assert len(generation.token_ids) == options.max_tokens
+        session.commit(audio, generation)
+        assert session.context_metadata['retained_context_tokens'] == engine.options.max_model_len
+    assert session.context_metadata['rollovers'] == 1

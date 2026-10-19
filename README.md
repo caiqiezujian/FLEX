@@ -6,7 +6,7 @@ FLEX Live 是面向 SFT 后双向中英 Qwen3-Omni 模型的流式推理系统�
 
 本仓库发布独立的 Web 推理系统及单音频推理入口，不包含模型权重、训练数据、数据准备/训练脚本或蒸馏 prompt。前端无需 Node 构建；Node 仅用于音频处理逻辑测试。
 
-> 当前版本：有界会话、单模型、单活动会话。目标部署是一张 A800 80 GB；CPU 自动化测试与浏览器 mock 链路已经验证，真实 checkpoint 的显存、吞吐和翻译质量仍需在目标服务器验收。mock 不是语音翻译模型。
+> 当前版本：滚动模型上下文、默认最长 8 小时、单模型、单活动会话。完整结果落盘，页面仅渲染近期内容。目标部署是一张 A800 80 GB；加速长会话测试与浏览器 mock 验证不等于真实 GPU 连续运行数小时，真实 checkpoint 的吞吐和滚动后的翻译质量仍需在目标服务器验收。mock 不是语音翻译模型。
 
 ![FLEX Live 界面：左侧播放测试视频，右侧显示增量文本与策略时间线](docs/preview.jpg)
 
@@ -100,7 +100,7 @@ CUDA_VISIBLE_DEVICES=0 python run.py \
   --chunk-seconds 1 \
   --max-chunk-seconds 3 \
   --max-pending-seconds 12 \
-  --max-session-seconds 180
+  --max-session-seconds 28800
 ```
 
 注意：上面 `special` 只适用于真正按三个 special token 训练并正确保存 tokenizer 的 checkpoint。历史 text-form 模型改用 `--protocol-form text`；默认 `auto` 只检查 tokenizer 的表现，**不能证明模型权重的训练形式**。服务不会替你新增协议 token 或修改模型文件。模型必须是完整 merged 权重及匹配的 tokenizer/processor，不是仅 LoRA adapter。
@@ -125,7 +125,9 @@ CUDA_VISIBLE_DEVICES=6 bash start_server.sh /absolute/path/to/checkpoint-merged 
 
 点击“开始同传”后先上传和准备文件，成功后才播放。服务器从临时解码文件读取已播放前缀，网页短暂卡顿后只需更新播放位置，不会因约 43 ms 的采集回调偏移终止。文件输入不创建浏览器音频采集节点；HTTP 与 HTTPS 使用同一文件路径。播放器暂停时不释放未来音频，恢复后连续读取；推理落后时显示待处理时长，保留磁盘上的音频，不触发麦克风的内存队列溢出规则。
 
-默认上传上限 256 MiB、文件解码时长上限与 `--max-session-seconds` 一致（默认 180 秒）。16 kHz 单声道 PCM16 WAV 可直接处理；其他格式需要服务器可执行 FFmpeg，可用 `--ffmpeg /path/to/ffmpeg` 指定。只复用现有模型环境，不需更换 torch/vLLM。临时文件正常在会话结束/取消后清理，未使用的上传有过期清理；完整文件会传到服务器，敏感媒体请先确认留存和访问策略。
+默认上传上限 4 GiB、文件解码时长上限与 `--max-session-seconds` 一致（默认 28800 秒，即 8 小时）。上传超时默认 3600 秒，解码超时默认 1800 秒，均可配置。16 kHz 单声道 PCM16 WAV 可直接处理；其他格式需要服务器可执行 FFmpeg，可用 `--ffmpeg /path/to/ffmpeg` 指定。只复用现有模型环境，不需更换 torch/vLLM。临时文件正常在会话结束/取消后清理，未使用的上传有过期清理；完整文件会传到服务器，敏感媒体请先确认留存和访问策略。
+
+长文件请给临时磁盘留足空间：8 小时的解码 PCM 约 0.92 GB，解码期间还存在原始上传；默认最多 4 个上传槽位，极端并发准备可占约 20 GB，另有结果与日志。可在原启动命令末尾追加 `--temp-dir /data/flex-tmp` 指定较大的本地磁盘。大视频仍需先完整上传/解码，再开始播放同传，不是边上传边播放。
 
 更新包含 Python 后端，**需要重启服务并刷新页面**。仅使用 HTTP 文件模式时，原来的启动命令不变，不需要证书。
 
@@ -179,11 +181,15 @@ python run.py --backend mock --host 127.0.0.1 --port 8000
 3. 点击开始：文件模式依次上传、准备音轨、连接推理，然后播放；麦克风在会话建立后开始提交音频。FLEX/DIRECT 均直接显示，WAIT 只出现在策略记录中，不污染译文。
 4. 暂停视频时不再释放新的音频，服务器继续处理已播放的部分；恢复后从原位置连续读取。结束会确认最后的播放位置，再处理此前尚未完成的音频。不要通过刷新网页代替正常结束。
 5. 当前会话禁止随意跳播/倍速。要看其他位置：先结束，定位视频，再开始新会话。这样不会把新位置接到旧历史上。
-6. 导出 TXT 获取原样拼接译文，导出 JSON 获取事件及时间信息。服务器默认另存 `logs/<session_id>.jsonl`，可用 `--no-log` 禁用。
+6. 导出 TXT 获取原样拼接译文，导出 JSON 获取服务端事件及时间信息；运行中导出是当时已提交的快照。完整结果从服务器读取，不受页面显示数量限制。服务器默认另存 `logs/<session_id>.jsonl`，可用 `--no-log` 禁用持久日志。
+
+页面正文最多保留近期 500 个片段 / 60000 个 UTF-16 字符，策略记录最多保留 200 行；这是显示窗口，不是删除完整结果。临时导出最多保留 24 小时、最多 8 个会话，新会话可能提前淘汰最旧已结束结果；服务重启会清除本进程的临时结果。重要内容请及时导出。`--no-log` 仍会临时落盘以支持完整导出，不表示不写任何译文文件。
+
+麦克风模式只采集浏览器选用的音频输入设备，不自动混入本地文件或系统播放音轨；文件与麦克风是互斥输入。扬声器外放可能被物理麦克风拾取，也可能被回声消除压低；使用耳机一般不会将播放声音送入麦克风。虚拟声卡/系统回录设备属于设备层面的例外，本版没有加入屏幕共享音频或混音。
 
 仅视频画面及用户提供的字幕用于人工对照；页面“本轮耗时”不是模型语义延迟，不能直接当论文里的 AL/LAAL。完整字段见 [协议说明](docs/PROTOCOL.md)。
 
-服务端日志和浏览器 JSON 导出包含译文、源文件名和时间信息。处理敏感内容时使用 `--no-log`，并自行保护导出文件；不应将这些文件提交到仓库。详见 [安全与隐私说明](SECURITY.md)。
+服务端日志、临时导出与下载文件包含译文、源文件名和时间信息。处理敏感内容时可用 `--no-log` 关闭持久日志，并保护临时目录及下载文件；不应将这些文件提交到仓库。详见 [安全与隐私说明](SECURITY.md)。
 
 ## 4. Chunk、积压与停止行为
 
@@ -221,20 +227,32 @@ python run.py --backend mock --host 127.0.0.1 --port 8000
 | `--chunk-seconds` | 1 | 基础模型音频块长度，秒 |
 | `--max-chunk-seconds` | 3 | 可选基础块/麦克风自适应合并的上限，秒；文件不自适应合并 |
 | `--max-pending-seconds` | 12 | 麦克风待处理音频上限，秒；不含正在推理的块 |
-| `--max-session-seconds` | 180 | 麦克风会话时长及上传文件解码时长上限，秒 |
+| `--max-session-seconds` | 28800 | 麦克风会话时长及上传文件解码时长上限，秒（8 小时） |
 | `--max-model-len` | 8192 | 包含音频展开 token 的模型上下文预算 |
-| `--max-audio-turns` | 256 | 历史加本轮的音频块数量上限 |
+| `--max-audio-turns` | 256 | 当前模型窗口中的音频轮数上限，不是全会话总轮数 |
+| `--context-policy` | `rolling` | 自动滚动；`stop` 保留原先上下文触顶即停的对照行为 |
+| `--history-window-seconds` | 120 | 模型当前窗口的音频时长上限；token/轮数可更早触发滚动 |
+| `--history-retain-seconds` | 60 | 滚动后的近期音频保留目标，实际仍受 token/轮数约束 |
 | `--max-tokens` | 160 | 每轮生成长度上限 |
 | `--protocol-form` | `auto` | `auto` / `special` / `text`；必须与权重训练形式一致 |
 | `--image-slots` | 1 | Qwen3-Omni 初始化兼容选项；不向翻译模型传入视频画面 |
 | `--ffmpeg` | 系统 PATH | 上传音视频解码使用的 FFmpeg 可执行文件路径 |
-| `--no-log` | 未启用 | 禁用服务端译文/事件日志，不影响浏览器导出 |
+| `--max-upload-mb` | 4096 | 单文件上传上限，MiB |
+| `--upload-timeout-seconds` / `--decode-timeout-seconds` | 3600 / 1800 | 上传及文件解码超时 |
+| `--temp-dir` | 系统临时目录 | 上传、解码 PCM 与临时导出的存储位置 |
+| `--max-result-mb` | 256 | 单会话临时事件+纯文本预算，达到时显式停止并保留有效前缀 |
+| `--result-retention-hours` | 24 | 已结束结果的最长临时保存时间；最多 8 个会话 |
+| `--no-log` | 未启用 | 禁用持久 JSONL 日志；完整导出仍使用临时磁盘 |
 
 ## 5. 目前的真实边界
 
-**这是有界会话的同传实验台，不是无限时长会议系统。** 默认最长 180 秒，模型上下文或 256 个音频轮可能更早触顶。触顶明确停止并保留已有结果；不偷偷截去历史，也不在模型仍 WAIT 时抛弃未译内容。建议先拿 20–40 秒训练同分布片段做端到端验收，再测 1–3 分钟片段。
+**本版支持长会话的资源管理，不宣称无限时间或无损语义记忆。** 默认总时长 8 小时，与模型窗口长度分开。保持原来的 `start_server.sh` 启动方式即可启用；无需更换 checkpoint、重训或重签证书。可以配置更长总时长，但 PCM 传输的 uint32 样本偏移限制约 74.56 小时，超出会在启动时拒绝。
 
-上传文件的完整解码时长也受上述上限限制，长视频请先裁出待测片段；在允许长度内可以先定位，再开始新会话。增加 `--max-session-seconds/--max-model-len/--max-audio-turns` 会增加计算与资源压力，并不能证明超长输入质量。自动安全滚动上下文需要单独设计和训练/实验支持，不在这版里伪装解决。
+默认滚动步骤：保留 system prompt；每次推理计入当前音频、展开 token、生成预算及结束符；即将超过 120 秒音频、8192 token 或 256 轮中的任一预算时，从最早开始移除完整的“音频 + 原始响应 token”轮次，批量降到近期约 60 秒及相应 token/轮数低水位。必要时 token 预算决定更短窗口。只有新响应完成协议校验、成功提交时才应用裁剪；失败不提前损坏原历史。窗口滚动发出 `context_window` 事件，可在页面记录和 JSON 中追踪。
+
+这属于应用层重建模型上下文，不是 Qwen3-Omni 原生流式编码或底层 KV cache 驱逐；窗口变化也可能降低前缀缓存命中率。WAIT/FLEX/DIRECT 的语义和 SFT 协议保持不变，不在 DIRECT 后清空、不重放源音频、不生成摘要、不改写已输出字幕。旧轮次离开模型窗口后，完整译文仍保存在导出文件中，但模型不再看到那些原始音频/回复。标签不能证明那一段已经语义覆盖，长距离指代、术语一致性和延迟未译内容存在损失风险；120/60 秒是可调工程默认值，不是已证明最优的翻译参数。需要严格保留全历史做对照时，用 `--context-policy stop`，它仍会触顶停止。
+
+先用两方向各 20–40 秒样例检查协议，再用 10–30 分钟真实音频检查滚动边界前后，最后在 A800 上连续运行数小时，记录 `service_s`、积压、显存和译文质量。麦克风若平均处理速度持续慢于实时，滚动窗口不能创造算力；12 秒积压保护仍会显式终止，不丢音频伪装实时。断网后不自动无损续接，GPU 请求挂死也不强杀线程来接纳下一会话。
 
 文件必须同时可由浏览器播放和服务器解码。若浏览器容器时长与服务器音轨时长相差超过 0.5 秒，页面会在推理前提示转换为 WAV 或音视频等长的 MP4，不静默丢掉尾部；小幅容器/编码差异只在自然播放结束时对齐到服务器音频末尾，手动结束不补读未播放部分。
 
@@ -250,6 +268,7 @@ python -m pytest -q tests
 node static/test_pcm.mjs
 node static/test_capture.mjs
 node static/test_file_playback.mjs
+node static/test_long_session.mjs
 python run.py --help
 ```
 
@@ -259,7 +278,8 @@ python run.py --help
 
 - `busy`：另一页面正在用 GPU，或者它断开后的请求尚未安全完成。
 - `model_protocol`：模型没输出合法标签或达到生成长度上限；检查权重/tokenizer 匹配和 `--max-tokens`，不要在前端修造标签。
-- `context_limit`：上下文/音频轮达到上限；新开会话，不应自动删除历史。
+- `context_limit`：`stop` 模式触顶，或滚动后单个当前音频块仍无法容纳；检查窗口/生成预算，不能靠无限清空历史解决。
+- `result_limit` / `media_storage`：临时结果预算或磁盘异常；先导出已提交前缀并检查磁盘，必要时调整 `--max-result-mb` / `--temp-dir`。
 - `sequence_gap`：麦克风/旧 PCM 客户端传输序号或样本偏移不连续；重新开始，不假装已无损续接。
 - `backlog_limit`：麦克风持续吞吐慢于输入。先看耗时与队列曲线，再尝试 2 秒块；仅扩大队列会增加延时。上传文件模式不触发该队列限制。
 - 浏览器无声音/不解码：换兼容编码（例如 H.264 + AAC 的 MP4），确认系统播放权限和媒体文件音轨；字幕文件请用 UTF-8 `.vtt`。
@@ -276,6 +296,7 @@ FLEX/
   run.py / start_server.sh       启动入口与单卡示例
   requirements*.txt             Web 与测试依赖
   flex_web/server.py            WebSocket、队列、会话隔离、事件日志
+  flex_web/results.py           有界内存的磁盘结果与流式导出
   flex_web/tls.py               内网证书自动生成、校验与复用
   flex_web/media.py             临时上传、受限解码、按播放进度读取文件
   flex_web/model.py             本地 vLLM 模型与 SFT 协议；显式 mock 后端
@@ -291,6 +312,7 @@ FLEX/
 ## 7. 参考与取舍
 
 - [SimulStream 官方仓库](https://github.com/hlt-mt/simulstream)：参考其 WebSocket 音频输入、增量文本输出及事件日志的服务分层思路。本项目直接适配三标签协议，不引入另一套翻译模型。
+- [Qwen3-Omni 官方 Web demo](https://github.com/QwenLM/Qwen3-Omni/blob/main/web_demo.py)：其 `format_history` 按完整多模态 user+assistant 轮次限制模型历史。本项目参考整轮裁剪与显示历史分离的方式，另按 S2TT 时间/token/轮数预算实现滚动，不照搬聊天 demo 的 5 个音频轮参数，也不将其视为同传质量验证。
 - [InfiniSST 官方仓库](https://github.com/LeiLiLab/InfiniSST)：参考流式语音翻译研究的 Web 演示/后端分离方式，不以其模型行为替换本项目的 FLEX 策略。
 - [MDN：AudioWorklet](https://developer.mozilla.org/en-US/docs/Web/API/AudioWorklet)、[getUserMedia](https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getUserMedia)：麦克风使用浏览器音频处理线程，需要安全上下文和用户授权。文件模式独立走上传和播放进度协议。
 - [MDN：ScriptProcessorNode](https://developer.mozilla.org/en-US/docs/Web/API/ScriptProcessorNode)：旧文件兼容实现所用的已弃用主线程接口；当前页面不再使用此路径，旧适配器仅保留作历史测试。
