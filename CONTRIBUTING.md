@@ -52,6 +52,8 @@ node tools/browser_upload_smoke.mjs --base-url http://127.0.0.1:8000
 
 脚本只接受本地 mock 服务，自动生成合成 WAV 并清理，不接触模型权重或用户麦克风。使用非安全测试域名 `flex-http.test`（仅在测试浏览器内映射 127.0.0.1），不设置安全豁免 flags；文件模式在 HTTP 与 localhost 都不应创建 AudioContext/采集器。人为阻塞主线程后应继续完成文件，而不是把“成功停止”当作本需求的通过标准。`--fixture /path/to/test.mp4` 可测试自备的合成视频；不要提供私密媒体。可用 `FLEX_PLAYWRIGHT_MODULE` 指定 Playwright 包的绝对路径，用 `FLEX_BROWSER_EXECUTABLE` 指定已安装的 Chrome/Edge。启用服务认证时，另在测试终端设置相同的 `FLEX_ACCESS_TOKEN`。旧 `browser_http_smoke.mjs` 仅保留为历史采集实现的测试记录，不用于当前文件上传模式验收。
 
+紧凑布局及网页 1 / 2 / 3 秒分块回归：在未设置令牌、默认最大块长 3 秒的本地 mock 服务运行 `node tools/browser_layout_smoke.mjs --base-url http://127.0.0.1:8000`。检查 1366、1920、900、390 像素宽度、字号、设置面板、隐藏认证输入，以及三种块长实际经过上传/WS 到后端的结果。可加 `--screenshots` 保存预览到新建的系统临时目录；输出路径会打印出来，图片不会进入仓库。使用相同的 Playwright/浏览器环境变量。
+
 ## 必须保留的行为
 
 - 译文 append-only：不修改、去重改写或替换已提交的内容。

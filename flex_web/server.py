@@ -611,7 +611,8 @@ def main():
     parser.add_argument('--model', default='', help='Local merged SFT checkpoint directory (not a LoRA-only adapter)')
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=8000)
-    parser.add_argument('--token-env', default='FLEX_ACCESS_TOKEN', help='Read access token from this environment variable')
+    parser.add_argument('--token-env', default='FLEX_ACCESS_TOKEN',
+                        help='Optional access token environment variable; unset or empty disables authentication')
     parser.add_argument('--allow-origin', action='append', default=[], help='Exact extra allowed Origin; useful behind TLS proxy')
     parser.add_argument('--directions', nargs='+', choices=['en-zh', 'zh-en'], default=['en-zh', 'zh-en'])
     parser.add_argument('--log-dir', type=Path, default=Path('logs'))
@@ -632,11 +633,9 @@ def main():
                         help='Qwen3-Omni initialization compatibility: 1 retains vision initialization; input remains audio-only')
     parser.add_argument('--ffmpeg', default=None, help='Optional FFmpeg executable path for uploaded audio/video decoding')
     args = parser.parse_args()
+    # Trusted intranet deployments may run without an application-level token.
+    # An explicitly configured token still protects both HTTP media and WS APIs.
     token = os.environ.get(args.token_env, '')
-    if args.host not in ('127.0.0.1', 'localhost', '::1') and not token:
-        parser.error(f'Non-loopback listening requires an access token. Set {args.token_env} '
-                     'in the same shell before starting the server. '
-                     'HTTP file playback is supported; browser microphone capture requires a secure context.')
     if not 0 < args.gpu_memory_utilization < 1 or min(args.max_model_len, args.max_audio_turns, args.max_tokens) <= 0:
         parser.error('Invalid GPU/context configuration')
     options = ModelOptions(model=args.model, dtype=args.dtype, max_model_len=args.max_model_len,

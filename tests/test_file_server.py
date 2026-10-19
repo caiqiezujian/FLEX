@@ -5,6 +5,7 @@ import json
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from test_media import wav_bytes
 from test_server import app_factory, connect_ready, receive_until, start
@@ -24,13 +25,50 @@ def test_upload_auth_origin_and_config(app_factory):
         assert config['file_mode'] == 'uploaded'
         assert config['max_upload_bytes'] == 256 * 1024 * 1024
         assert client.post('/api/media', content=b'123').status_code == 401
+        assert client.post('/api/media', content=b'123',
+                           headers={'Authorization': 'Bearer wrong-token'}).status_code == 401
         auth = {'Authorization': 'Bearer example-secret'}
         assert client.post('/api/media', content=b'123',
                            headers={**auth, 'Origin': 'http://attacker.example'}).status_code == 403
         item = upload(client, headers={**auth, 'Origin': 'http://testserver'})
         assert 'example-secret' not in json.dumps(item)
         assert client.delete('/api/media/' + item['media_id']).status_code == 401
+        assert client.delete('/api/media/' + item['media_id'],
+                             headers={'Authorization': 'Bearer wrong-token'}).status_code == 401
         assert client.delete('/api/media/' + item['media_id'], headers=auth).status_code == 200
+        assert not app.state.media.uploads
+
+
+@pytest.mark.parametrize('token', ['', 'synthetic-intranet-test-token'])
+def test_intranet_upload_ws_and_delete_keep_optional_auth_and_origin_checks(app_factory, token):
+    app, engine = app_factory(token=token)
+    origin = 'http://10.0.0.8:18889'
+    socket_url = 'ws://10.0.0.8:18889/ws'
+    headers = {'Origin': origin}
+    start_auth = {}
+    if token:
+        headers['Authorization'] = f'Bearer {token}'
+        start_auth['token'] = token
+    with TestClient(app, base_url=origin) as client:
+        assert client.get('/api/config').json()['auth_required'] is bool(token)
+        hostile = {**headers, 'Origin': 'http://unrelated.example'}
+        assert client.post('/api/media', content=b'123', headers=hostile).status_code == 403
+        item = upload(client, samples=16000, headers=headers)
+        assert client.delete('/api/media/' + item['media_id'], headers=hostile).status_code == 403
+        assert item['media_id'] in app.state.media.uploads
+        with pytest.raises(WebSocketDisconnect) as rejected:
+            with client.websocket_connect(socket_url, headers=hostile):
+                pass
+        assert rejected.value.code == 1008
+        assert not engine.sessions
+        with client.websocket_connect(socket_url, headers={'Origin': origin}) as ws:
+            connect_ready(ws, media_id=item['media_id'], **start_auth)
+            ws.send_json(dict(type='finish', position_s=1))
+            done = receive_until(ws, 'done')[-1]
+            assert done['reason'] == 'finished' and done['processed_audio_s'] == 1
+        assert not app.state.media.uploads
+        unused = upload(client, samples=160, headers=headers)
+        assert client.delete('/api/media/' + unused['media_id'], headers=headers).status_code == 200
         assert not app.state.media.uploads
 
 

@@ -1,63 +1,53 @@
-/* Functional labels stay legible at laptop size and when viewed remotely. */
-.page-heading p,
-.field-label,
-.settings > summary,
-.settings-panel > label,
-.state-label,
-.file-description strong,
-.transcript-empty p,
-.microphone-stage p {
-  font-size: 12px;
-  color: #6c7f70;
+/* Readable controls and quiet secondary text; no decorative typefaces. */
+:root { font-size: 15px; }
+button, input, select, summary { font-size: 15px; }
+.brand { font-size: 23px; font-weight: 700; letter-spacing: 0; }
+.brand > span { font-size: 18px; font-weight: 500; }
+.model-card strong, .server-status, .state-label,
+.field-label, .file-description strong, .settings > summary,
+.settings-panel > label, .settings-panel select,
+.settings-panel input[type=password], .button, .button-small,
+.segmented button, .text-button, .export-actions .text-button,
+.turn-details > summary, .clock-label { font-size: 15px; }
+.panel-title h2, .settings-panel h3 { font-size: 17px; font-weight: 600; }
+.file-description strong { color: #37463f; }
+.field-label, .server-status, .settings > summary,
+.settings-panel > label, .state-label, .segmented button,
+.text-button, .export-actions .text-button, .turn-details > summary,
+.clock-label { color: #53665a; }
+.file-description small, .source-options, .source-options > span,
+.source-footer, .source-footer #captureFormat, .clock-label small,
+.badge, .file-type, .language-badge, .tag, .check-label small,
+.transcript-bottom, .turn-details #turnCount, .turn-list, .no-turns,
+.turn-row-header time, .turn-row .turn-latency, .turn-row.wait p,
+.metrics > div > span, .metrics small, .workspace-footer {
+  font-size: 13px;
+  color: #65736b;
+  letter-spacing: 0;
 }
-.drop-zone strong { color: #45624f; }
-.drop-zone > span:not(.upload-icon) { color: #718572; }
-.drop-zone small { font-size: 10px; color: #7a8d7b; }
-.drop-zone .local-file-note { color: #758b75; }
-.file-description small,
-.model-card #modelMeta,
-.source-options,
-.source-options > span,
-.source-options .text-button,
-.translation-status,
-.transcript-bottom,
-.committed-note,
-.turn-details > summary,
-.metrics > div > span,
-.workspace-footer,
-.tag-legend,
-.mic-headphone-note {
-  color: #748674;
-  font-size: 11px;
+.badge.mock { color: #885b21; }
+.tag-flex { color: #78539b; }
+.tag-direct { color: #326d4b; }
+.tag-wait { color: #8d6b2c; }
+.tag-neutral { color: #6c7871; }
+.drop-zone strong { font-size: 18px; color: #3e5548; font-weight: 500; }
+.drop-zone > span:not(.upload-icon) { font-size: 14px; color: #66776d; }
+.transcript-empty h3 { font-size: 17px; color: #78857d; font-weight: 400; }
+.transcript, .transcript[lang=en] {
+  font-size: 24px;
+  line-height: 1.7;
+  letter-spacing: 0;
+  font-weight: 400;
+  color: #263b2e;
 }
-.transcript-empty h3 { color: #647e66; font-size: 14px; }
-.settings-panel p,
-.check-label small,
-.turn-row .turn-latency,
-.turn-row-header time,
-.turn-details #turnCount,
-.source-footer,
-.clock-label small {
-  color: #758774;
-  font-size: 10px;
-}
-.tag-neutral { color: #778b77; }
-.tag { font-size: 9px; }
-.model-card strong { max-width: 225px; }
-.export-actions .text-button { color: #718870; font-size: 10px; }
-@media (max-width: 900px) {
-  .file-description small { font-size: 10px; }
-  .metrics > div > span { font-size: 10px; }
-  .workspace-footer { font-size: 10px; }
-  .source-options > span { font-size: 10px; }
-}
+.turn-row p { font-size: 15px; color: #3e5546; }
+.metrics strong { font-size: 21px; color: #3e5847; font-weight: 500; }
+.microphone-stage strong { font-size: 18px; color: #445c4c; }
+.microphone-stage p { font-size: 14px; color: #65786a; }
+.notice { font-size: 15px; }
 @media (max-width: 650px) {
-  .model-card > div { grid-template-columns: minmax(0, 1fr); }
-  .model-card #modelMeta { font-size: 9px; }
-  .model-card strong { max-width: 100%; }
-  .page-heading p { font-size: 11px; }
-  .settings > summary { font-size: 11px; }
-  .source-options > span { font-size: 9px; }
-  .metrics > div > span { font-size: 9px; }
-  .tag-legend { font-size: 10px; }
+  .brand { font-size: 21px; }
+  .brand > span { font-size: 16px; }
+  .server-status { font-size: 13px; }
+  .transcript, .transcript[lang=en] { font-size: 23px; }
 }

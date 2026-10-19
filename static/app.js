@@ -51,7 +51,7 @@ function updateControls() {
   for (const element of [ui.fileMode,ui.micMode,ui.sourceLang,ui.targetLang,ui.swapLang,ui.chooseFile,ui.chunkSeconds,ui.adaptive,ui.authToken]) element.disabled = active;
   ui.adaptive.disabled = active || mode === 'file';
   ui.adaptive.checked = mode === 'microphone' && microphoneAdaptive;
-  ui.adaptiveHint.textContent = mode === 'file' ? '文件采用固定分块，页面卡顿不会改变切块或丢失音频' : `最多合并 ${config?.max_chunk_seconds || 3} 秒，保持顺序、不丢音频`;
+  ui.adaptiveHint.textContent = mode === 'file' ? '文件固定分块' : `最多合并 ${config?.max_chunk_seconds || 3} 秒`;
   ui.dropZone.disabled = active;
   ui.chooseSubtitle.disabled = active || !selectedFile;
   ui.removeSubtitle.disabled = active;
@@ -60,10 +60,10 @@ function updateControls() {
   ui.exportJson.disabled = !turns.length && !lastExport;
   ui.captureDot.classList.toggle('active', state === 'live');
   ui.micArea.querySelector('.microphone-stage').classList.toggle('active', state === 'live' && mode === 'microphone');
-  ui.micTitle.textContent = state === 'live' ? '正在聆听你的声音' : '准备好，开始对话';
-  ui.micDescription.textContent = state === 'live' ? '正常说话即可，译文会逐步出现在右侧。' : '开始同传时，浏览器会请求麦克风权限。';
+  ui.micTitle.textContent = state === 'live' ? '正在录音' : '麦克风就绪';
+  ui.micDescription.textContent = state === 'live' ? '' : '开始时需要麦克风授权';
   ui.audioArtwork.classList.toggle('playing', mode === 'file' && !ui.media.paused);
-  const labels = {idle:'等待开始',connecting:'准备音频与连接服务',live:'同传进行中',paused:'播放已暂停 · 处理已接收音频',draining:'正在处理剩余音频',done:'本次同传已结束',error:'会话已停止'};
+  const labels = {idle:'等待开始',connecting:'正在准备',live:'同传进行中',paused:'播放已暂停',draining:'处理剩余音频',done:'同传已结束',error:'会话已停止'};
   statusLabel(state === 'connecting' ? session?.preparationLabel || labels.connecting : labels[state] || state, state === 'live' ? 'live' : state === 'error' ? 'error' : '');
 }
 function setState(value) { state = value; updateControls(); }
@@ -90,9 +90,9 @@ function clearTranscript() {
   if (busy()) return;
   currentTranslation = ''; turns = []; transcriptFragments = 0; lastExport = null; lastMetrics = {};
   ui.transcript.replaceChildren(); ui.turnList.replaceChildren();
-  const hint = document.createElement('p'); hint.className = 'no-turns'; hint.textContent = '开始后可查看每轮标签、输入区间和推理耗时。'; ui.turnList.append(hint);
+  const hint = document.createElement('p'); hint.className = 'no-turns'; hint.textContent = '暂无记录'; ui.turnList.append(hint);
   ui.transcriptEmpty.hidden = false; ui.translationCount.textContent = '0 个输出片段'; ui.turnCount.textContent = '0 轮';
-  ui.latestTag.className = 'tag tag-neutral'; ui.latestTag.textContent = 'APPEND ONLY';
+  ui.latestTag.className = 'tag tag-neutral'; ui.latestTag.textContent = '—';
   followOutput = true; ui.followButton.hidden = true;
   renderMetrics({received_audio_s:0,processed_audio_s:0,pending_audio_s:0});
   ui.serviceMetric.replaceChildren(document.createTextNode('—'), Object.assign(document.createElement('small'), {textContent:' s'}));
@@ -129,7 +129,7 @@ function appendTurn(data, s) {
   const timing = document.createElement('time'); timing.textContent = `${time(data.source_start_s+s.mediaOffset)} – ${time(data.source_end_s+s.mediaOffset)}`;
   header.append(tag,timing);
   const latency = document.createElement('span'); latency.className = 'turn-latency'; latency.textContent = `推理 ${Number(data.service_s).toFixed(2)}s · 提交前等待 ${Number(data.queue_wait_s).toFixed(2)}s`;
-  const text = document.createElement('p'); text.textContent = data.tag === 'WAIT' ? '等待更多源语音，上下文继续保留。' : data.delta;
+  const text = document.createElement('p'); text.textContent = data.tag === 'WAIT' ? '等待后续音频' : data.delta;
   row.append(header,latency,text); ui.turnList.append(row);
   ui.translationCount.textContent = `${transcriptFragments} 个输出片段`;
   ui.turnCount.textContent = `${turns.length} 轮`;
@@ -147,11 +147,11 @@ async function loadConfig() {
     ui.backendBadge.textContent = config.backend === 'mock' ? 'MOCK' : 'LOCAL';
     ui.backendBadge.classList.toggle('mock',config.backend === 'mock');
     ui.demoBanner.hidden = config.backend !== 'mock';
-    ui.modelMeta.textContent = config.backend === 'mock' ? '模拟后端 · 不代表实际翻译能力' : '一个双向模型 · 中英互译';
+    ui.modelMeta.textContent = config.backend === 'mock' ? '模拟输出' : '中英互译';
     ui.serverStatus.className = `server-status ${config.status}`;
     ui.serverStatus.replaceChildren(document.createElement('i'), document.createTextNode(config.status === 'ready' ? '服务已就绪' : config.status === 'error' ? '模型加载失败' : '模型加载中'));
     ui.authField.hidden = !config.auth_required;
-    ui.adaptiveHint.textContent = `最多合并 ${config.max_chunk_seconds || 3} 秒，保持顺序、不丢音频`;
+    ui.adaptiveHint.textContent = `最多合并 ${config.max_chunk_seconds || 3} 秒`;
     if (!busy()) {
       if ([...ui.chunkSeconds.options].some(x => x.value === String(config.chunk_seconds))) ui.chunkSeconds.value = String(config.chunk_seconds);
       for (const option of ui.chunkSeconds.options) option.disabled = Number(option.value) > (config.max_chunk_seconds || 3);
@@ -159,7 +159,7 @@ async function loadConfig() {
     if (config.status === 'error') showError(config.error || '请检查服务器日志和本地模型路径。','模型尚未就绪');
     if (config.status === 'loading') pollTimer = setTimeout(loadConfig,3000);
     else pollTimer = null;
-    ui.footerHint.textContent = `单卡单会话 · 最长 ${config.max_session_seconds || 180} 秒 · ${config.backend === 'mock' ? '当前为功能演示模式' : '模型在服务器本地运行'}`;
+    ui.footerHint.textContent = `最长 ${config.max_session_seconds || 180} 秒 · 单会话`;
     updateControls();
   } catch (error) {
     config = null; ui.serverStatus.className = 'server-status error'; ui.serverStatus.replaceChildren(document.createElement('i'),document.createTextNode('服务未连接'));
@@ -389,7 +389,7 @@ async function startSession() {
     setState('live');
     if (mode === 'file') {
       s.progressTimer = setInterval(() => sendFileProgress(s),200);
-      ui.footerHint.textContent = '文件由服务器按播放进度读取 · 页面短暂卡顿可续接 · 麦克风仍需 HTTPS / localhost';
+      ui.footerHint.textContent = `固定 ${s.chunkSeconds} 秒分块 · 最长 ${config.max_session_seconds || 180} 秒`;
       sendFileProgress(s,true);
       await ui.media.play();
     }
@@ -439,7 +439,7 @@ function download(kind) {
 function removeSubtitle() {
   if (subtitleTrack) {subtitleTrack.remove();subtitleTrack = null;}
   if (subtitleUrl) {URL.revokeObjectURL(subtitleUrl);subtitleUrl = null;}
-  ui.subtitleInput.value = '';ui.subtitleName.textContent = '支持视频内嵌画面字幕与外部 WebVTT';ui.removeSubtitle.hidden = true;
+  ui.subtitleInput.value = '';ui.subtitleName.textContent = '';ui.removeSubtitle.hidden = true;
 }
 function chooseFile(file) {
   if (!file || busy()) return;
@@ -449,7 +449,7 @@ function chooseFile(file) {
   ui.media.hidden = false;ui.dropZone.hidden = true;ui.mediaStage.classList.add('has-file');
   const audioOnly = file.type.startsWith('audio/') || /\.(wav|mp3|m4a|ogg|flac|aac)$/i.test(file.name);
   ui.audioArtwork.hidden = !audioOnly;ui.fileType.textContent = audioOnly ? 'AUDIO' : 'VIDEO';
-  ui.fileName.textContent = file.name;ui.fileDetails.textContent = `${formatBytes(file.size)} · 正在读取媒体信息`;
+  ui.fileName.textContent = file.name;ui.fileDetails.textContent = `${formatBytes(file.size)} · 读取中`;
   ui.errorBox.hidden = true;ui.fileInput.value = '';updateControls();
 }
 
@@ -487,7 +487,7 @@ ui.media.addEventListener('playing',() => {
 ui.media.addEventListener('waiting',() => {
   const s = session;
   if (s && s.sourceKind === 'file' && !s.terminal && state === 'live') {
-    statusLabel('媒体缓冲中 · 已播放音频继续推理');
+    statusLabel('媒体缓冲中');
     sendFileProgress(s,true);
   }
 });
@@ -515,7 +515,7 @@ setInterval(() => {
   const seconds = mode === 'file' ? ui.media.currentTime : (session?.sentSamples || 0)/16000;
   ui.sourceClock.textContent = time(seconds);
   ui.clockDescription.textContent = mode === 'file'
-    ? (session?.captureMode === 'server-file' ? '源媒体播放时间 · 服务器按进度读取' : '源媒体播放时间')
-    : '已采集源音频';
+    ? '播放位置'
+    : '已采集音频';
 },200);
 updateControls();void loadConfig();

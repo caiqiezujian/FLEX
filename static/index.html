@@ -4,61 +4,63 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <meta name="theme-color" content="#f5f7f5">
-  <title>FLEX Live · 同声传译工作台</title>
+  <meta name="theme-color" content="#f4f5f6">
+  <title>FLEX 同声传译</title>
   <link rel="stylesheet" href="/static/styles.css">
   <link rel="stylesheet" href="/static/readability.css">
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="/" aria-label="FLEX Live 首页"><span class="brand-mark">F<span>·</span></span><span>FLEX <b>Live</b><small>同声传译工作台</small></span></a>
-    <div class="topbar-right"><span class="private-pill"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 4.5 6v5c0 4.6 3.1 8.2 7.5 10 4.4-1.8 7.5-5.4 7.5-10V6Z"/><path d="m8.5 12 2.3 2.3 4.7-4.7"/></svg>本地模型 · 私有推理</span><span id="serverStatus" class="server-status"><i></i>连接服务中</span></div>
+    <a class="brand" href="/" aria-label="FLEX 同声传译首页">FLEX <span>同声传译</span></a>
+    <div class="topbar-right">
+      <div class="model-card"><strong id="modelLabel">正在读取模型</strong><span id="modelMeta" hidden></span><span id="backendBadge" class="badge">—</span></div>
+      <span id="serverStatus" class="server-status"><i></i>连接服务中</span>
+    </div>
   </header>
 
   <main class="workspace">
-    <section class="page-heading">
-      <div><div class="eyebrow">STREAMING INTERPRETATION</div><h1>听见此刻，译见此刻<span>。</span></h1><p>播放音视频，或打开麦克风。让每一段译文，跟上正在发生的对话。</p></div>
-      <div class="model-card"><span class="model-icon">◈</span><div><span class="tiny-label">当前推理引擎</span><strong id="modelLabel">正在读取服务器配置</strong><span id="modelMeta">一个双向模型 · 中英互译</span></div><span id="backendBadge" class="badge">—</span></div>
-    </section>
-
-    <div id="demoBanner" class="notice demo-notice" hidden><strong>演示模式</strong><span>当前为模拟输出，仅用于验证页面、音频传输和时序；不是模型翻译结果。</span></div>
+    <div id="demoBanner" class="notice demo-notice" hidden><strong>演示模式</strong><span>当前为模拟输出，不是模型翻译结果。</span></div>
     <div id="errorBox" class="notice error-notice" role="alert" hidden><div><strong id="errorTitle">会话提示</strong><span id="errorMessage"></span></div><button id="dismissError" class="icon-button" aria-label="关闭提示">×</button></div>
 
     <section class="toolbar" aria-label="同传设置">
-      <div class="direction-control"><span class="field-label">翻译方向</span><select id="sourceLang" aria-label="源语言"><option value="en">英语 English</option><option value="zh">中文 Chinese</option></select><button id="swapLang" class="swap-button" title="切换翻译方向" aria-label="切换翻译方向">⇄</button><select id="targetLang" aria-label="目标语言"><option value="zh">中文 Chinese</option><option value="en">英语 English</option></select></div>
-      <div class="toolbar-actions"><details id="settings" class="settings"><summary><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16M8 4v6m8 4v6"/></svg>推理设置</summary><div class="settings-panel"><h3>流式参数</h3><label>基础分块<select id="chunkSeconds"><option value="1">1 秒 · 更及时</option><option value="2">2 秒 · 更少轮次</option><option value="3">3 秒 · 更大上下文单元</option></select></label><label class="check-label"><input id="adaptive" type="checkbox" checked><span>积压时自适应合并<small id="adaptiveHint">保持先后顺序，不丢弃音频</small></span></label><label id="authField" hidden>服务访问令牌<input id="authToken" type="password" autocomplete="off" placeholder="仅在本次页面中保存"></label><p>WAIT 保留上下文；FLEX / DIRECT 都会立即追加译文。参数在会话开始后锁定。</p></div></details><button id="clearButton" class="button button-subtle" disabled>清空结果</button></div>
+      <div class="direction-control"><span class="field-label">翻译方向</span><select id="sourceLang" aria-label="源语言"><option value="en">英语</option><option value="zh">中文</option></select><button id="swapLang" class="swap-button" title="切换翻译方向" aria-label="切换翻译方向">⇄</button><select id="targetLang" aria-label="目标语言"><option value="zh">中文</option><option value="en">英语</option></select></div>
+      <div class="toolbar-actions">
+        <details id="settings" class="settings"><summary><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16M8 4v6m8 4v6"/></svg>推理设置</summary>
+          <div class="settings-panel"><h3>流式参数</h3><label>基础分块<select id="chunkSeconds"><option value="1">1 秒</option><option value="2">2 秒</option><option value="3">3 秒</option></select></label><label class="check-label"><input id="adaptive" type="checkbox" checked><span>麦克风积压时合并<small id="adaptiveHint">文件固定分块</small></span></label><label id="authField" hidden>服务访问令牌<input id="authToken" type="password" autocomplete="off" placeholder="仅在本次页面中保存"></label></div>
+        </details>
+        <button id="clearButton" class="button button-subtle" disabled>清空结果</button>
+      </div>
     </section>
 
     <section class="panels">
       <article class="panel source-panel">
-        <div class="panel-heading"><div class="panel-title"><span class="section-number">01</span><h2>原始内容</h2></div><div class="segmented" role="group" aria-label="输入来源"><button id="fileMode" class="selected" aria-pressed="true">音视频文件</button><button id="micMode" aria-pressed="false">麦克风</button></div></div>
+        <div class="panel-heading"><div class="panel-title"><h2>原始内容</h2></div><div class="segmented" role="group" aria-label="输入来源"><button id="fileMode" class="selected" aria-pressed="true">音视频</button><button id="micMode" aria-pressed="false">麦克风</button></div></div>
         <div id="fileArea">
           <div id="mediaStage" class="media-stage">
             <video id="media" controls playsinline preload="metadata" hidden></video>
-            <div id="audioArtwork" class="audio-artwork" hidden><div class="audio-disc"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l11-2v13M9 8l11-2"/><ellipse cx="6" cy="18" rx="3" ry="2"/><ellipse cx="17" cy="16" rx="3" ry="2"/></svg></div><div class="audio-bars" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div><span>让声音，跨越语言</span></div>
-            <button id="dropZone" class="drop-zone"><span class="upload-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m-4 4 4-4 4 4M4 15v5h16v-5"/></svg></span><strong>放入一段音视频，开始同传</strong><span>拖放文件到这里，或点击选择</span><small>支持浏览器可播放的 MP4 / WebM / WAV / MP3 等格式</small><span class="local-file-note">开始时上传完整文件，模型只接收已播放的音频</span></button>
+            <div id="audioArtwork" class="audio-artwork" hidden><div class="audio-disc"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l11-2v13M9 8l11-2"/><ellipse cx="6" cy="18" rx="3" ry="2"/><ellipse cx="17" cy="16" rx="3" ry="2"/></svg></div><div class="audio-bars" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div></div>
+            <button id="dropZone" class="drop-zone"><span class="upload-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m-4 4 4-4 4 4M4 15v5h16v-5"/></svg></span><strong>选择或拖入音视频</strong><span>MP4 / WebM / WAV / MP3 等</span></button>
           </div>
-          <div class="media-info"><div class="file-description"><span id="fileType" class="file-type">MEDIA</span><div><strong id="fileName">尚未选择文件</strong><small id="fileDetails">可直接对照视频中的原始字幕</small></div></div><button id="chooseFile" class="button button-small">选择文件</button></div>
-          <div class="source-options"><button id="chooseSubtitle" class="text-button" disabled>＋ 添加 VTT 字幕</button><span id="subtitleName">支持视频内嵌画面字幕与外部 WebVTT</span><button id="removeSubtitle" class="text-button" hidden>移除</button></div>
-          <p class="source-options">完整文件临时上传到当前服务器，会话结束后清理；模型只读取已播放的部分。</p>
+          <div class="media-info"><div class="file-description"><span id="fileType" class="file-type">文件</span><div><strong id="fileName">尚未选择文件</strong><small id="fileDetails"></small></div></div><button id="chooseFile" class="button button-small">选择文件</button></div>
+          <div class="source-options"><button id="chooseSubtitle" class="text-button" disabled>添加 VTT 字幕</button><span id="subtitleName"></span><button id="removeSubtitle" class="text-button" hidden>移除</button><span class="upload-note" title="开始时完整上传到当前服务器；模型按播放进度读取，会话结束后清理。">文件临时上传，结束后清理</span></div>
           <input id="fileInput" type="file" accept="audio/*,video/*,.mkv,.mov,.mp4,.webm,.wav,.mp3,.m4a,.ogg,.flac" hidden>
           <input id="subtitleInput" type="file" accept=".vtt,text/vtt" hidden>
         </div>
-        <div id="micArea" hidden><div class="microphone-stage"><div class="mic-orbit"><div class="mic-symbol"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="12" rx="3"/><path d="M6 10v2a6 6 0 0 0 12 0v-2M12 18v3m-4 0h8"/></svg></div></div><strong id="micTitle">准备好，开始对话</strong><p id="micDescription">开始同传时，浏览器会请求麦克风权限。</p><div id="micMeter" class="mic-meter" aria-label="麦克风音量"><span></span></div><span class="mic-headphone-note">建议佩戴耳机，避免扬声器回声</span></div></div>
-        <div class="source-footer"><span class="clock-label"><i id="captureDot"></i><span id="sourceClock">00:00.0</span><small id="clockDescription">源音频时间</small></span><span id="captureFormat">16 kHz · Mono · PCM</span></div>
+        <div id="micArea" hidden><div class="microphone-stage"><div class="mic-orbit"><div class="mic-symbol"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="12" rx="3"/><path d="M6 10v2a6 6 0 0 0 12 0v-2M12 18v3m-4 0h8"/></svg></div></div><strong id="micTitle">麦克风就绪</strong><p id="micDescription">开始时需要麦克风授权</p><div id="micMeter" class="mic-meter" aria-label="麦克风音量"><span></span></div></div></div>
+        <div class="source-footer"><span class="clock-label"><i id="captureDot"></i><span id="sourceClock">00:00.0</span><small id="clockDescription">播放位置</small></span><span id="captureFormat">16 kHz · 单声道</span></div>
       </article>
 
       <article class="panel translation-panel">
-        <div class="panel-heading"><div class="panel-title"><span class="section-number">02</span><h2>实时译文</h2><span id="targetBadge" class="language-badge">中文</span></div><div class="export-actions"><button id="exportTxt" class="text-button" disabled title="导出纯译文">TXT ↓</button><button id="exportJson" class="text-button" disabled title="导出含时序、标签的完整会话">JSON ↓</button></div></div>
-        <div class="translation-status"><span id="sessionStatus" class="state-label"><i></i>等待开始</span><span id="latestTag" class="tag tag-neutral">APPEND ONLY</span></div>
-        <div id="transcriptViewport" class="transcript-viewport" tabindex="0" aria-label="增量译文区域"><div id="transcriptEmpty" class="transcript-empty"><div class="translation-glyph">文<span>A</span></div><h3>译文将在这里逐步出现</h3><p>每次输出都只追加新内容。<br>FLEX 与 DIRECT 都是已提交的译文。</p><div class="tag-legend"><span><i class="legend-flex"></i>FLEX 灵活表达</span><span><i class="legend-direct"></i>DIRECT 直接翻译</span></div></div><div id="transcript" class="transcript" lang="zh" aria-live="polite" aria-relevant="additions text"></div></div>
-        <div class="transcript-bottom"><span id="translationCount">0 个输出片段</span><button id="followButton" class="text-button" hidden>跟随最新 ↓</button><span class="committed-note">已提交 · 不回改</span></div>
-        <details id="turnDetails" class="turn-details"><summary><span>查看逐轮时间轴</span><span id="turnCount">0 轮</span></summary><div id="turnList" class="turn-list"><p class="no-turns">开始后可查看每轮标签、输入区间和推理耗时。</p></div></details>
+        <div class="panel-heading"><div class="panel-title"><h2>实时译文</h2><span id="targetBadge" class="language-badge">中文</span></div><div class="export-actions"><button id="exportTxt" class="text-button" disabled title="导出纯译文">TXT ↓</button><button id="exportJson" class="text-button" disabled title="导出含时序、标签的完整会话">JSON ↓</button></div></div>
+        <div class="translation-status"><span id="sessionStatus" class="state-label"><i></i>等待开始</span><span id="latestTag" class="tag tag-neutral">—</span></div>
+        <div id="transcriptViewport" class="transcript-viewport" tabindex="0" aria-label="增量译文区域"><div id="transcriptEmpty" class="transcript-empty"><h3>暂无译文</h3></div><div id="transcript" class="transcript" lang="zh" aria-live="polite" aria-relevant="additions text"></div></div>
+        <div class="transcript-bottom"><span id="translationCount">0 个输出片段</span><button id="followButton" class="text-button" hidden>跟随最新 ↓</button></div>
+        <details id="turnDetails" class="turn-details"><summary><span>逐轮记录</span><span id="turnCount">0 轮</span></summary><div id="turnList" class="turn-list"><p class="no-turns">暂无记录</p></div></details>
       </article>
     </section>
 
     <section class="session-bar" aria-label="会话控制和状态"><div class="transport"><button id="startButton" class="button button-primary" disabled><span>▶</span>开始同传</button><button id="pauseButton" class="button" disabled>暂停播放</button><button id="finishButton" class="button" disabled><span class="stop-icon"></span>结束同传</button></div><div class="metrics"><div><span>已接收音频</span><strong id="receivedMetric">0.0<small> s</small></strong></div><div><span>待推理音频</span><strong id="pendingMetric">0.0<small> s</small></strong></div><div><span>最近推理耗时</span><strong id="serviceMetric">—<small> s</small></strong></div><div><span>已处理音频</span><strong id="processedMetric">0.0<small> s</small></strong></div></div></section>
-    <footer class="workspace-footer"><span><i></i><span id="footerHint">模型在服务器本地运行，文件按播放进度逐块推理；麦克风需要 HTTPS / localhost。</span></span><span>音频时间 ≠ 语义延迟 · 保留真实逐轮记录</span></footer>
+    <footer class="workspace-footer"><span id="footerHint">文件按播放进度分块</span></footer>
   </main>
   <script type="module" src="/static/app.js"></script>
 </body>
