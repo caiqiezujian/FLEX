@@ -127,28 +127,41 @@ CUDA_VISIBLE_DEVICES=6 bash start_server.sh /absolute/path/to/checkpoint-merged 
 
 默认上传上限 256 MiB、文件解码时长上限与 `--max-session-seconds` 一致（默认 180 秒）。16 kHz 单声道 PCM16 WAV 可直接处理；其他格式需要服务器可执行 FFmpeg，可用 `--ffmpeg /path/to/ffmpeg` 指定。只复用现有模型环境，不需更换 torch/vLLM。临时文件正常在会话结束/取消后清理，未使用的上传有过期清理；完整文件会传到服务器，敏感媒体请先确认留存和访问策略。
 
-本次更新包含 Python 后端，**需要重启服务并刷新页面**，仅刷新旧网页不能启用文件上传。`start_server.sh` 用法不变，不需要新增服务、端口或证书。
+更新包含 Python 后端，**需要重启服务并刷新页面**。仅使用 HTTP 文件模式时，原来的启动命令不变，不需要证书。
 
-**麦克风与文件模式不同：普通远程 HTTP 默认不能调用麦克风。** 麦克风请使用可信 HTTPS，或下面的 localhost 访问方式；文件模式不再被这个检查一并拦截。HTTP 不加密口令和音频，仅在受控可信网络测试，敏感内容和长期共享部署使用 HTTPS；不要开放到公网。
+### 内网麦克风：自动生成证书并启动 HTTPS
 
-如果需要麦克风，也可以使用 SSH 隧道，服务器保持回环监听：
-
-```bash
-ssh -L 8000:127.0.0.1:8000 your_user@your_gpu_server
-```
-
-然后在本机 Chrome / Edge 打开 `http://localhost:8000`。这是可选的麦克风/安全访问方式，不是内网文件同传的必需步骤。若服务器端口为 18889，相应使用 `ssh -L 18889:127.0.0.1:18889 your_user@your_gpu_server` 和 `http://localhost:18889`。
-
-长期共享使用或需要直接远程采集麦克风时，部署可信 HTTPS/WSS 反向代理、配置认证和网络访问控制：
+在原启动命令后增加 `--https-host`，填写**浏览器访问的真实 IP 或域名**，不要填 `0.0.0.0`、协议或端口。下面的 `10.0.0.8` 是示例，请换成自己的服务器地址：
 
 ```bash
-export FLEX_ACCESS_TOKEN='replace-with-a-long-random-secret'
-CUDA_VISIBLE_DEVICES=0 python run.py --model /absolute/merged \
-  --host 0.0.0.0 --port 8000 \
-  --allow-origin https://flex.example.internal
+unset FLEX_ACCESS_TOKEN
+CUDA_VISIBLE_DEVICES=6 bash start_server.sh /absolute/path/to/checkpoint-merged \
+  --host 0.0.0.0 --port 18889 --https-host 10.0.0.8
 ```
 
-页面将要求输入访问口令。口令不放 URL，不写进服务事件日志。反向代理必须转发 WebSocket Upgrade、保留 Host，设置足够的读超时，并正确处理可信代理头。没有部署和访问授权时不要自行开放公网端口。
+首次启动会在服务器的 `certs/` 下生成本项目专用的自签根 CA 和带 IP/DNS SAN 的服务器证书，随后直接启动 HTTPS/WSS。需要系统有 OpenSSL 1.1.1 或更新版本（Ubuntu/Debian 缺少时安装 `apt-get install openssl`），不新增 Python 包，不更换模型环境，不需要 Nginx、域名或公网访问。
+
+同事访问 **`https://10.0.0.8:18889`**。仍然是一个 Python 服务、一个 GPU worker、原端口，无访问令牌。**这个端口现在提供 HTTPS，不再提供 HTTP；浏览器需明确改为 `https://`，没有额外的 HTTP 重定向端口。** Docker 继续映射相同端口即可；`--https-host` 填客户端实际访问的宿主机 IP，而不是容器 IP。
+
+**首次在使用者电脑上信任证书（以 Windows + Chrome/Edge 为例）：**
+
+1. 管理员将服务器 `certs/root-ca.crt` 复制给同事，只分发这个公开证书，不分发 `.key` 文件。
+2. 双击 `root-ca.crt` → “安装证书” → “当前用户” → “将所有的证书都放入下列存储” → **“受信任的根证书颁发机构”** → 完成。核对这是部署者提供的 FLEX 证书。
+3. 完全退出并重新打开浏览器，访问上述 HTTPS 地址。选择麦克风后，在浏览器正常授权弹窗中点击“允许”。
+
+这只需在每台电脑首次使用时操作一次；重启服务仍复用同一个 CA，不需要每次导入。单位统一管理的电脑也可以由管理员集中分发。证书由我们自己签发，不会自动成为其他电脑信任的证书；不能把“忽略证书警告继续访问”当作所有浏览器均可稳定录音的保证。如果仍有地址不匹配警告，检查访问 IP/域名是否与 `--https-host` 一致；如果 HTTPS 正常但录音被拒绝，再检查浏览器站点权限、操作系统麦克风权限和设备是否可用。
+
+保留 `certs/`，不要随 `git pull` 删除；容器重建时需持久化该目录。证书/私钥已排除 Git 和源码打包。可通过 `--cert-dir /persistent/path/flex-certs` 指定持久化目录。多个访问地址可重复指定 `--https-host`；换 IP 时仍复用同一 CA，已信任它的电脑不需再次导入。服务器证书到期前会在下次启动时自动续签，不会在运行中热重载；根 CA 不会被静默替换。
+
+已有单位证书时不需要自签，改用：
+
+```bash
+CUDA_VISIBLE_DEVICES=6 bash start_server.sh /absolute/path/to/checkpoint-merged \
+  --host 0.0.0.0 --port 18889 \
+  --ssl-certfile /path/to/fullchain.pem --ssl-keyfile /path/to/private.key
+```
+
+也支持已有 HTTPS 反向代理：后端保持原 HTTP 启动，代理转发 WebSocket Upgrade、保留 Host，并正确处理可信代理头。应用令牌始终可选，与 HTTPS 或麦克风授权无关。仅个人调试时，也可用 SSH 将服务器端口转发到本机 localhost；多人内网使用不需要采用这种方式。
 
 ## 2. 无 GPU 的功能演示
 
@@ -263,6 +276,7 @@ FLEX/
   run.py / start_server.sh       启动入口与单卡示例
   requirements*.txt             Web 与测试依赖
   flex_web/server.py            WebSocket、队列、会话隔离、事件日志
+  flex_web/tls.py               内网证书自动生成、校验与复用
   flex_web/media.py             临时上传、受限解码、按播放进度读取文件
   flex_web/model.py             本地 vLLM 模型与 SFT 协议；显式 mock 后端
   static/                      页面、交互、音频采集与重采样

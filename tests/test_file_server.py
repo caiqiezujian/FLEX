@@ -40,10 +40,11 @@ def test_upload_auth_origin_and_config(app_factory):
 
 
 @pytest.mark.parametrize('token', ['', 'synthetic-intranet-test-token'])
-def test_intranet_upload_ws_and_delete_keep_optional_auth_and_origin_checks(app_factory, token):
+@pytest.mark.parametrize('secure', [False, True])
+def test_intranet_upload_ws_and_delete_keep_optional_auth_and_origin_checks(app_factory, token, secure):
     app, engine = app_factory(token=token)
-    origin = 'http://10.0.0.8:18889'
-    socket_url = 'ws://10.0.0.8:18889/ws'
+    origin = f'{"https" if secure else "http"}://10.0.0.8:18889'
+    socket_url = f'{"wss" if secure else "ws"}://10.0.0.8:18889/ws'
     headers = {'Origin': origin}
     start_auth = {}
     if token:
@@ -53,6 +54,8 @@ def test_intranet_upload_ws_and_delete_keep_optional_auth_and_origin_checks(app_
         assert client.get('/api/config').json()['auth_required'] is bool(token)
         hostile = {**headers, 'Origin': 'http://unrelated.example'}
         assert client.post('/api/media', content=b'123', headers=hostile).status_code == 403
+        mismatched_scheme = {**headers, 'Origin': f'{"http" if secure else "https"}://10.0.0.8:18889'}
+        assert client.post('/api/media', content=b'123', headers=mismatched_scheme).status_code == 403
         item = upload(client, samples=16000, headers=headers)
         assert client.delete('/api/media/' + item['media_id'], headers=hostile).status_code == 403
         assert item['media_id'] in app.state.media.uploads

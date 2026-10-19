@@ -54,6 +54,20 @@ node tools/browser_upload_smoke.mjs --base-url http://127.0.0.1:8000
 
 紧凑布局及网页 1 / 2 / 3 秒分块回归：在未设置令牌、默认最大块长 3 秒的本地 mock 服务运行 `node tools/browser_layout_smoke.mjs --base-url http://127.0.0.1:8000`。检查 1366、1920、900、390 像素宽度、字号、设置面板、隐藏认证输入，以及三种块长实际经过上传/WS 到后端的结果。可加 `--screenshots` 保存预览到新建的系统临时目录；输出路径会打印出来，图片不会进入仓库。使用相同的 Playwright/浏览器环境变量。
 
+### HTTPS 麦克风与上传回归
+
+```bash
+python run.py --backend mock --host 127.0.0.1 --port 31220 \
+  --https-host localhost --cert-dir certs --no-log
+# 另一个终端运行，环境变量与上面的 Playwright 测试相同：
+node tools/browser_https_smoke.mjs --base-url https://localhost:31220 \
+  --ca-cert certs/root-ca.crt --certfile certs/server.crt
+```
+
+只连接本地 mock，不访问物理麦克风、不加载 GPU 模型。Node 使用指定根 CA 验证 TLS 链、主机名和实际叶证书；隔离的测试浏览器仅为该叶证书公钥设置 SPKI 例外，使用浏览器合成麦克风执行真实 AudioWorklet → WSS → 协议响应 → 停止释放设备，再验证 HTTPS 文件上传与固定切块。没有全局关闭证书校验，没有修改电脑根证书存储；这不等于已经验证了用户电脑的系统证书导入。生产使用者应按 README 正常信任专用根 CA。
+
+Python TLS 测试另行覆盖真实 OpenSSL 生成、SAN、可信/不可信握手、重启复用、换 IP 和到期续签、不完整 CA 拒绝；无 OpenSSL 的环境会跳过涉及生成的部分，发布时应确认这些测试实际执行。
+
 ## 必须保留的行为
 
 - 译文 append-only：不修改、去重改写或替换已提交的内容。

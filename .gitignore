@@ -16,6 +16,10 @@ htmlcov/
 !.env.example
 *.pem
 *.key
+*.crt
+*.csr
+*.srl
+certs/
 
 # Model weights, private data, transcripts and runtime output
 model/

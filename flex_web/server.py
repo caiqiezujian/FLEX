@@ -31,6 +31,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .model import ContextLimit, ModelEngine, ModelOptions, ProtocolError, parse_reply
 from .media import FileQueue, MAX_UPLOAD_BYTES, MediaError, MediaStore, decode_upload
+from .tls import TLSConfigError, prepare_local_tls, validate_tls_files
 
 RATE = 16000
 STATIC = Path(__file__).resolve().parent.parent / 'static'
@@ -611,6 +612,12 @@ def main():
     parser.add_argument('--model', default='', help='Local merged SFT checkpoint directory (not a LoRA-only adapter)')
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=8000)
+    parser.add_argument('--https-host', action='append', default=[], metavar='IP_OR_NAME',
+                        help='Generate/reuse a local TLS certificate for this browser-facing IP/name; repeat for aliases')
+    parser.add_argument('--cert-dir', type=Path, default=Path('certs'),
+                        help='Persistent local CA and server certificate directory (default: certs)')
+    parser.add_argument('--ssl-certfile', type=Path, help='Use an existing PEM certificate/chain instead of --https-host')
+    parser.add_argument('--ssl-keyfile', type=Path, help='Unencrypted PEM key matching --ssl-certfile')
     parser.add_argument('--token-env', default='FLEX_ACCESS_TOKEN',
                         help='Optional access token environment variable; unset or empty disables authentication')
     parser.add_argument('--allow-origin', action='append', default=[], help='Exact extra allowed Origin; useful behind TLS proxy')
@@ -633,6 +640,14 @@ def main():
                         help='Qwen3-Omni initialization compatibility: 1 retains vision initialization; input remains audio-only')
     parser.add_argument('--ffmpeg', default=None, help='Optional FFmpeg executable path for uploaded audio/video decoding')
     args = parser.parse_args()
+    if args.https_host and (args.ssl_certfile or args.ssl_keyfile):
+        parser.error('Use either --https-host or --ssl-certfile + --ssl-keyfile, not both')
+    if bool(args.ssl_certfile) != bool(args.ssl_keyfile):
+        parser.error('--ssl-certfile and --ssl-keyfile must be supplied together')
+    tls_paths = ([args.cert_dir] if args.https_host else
+                 [path for path in (args.ssl_certfile, args.ssl_keyfile) if path is not None])
+    if any(path.resolve() == STATIC or STATIC in path.resolve().parents for path in tls_paths):
+        parser.error('TLS certificates/keys must be outside the publicly served static directory; use --cert-dir certs')
     # Trusted intranet deployments may run without an application-level token.
     # An explicitly configured token still protects both HTTP media and WS APIs.
     token = os.environ.get(args.token_env, '')
@@ -649,11 +664,28 @@ def main():
                         allowed_origins=tuple(args.allow_origin), chunk_seconds=args.chunk_seconds,
                         max_chunk_seconds=args.max_chunk_seconds, max_pending_seconds=args.max_pending_seconds,
                         max_session_seconds=args.max_session_seconds, model_options=options, ffmpeg=args.ffmpeg)
+    # Validate deployment/TLS before loading the GPU model. Default HTTP is unchanged.
+    settings.validate()
+    tls_options = {}
+    try:
+        if args.https_host:
+            certificate = prepare_local_tls(args.https_host, args.cert_dir)
+            tls_options = dict(ssl_certfile=str(certificate.certfile), ssl_keyfile=str(certificate.keyfile))
+            print(f'[HTTPS] Local CA certificate: {certificate.ca_certfile}', flush=True)
+            print('[HTTPS] First use: trust this CA on client computers; never distribute .key files.', flush=True)
+            for host in args.https_host:
+                address = f'[{host}]' if ':' in host else host
+                print(f'[HTTPS] After model startup, open https://{address}:{args.port}', flush=True)
+        elif args.ssl_certfile:
+            validate_tls_files(args.ssl_certfile, args.ssl_keyfile)
+            tls_options = dict(ssl_certfile=str(args.ssl_certfile), ssl_keyfile=str(args.ssl_keyfile))
+    except TLSConfigError as exc:
+        parser.error(str(exc))
     import uvicorn
     # A single worker is essential: each extra worker would load another GPU model.
     uvicorn.run(create_app(settings), host=args.host, port=args.port, workers=1,
                 ws_max_size=32768, ws_max_queue=8, ws_ping_interval=20, ws_ping_timeout=20,
-                timeout_graceful_shutdown=120)
+                timeout_graceful_shutdown=120, **tls_options)
 
 
 if __name__ == '__main__':
