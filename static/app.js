@@ -1,4 +1,5 @@
 import { makeAudioPacket } from './pcm-core.js';
+import { createFileCaptureAdapter, selectCaptureMode } from './capture-adapter.js';
 
 const $ = id => document.getElementById(id);
 const ui = Object.fromEntries([
@@ -164,8 +165,12 @@ async function loadConfig() {
   }
 }
 
-async function ensureAudioContext() {
-  if (!window.isSecureContext) throw new Error('音频采集需要安全上下文。请通过 HTTPS 访问，或用 SSH 端口转发后访问 http://localhost:8000。普通远程 HTTP 不支持麦克风 / AudioWorklet。');
+async function ensureAudioContext(sourceKind) {
+  // Reject microphone permission attempts before creating audio resources, but
+  // do not apply that browser restriction to a user-selected local file.
+  if (sourceKind === 'microphone' && !window.isSecureContext) {
+    throw new Error('普通远程 HTTP 不能请求麦克风权限。请选择音视频文件进行同传；麦克风模式需要 HTTPS 或 localhost。');
+  }
   const AudioContextClass = window.AudioContext || window.webkitAudioContext;
   if (!AudioContextClass) throw new Error('当前浏览器不支持 Web Audio，请使用近期版本 Chrome 或 Edge。');
   if (!audioContext) {
@@ -173,8 +178,13 @@ async function ensureAudioContext() {
     monitor = audioContext.createGain(); monitor.connect(audioContext.destination);
   }
   await audioContext.resume();
-  if (!audioContext.audioWorklet) throw new Error('当前浏览器不支持 AudioWorklet，请使用近期版本 Chrome 或 Edge，并确认 HTTPS / localhost 访问。');
-  if (!workletLoaded) { await audioContext.audioWorklet.addModule('/static/capture-worklet.js'); workletLoaded = true; }
+  const captureMode = selectCaptureMode({sourceKind,isSecureContext:window.isSecureContext,
+    hasWorklet:Boolean(audioContext.audioWorklet && window.AudioWorkletNode),
+    hasScriptProcessor:typeof audioContext.createScriptProcessor === 'function'});
+  if (captureMode === 'worklet' && !workletLoaded) {
+    await audioContext.audioWorklet.addModule('/static/capture-worklet.js'); workletLoaded = true;
+  }
+  return captureMode;
 }
 function gate(s, operation) {
   if (!s.node) return Promise.resolve();
@@ -195,7 +205,7 @@ function sendPCM(s, samples) {
   s.ws.send(packet); s.sequence++; s.sentSamples += samples.length;
 }
 async function prepareCapture(s) {
-  await ensureAudioContext();
+  s.captureMode = await ensureAudioContext(s.sourceKind);
   if (!current(s) || s.terminal) return;
   if (mode === 'microphone') {
     if (!navigator.mediaDevices?.getUserMedia) throw new Error('浏览器无法访问麦克风，请确认 HTTPS / localhost 以及麦克风权限。');
@@ -209,14 +219,20 @@ async function prepareCapture(s) {
     mediaSource.disconnect(); s.source = mediaSource;
   }
   monitor.gain.value = mode === 'microphone' ? 0 : 1;
-  s.node = new AudioWorkletNode(audioContext,'flex-capture',{numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[2],processorOptions:{sampleRate:16000,frameSamples:1600}});
+  s.node = s.captureMode === 'http-file'
+    ? createFileCaptureAdapter(audioContext,{media:ui.media,mediaOffset:s.mediaOffset,
+      frameSamples:1600,onError:error => {void failSession(s,error.message);}})
+    : new AudioWorkletNode(audioContext,'flex-capture',{numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[2],processorOptions:{sampleRate:16000,frameSamples:1600}});
   s.node.port.onmessage = ({data}) => {
     if (data.type === 'ack') { const ack = s.acks.get(data.requestId); if (ack) { s.acks.delete(data.requestId); ack.resolve(); } }
     if (data.type === 'pcm') sendPCM(s,new Int16Array(data.buffer));
     if (data.type === 'level' && current(s)) ui.micMeter.firstElementChild.style.width = `${Math.min(100,data.value * 400)}%`;
   };
   s.node.onprocessorerror = () => {void failSession(s,'浏览器音频处理线程发生错误，请重新开始会话。');};
-  s.source.connect(s.node); s.node.connect(monitor);
+  s.source.connect(s.node.inputNode || s.node); s.node.connect(monitor);
+  if (s.captureMode === 'http-file') {
+    ui.footerHint.textContent = '文件 HTTP 兼容模式 · 请保持页面在前台 · 麦克风仍需 HTTPS / localhost · HTTP 传输未加密';
+  }
 }
 async function cleanupCapture(s) {
   clearInterval(s.pingTimer);
@@ -347,7 +363,7 @@ async function resumeCapture() {
   try {await audioContext.resume();if(!s.terminal)setState('live');}catch(error){await failSession(s,error.message);}
 }
 function exportData(s = session) {
-  return {schema_version:1,backend:config?.backend,model_label:config?.model_label,session_id:s?.sessionId || null,source_language:s?.sourceLang || ui.sourceLang.value,target_language:s?.targetLang || ui.targetLang.value,source_kind:s?.sourceKind || mode,source_name:s?.sourceName || null,media_offset_s:s?.mediaOffset || 0,started_at:s?.startedDate || null,ended_at:s?.endedAt || null,sample_rate:16000,sent_audio_s:(s?.sentSamples || 0)/16000,chunk_seconds:s?.chunkSeconds,adaptive:s?.adaptive,translation:currentTranslation,turns:[...turns],final_metrics:{...lastMetrics},done:s?.doneEvent || null,error:s?.failure || null,timing_note:'source_start_s/source_end_s are input audio intervals, not word alignment or semantic latency. Add media_offset_s to compare against file playback time. client_elapsed_s includes actual inference/network scheduling.'};
+  return {schema_version:1,backend:config?.backend,model_label:config?.model_label,session_id:s?.sessionId || null,source_language:s?.sourceLang || ui.sourceLang.value,target_language:s?.targetLang || ui.targetLang.value,source_kind:s?.sourceKind || mode,source_name:s?.sourceName || null,capture_mode:s?.captureMode || null,media_offset_s:s?.mediaOffset || 0,started_at:s?.startedDate || null,ended_at:s?.endedAt || null,sample_rate:16000,sent_audio_s:(s?.sentSamples || 0)/16000,chunk_seconds:s?.chunkSeconds,adaptive:s?.adaptive,translation:currentTranslation,turns:[...turns],final_metrics:{...lastMetrics},done:s?.doneEvent || null,error:s?.failure || null,timing_note:'source_start_s/source_end_s are input audio intervals, not word alignment or semantic latency. Add media_offset_s to compare against file playback time. client_elapsed_s includes actual inference/network scheduling. http-file is a main-thread compatibility path, not a sample-accurate latency benchmark.'};
 }
 function download(kind) {
   const data = session ? exportData(session) : lastExport;
@@ -435,6 +451,8 @@ window.addEventListener('pagehide',() => {
 setInterval(() => {
   const seconds = mode === 'file' ? ui.media.currentTime : (session?.sentSamples || 0)/16000;
   ui.sourceClock.textContent = time(seconds);
-  ui.clockDescription.textContent = mode === 'file' ? '源媒体播放时间' : '已采集源音频';
+  ui.clockDescription.textContent = mode === 'file'
+    ? (session?.captureMode === 'http-file' ? '源媒体播放时间 · HTTP 兼容采集' : '源媒体播放时间')
+    : '已采集源音频';
 },200);
 updateControls();void loadConfig();

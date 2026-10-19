@@ -502,7 +502,9 @@ def main():
     args = parser.parse_args()
     token = os.environ.get(args.token_env, '')
     if args.host not in ('127.0.0.1', 'localhost', '::1') and not token:
-        parser.error('Non-loopback listening requires an access token. Set FLEX_ACCESS_TOKEN; use HTTPS or SSH forwarding.')
+        parser.error(f'Non-loopback listening requires an access token. Set {args.token_env} '
+                     'in the same shell before starting the server. '
+                     'HTTP file playback is supported; browser microphone capture requires a secure context.')
     if not 0 < args.gpu_memory_utilization < 1 or min(args.max_model_len, args.max_audio_turns, args.max_tokens) <= 0:
         parser.error('Invalid GPU/context configuration')
     options = ModelOptions(model=args.model, dtype=args.dtype, max_model_len=args.max_model_len,

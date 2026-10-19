@@ -1,6 +1,6 @@
 # 开发与测试
 
-本仓库仅包含 FLEX Live Web 推理系统。模型权重、训练数据、训练脚本与蒸馏 prompt 不随此仓库发布。
+本仓库包含 FLEX Live Web 推理系统及 `infer_audio.py` 单音频入口。模型权重、训练数据、训练脚本与蒸馏 prompt 不随此仓库发布。
 
 ## 本地开发
 
@@ -20,11 +20,13 @@ python run.py --backend mock --host 127.0.0.1 --port 8000
 ```bash
 python -m pytest -q tests
 node static/test_pcm.mjs
+node static/test_capture.mjs
 python run.py --help
+python infer_audio.py --help
 git diff --check
 ```
 
-Python 测试不加载 checkpoint，不要求 GPU。Node 测试覆盖重采样、PCM 编码、AudioWorklet 暂停/结束/取消；本地曾在 Node 18.17 验证，持续集成使用 Node 22。GitHub Actions 同时检查 Python 3.10、3.11；具体通过状态以对应运行记录为准。
+Python 测试不加载 checkpoint，不要求 GPU；`tests/test_infer_audio.py` 覆盖独立文件推理。Node 测试覆盖重采样、PCM 编码、AudioWorklet 与 HTTP 文件兼容采集的暂停/结束/取消；本地曾在 Node 18.17 验证，持续集成使用 Node 22。GitHub Actions 同时检查 Python 3.10、3.11；具体通过状态以对应运行记录为准。
 
 涉及界面或音频链路的变更还需手动检查：
 
@@ -33,8 +35,21 @@ Python 测试不加载 checkpoint，不要求 GPU。Node 测试覆盖重采样�
 3. 确认正文只有新增译文，WAIT 不追加内容，FLEX/DIRECT 标签保留在时间线。
 4. 检查 TXT / JSON 导出、双向切换与小屏布局。
 5. 改动模型接口后，在真实 checkpoint 上分别验证中→英、英→中。
+6. HTTP 文件模式必须在真实非安全 origin 下验证，例如测试域名通过浏览器 host-resolver 映射本机；不能仅用 localhost（它是可信例外），也不能通过关闭浏览器安全检查伪装通过。同时确认 HTTP 麦克风被单独阻止。
 
 请在变更说明中区分“自动化测试通过”“浏览器 mock 验证”和“真实 GPU 验证”，不要将它们混写成模型效果证明。
+
+### 可选：真实 HTTP 浏览器回归
+
+在 Node 20+ 测试环境安装 Playwright 及其 Chromium（仅开发测试依赖，生产部署不需要），启动本地 mock 服务后执行：
+
+```bash
+python run.py --backend mock --host 127.0.0.1 --port 8000 --no-log
+# 另一个终端执行；Playwright 需已安装在 Node 模块搜索路径中。
+node tools/browser_http_smoke.mjs --base-url http://127.0.0.1:8000
+```
+
+脚本只接受本地 mock 服务，自动生成合成 WAV 并清理，不接触模型权重或用户麦克风。使用非安全测试域名 `flex-http.test`（仅在测试浏览器内映射 127.0.0.1），不设置安全豁免 flags；覆盖普通 HTTP 文件采集与 localhost AudioWorklet。`--fixture /path/to/test.mp4` 可测试自备的合成视频；不要提供私密媒体。可用 `FLEX_PLAYWRIGHT_MODULE` 指定 Playwright 包的绝对路径，用 `FLEX_BROWSER_EXECUTABLE` 指定已安装的 Chrome/Edge。启用服务认证时，另在测试终端设置相同的 `FLEX_ACCESS_TOKEN`。
 
 ## 必须保留的行为
 

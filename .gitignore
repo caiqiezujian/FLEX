@@ -25,6 +25,7 @@ data/
 datasets/
 logs*/
 exports/
+outputs/
 recordings/
 tmp/
 *.jsonl
