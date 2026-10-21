@@ -1,0 +1,52 @@
+{
+  "model_path": "/data/models/flex-sft-merged",
+  "manifest_path": "/data/flex/datasets/flex_gspo_prepared/train.tasks.jsonl",
+  "output_dir": "outputs/gspo_run_001",
+  "seed": 42,
+  "model": {
+    "attn_implementation": "sdpa",
+    "lora_rank": 8,
+    "lora_alpha": 32,
+    "gradient_checkpointing": true
+  },
+  "rollout": {
+    "group_size": 8,
+    "max_new_tokens": 256,
+    "max_context_tokens": 4096,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": 0
+  },
+  "train": {
+    "max_updates": 1000,
+    "epochs": 1,
+    "shuffle": true,
+    "log_interval_seconds": 15,
+    "distributed_timeout_seconds": 3600,
+    "learning_rate": 0.000001,
+    "weight_decay": 0.0,
+    "clip_low": 0.0003,
+    "clip_high": 0.0004,
+    "max_grad_norm": 1.0,
+    "advantage_normalization": "group_std",
+    "std_floor": 0.05,
+    "kl_beta": 0.0,
+    "save_every": 25,
+    "parity_tolerance": 0.05
+  },
+  "reward": {
+    "provider": "qalco",
+    "calibration_acknowledged": false,
+    "quality_floor": 0.85,
+    "latency_budget_seconds": 3.0,
+    "reference_length_ratio": 1.2,
+    "latency_weight": 0.2,
+    "length_weight": 0.1,
+    "metricx": {
+      "backend": "service",
+      "service_url": "",
+      "service_id": "",
+      "mode": "qe"
+    }
+  }
+}

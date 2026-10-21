@@ -1,10 +1,10 @@
-# FLEX · 本地模型同声传译系统
+# FLEX · 本地模型同声传译与强化学习
 
 FLEX Live 是面向 SFT 后双向中英 Qwen3-Omni 模型的流式推理系统，提供单音频命令行和 Web 两种入口。Web 页面支持播放上传音视频，或采集电脑正在播放的声音；右侧显示增量译文，并单独记录 WAIT / FLEX / DIRECT 策略与处理时间。一个本地 checkpoint 支持中→英、英→中两个方向，不调用第三方翻译 API，不做 TTS。
 
 文件模式会先将用户选择的完整音视频上传到服务器临时目录，服务器解码后按播放进度逐块推理；**文件已上传不等于模型能看到未来音频**。普通文件由浏览器本地播放；WMV/ASF 上传后自动转为 H.264/AAC MP4，浏览器播放服务器提供的临时视频。文件模式只报告播放位置，不再实时抓取播放器声音，不依赖 ScriptProcessorNode 或 AudioWorklet。视频烧录字幕或另选的 WebVTT 字幕仍可用于人工对照翻译时机，外部 VTT 不上传。
 
-本仓库发布独立的 Web 推理系统及单音频推理入口，不包含模型权重、训练数据、数据准备/训练脚本或蒸馏 prompt。前端无需 Node 构建；Node 仅用于音频处理逻辑测试。
+仓库根目录保留独立的 Web 推理系统及单音频推理入口；本分支新增 [FLEX-GSPO](FLEX-GSPO/README.md)，提供 QALCO 奖励、MetricX HTTP 评分、在线 GSPO 训练、LoRA 导出与测试文档。两部分使用各自的依赖和配置，不需要为运行 Web 系统安装训练依赖。仓库不包含模型权重、训练数据、私有服务地址、数据准备工程或蒸馏 prompt。前端无需 Node 构建；Node 仅用于音频处理逻辑测试。
 
 > 当前版本：一份模型默认接纳 4 路独立同传、滚动模型上下文、每路默认最长 8 小时。完整结果落盘，页面保留当前会话全部已收到的译文，可滚动回看；正常等待、暂时变慢和服务故障分别显示。目标部署是一张 A800 80 GB；CPU/mock 并发测试不等于真实 GPU 四路实时性或数小时稳定性验收，实际吞吐和翻译质量仍需在目标服务器测量。mock 不是语音翻译模型。
 
@@ -32,13 +32,15 @@ FLEX 译文不是可以事后改写的草稿；与 DIRECT 一样，输出后就�
 ## 获取代码与文档导航
 
 ```bash
-git clone https://github.com/caiqiezujian/FLEX.git
+git clone --branch feat/qalco-gspo-metricx https://github.com/caiqiezujian/FLEX.git
 cd FLEX
 ```
 
-仓库根目录即应用根目录，后面的命令在此目录执行。
+仓库根目录即 Web 应用根目录，后面的 Web 命令在此目录执行。强化学习请进入 `FLEX-GSPO/`，按该目录 README 配置模型、任务文件和 MetricX 服务；公开配置不包含真实内网地址。
 
 - [真实模型启动](#1-先用真实模型启动) / [无 GPU 演示](#2-无-gpu-的功能演示)
+- [QALCO / GSPO 评分、训练与导出](FLEX-GSPO/README.md)
+- [强化学习方法、奖励公式与完整示例](FLEX-GSPO/docx/QALCO强化学习方案详解.md)
 - [先做单音频流式 S2TT，不启动网页](docs/S2TT.md)
 - [客户端/服务端协议](docs/PROTOCOL.md)
 - [已完成的验证与未验证边界](docs/VALIDATION.md)

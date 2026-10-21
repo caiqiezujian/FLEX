@@ -1,0 +1,14 @@
+# Install in a separate environment. Do not upgrade the working SFT/vLLM env.
+# Install a CUDA-compatible torch build for your server separately first.
+torch>=2.6,<3
+transformers==4.57.1
+peft>=0.17,<0.19
+accelerate>=1.10,<2
+numpy>=1.26,<3
+soundfile>=0.12,<1
+librosa>=0.10.2,<0.12
+safetensors>=0.5,<1
+sentencepiece>=0.2,<0.3
+protobuf>=4.25,<7
+Pillow>=10,<13
+requests>=2.32,<3
