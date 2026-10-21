@@ -99,13 +99,16 @@ class MetricXServiceTests(unittest.TestCase):
         config = {"reward": {"provider": "qalco", "metricx": self.settings}}
         self.assertIsInstance(build_scorer(config).quality_model, ServiceMetricX)
 
-    def test_training_stops_before_actor_or_cuda_initialization(self):
-        from flex_gspo.trainer import run_training
+    def test_online_reward_rejects_missing_service_without_loading_actor(self):
+        from flex_gspo.online_reward import OnlineQalcoReward
         config = {"reward": {"provider": "qalco", "metricx": dict(self.settings, service_url="")}}
-        with patch("flex_gspo.trainer._run_training") as expensive:
+        with patch("builtins.__import__", wraps=__import__) as imports, patch(
+                "flex_gspo.metricx_service.request_metricx_scores") as request:
             with self.assertRaisesRegex(RewardError, "service_url"):
-                run_training(config, [])
-            expensive.assert_not_called()
+                OnlineQalcoReward(config)
+            request.assert_not_called()
+        self.assertFalse(any(call.args[0].split(".")[0] in ("torch", "transformers", "swift")
+                             for call in imports.call_args_list))
 
     def test_unsupported_reward_rejected_before_expensive_work(self):
         with self.assertRaisesRegex(RewardError, "provider"):

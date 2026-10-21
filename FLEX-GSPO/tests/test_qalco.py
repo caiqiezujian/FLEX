@@ -185,12 +185,26 @@ class QalcoTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaisesRegex(RewardError, "Unsupported QALCO setting"):
                 validate_settings(settings)
 
-    def test_calibration_confirmation_must_be_boolean(self):
-        for value in ("true", 1, None):
+    def test_legacy_calibration_confirmation_is_rejected(self):
+        for value in (True, False, "true", 1, None):
             settings = copy.deepcopy(self.config)
             settings["reward"]["calibration_acknowledged"] = value
-            with self.subTest(value=value), self.assertRaisesRegex(RewardError, "must be boolean"):
+            with self.subTest(value=value), self.assertRaisesRegex(RewardError, "Unsupported QALCO setting"):
                 validate_settings(settings)
+
+    def test_default_latency_is_monotonic_mean_lag(self):
+        settings = validate_settings(self.config)
+        self.assertEqual(settings["latency_metric"], "mean_lag")
+        score = self.scorer.score(self.task, self.trajectory)
+        self.assertEqual(score["components"]["latency_metric"], "source_clock_mean_positive_lag")
+
+    def test_speech_laal_comparison_requires_explicit_selection(self):
+        config = copy.deepcopy(self.config)
+        config["reward"]["latency_metric"] = "speech_laal"
+        scorer = QalcoScorer(config, quality_model=self.quality)
+        components = scorer.score(self.task, self.trajectory)["components"]
+        self.assertEqual(components["latency_metric"], "utterance_speech_laal")
+        self.assertEqual(components["latency_seconds"], components["laal_seconds"])
 
     def test_mock_candidate_rejected(self):
         self.trajectory["mock"] = True

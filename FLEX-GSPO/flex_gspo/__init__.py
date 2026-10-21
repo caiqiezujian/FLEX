@@ -1,3 +1,3 @@
-"""FLEX simultaneous-translation GSPO research implementation."""
+"""FLEX online GSPO adapters for the Megatron-SWIFT training framework."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

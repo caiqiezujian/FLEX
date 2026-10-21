@@ -1,8 +1,7 @@
-"""Validate existing causal audio tasks without preparing or transcribing data.
+"""Validate causal task metadata shared by preparation and online rollout.
 
-Production manifests are read by ``artifacts.load_training_tasks``. Audio
-preparation and SFT trajectory sampling belong to the separate FLEX-GSPO-Data
-project. This module validates the schema and timing of those existing tasks.
+The Swift dataset keeps this object in the reward/environment-only ``flex_task``
+column. Only the system prompt and released audio chunks enter the actor.
 """
 
 from __future__ import annotations

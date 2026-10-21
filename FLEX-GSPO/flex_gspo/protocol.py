@@ -12,6 +12,8 @@ def parse_response(response):
     delta = response[len(tag):]
     if any(other in delta for other in TAGS):
         raise ValueError("multiple protocol tags in one response")
+    if "<|" in delta or "|>" in delta:
+        raise ValueError("embedded control token in translation")
     if tag == TAGS[0]:
         if delta.strip():
             raise ValueError("WAIT must not carry translation text")

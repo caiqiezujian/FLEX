@@ -1,222 +1,230 @@
-# FLEX-GSPO：QALCO 第一版强化学习
+# FLEX：Megatron-SWIFT 在线 GSPO
 
-本目录只保留实际使用的后续流程：
+当前主流程是：**原始 JSONL + 原音频 → 在线训练任务 → 当前策略生成多条完整同传轨迹 → QALCO 评分 → GSPO 更新。**
 
-**已有 G8 轨迹评分与校准 → 在线 GSPO → 模型导出。**
+不需要先把全量数据离线采样成固定 G8 轨迹。已有离线轨迹可以保留用于分析和对照，但不是本训练入口的必需输入，也不会被当作当前策略的新采样直接回放。
 
-数据准备、转写和 SFT 多轨迹采样由独立的 `FLEX-GSPO-Data` 工程负责，不要在这里重复运行。
+适用范围：英→中、已合并的 Qwen3-Omni-30B-A3B SFT checkpoint、4 张 A800 80GB、独立部署的 MetricX 服务。这里输出文字，不训练语音播报。
 
-## 先读文档
+**实现和 CPU 合约测试已完成；真实 checkpoint、4 卡前向/反向、权重同步和内网 MetricX 仍须在服务器验收。不能把单元测试通过理解为已经完成 GPU 训练。**
 
-- [强化学习方案详解](docx/QALCO强化学习方案详解.md)：研究目标、奖励公式、五条英中轨迹的完整数值示例、GSPO、四卡训练与研究边界。
-- [验证与清理记录](docx/验证与清理记录.md)：当前组件、验证方式、恢复位置和未验证事项。
-
-`docx/` 是按要求指定的文档目录，里面保存的是 Markdown，不是 Word 文件。
-
-## 当前状态
-
-- 训练代码、轨迹接入、奖励计算、断点恢复与导出代码已提供。
-- **MetricX HTTP 客户端已按提供的接口实现**，支持 QE 和带参考评分，没有默认分数、没有本地模型回退。
-- 公开配置不包含部署地址：先填写 MetricX 服务地址和部署标签，默认保持 QE 模式。内网连通性和真实评分仍需在服务器上验收。
-- 单元测试通过不等于已经在真实 SFT checkpoint、4×A800 或真实服务上验收。
-- 第一版是完整轨迹、一次 fresh rollout 对应一次更新的保守 GSPO；不是逐 WAIT 因果奖励。
-
-## 目录
+## 1. 目录与 SFT 的关系
 
 ```text
 FLEX-GSPO/
-├── 04_score.sh                 # 已有多轨迹评分
-├── 05_train.sh                 # 自包含四卡在线训练入口
-├── 06_export.sh                # LoRA 合并导出
-├── score_candidates.py
-├── train.py
-├── export_adapter.py
+├── 00_install_framework.sh     # 独立环境中的显式安装辅助，不替换 CUDA 栈
+├── 01_prepare.sh               # 原始 JSONL + WAV → train.jsonl
+├── 02_train.sh                 # Megatron-SWIFT 在线 GSPO 入口
+├── prepare_data.py
+├── train_megatron.py           # 参数、预检、四卡启动与恢复检查
+├── swift_plugin.py             # Omni 音频模板、多轮环境、奖励函数注册
 ├── check_environment.py
-├── check_metricx_service.py    # 只用合成文本检查真实评分接口，无需模型或音频
-├── requirements.txt
-├── configs/default.json
-├── flex_gspo/                  # 真实运行所需的模块
-├── tests/                      # 当前流程的回归测试
-└── docx/                       # 方法与验证文档
+├── check_metricx_service.py
+├── configs/default.json        # 当前 QALCO 奖励参数和 MetricX 地址
+├── flex_gspo/
+│   ├── prepare.py              # 有界并发元数据校验、去重、原子发布任务
+│   ├── audio.py                # 因果切片，只读取当前已释放的音频区间
+│   ├── online.py               # 每块音频一次决策，构成完整多轮轨迹
+│   ├── online_reward.py        # 完整轨迹评分、服务批量调用和诊断日志
+│   ├── qalco.py                # 质量门槛、时延预算、长度成本
+│   ├── metricx.py              # 用户提供的 MetricX HTTP 协议
+│   └── prompts.py             # 原始 SFT system prompt
+├── tests/
+└── docx/                      # Markdown 文档，不是 Word 文件
 ```
 
-编号 04 / 05 / 06 承接独立数据工程；本目录只负责评分、在线训练和导出。
+原项目的 SFT 入口为 `Scripts/train_duplex_sft.sh`，本次没有修改；该脚本不包含在这个公开仓库中。训练消息保持原始 SFT 提示词和 `<|WAIT|>` / `<|FLEX|>` / `<|DIRECT|>` 协议，不通过另写一个新 prompt 改变任务定义。
 
-## 1. 环境
+必须使用正确合并的 SFT checkpoint，且三个协议 token 已在该 checkpoint 中训练。启动预检检查单 token 编码、不同 ID、解码和词表尺寸；不会重新随机初始化这些 token。该检查不能代替对 checkpoint 训练来源的确认。
 
-建议使用独立的 Python 3.11 环境，不升级或破坏现有可用的 SFT / vLLM 环境。
+## 2. 从你的服务器原始数据准备
 
-先按服务器驱动安装 CUDA 版 PyTorch（版本要求见依赖文件），再执行：
-
-```bash
-python3 -m pip install -r requirements.txt
-python3 check_environment.py
-python3 -m unittest discover -s tests -v
-```
-
-音频读取需要 FFmpeg 在 PATH 中。训练使用 Transformers，不要求把已有 vLLM 0.16.0 降级。
-
-所有 Shell 默认 `python3`，可用 `PYTHON_BIN` 覆盖。`HF_HUB_OFFLINE=1` 仅约束 Hugging Face 资源下载，不阻止 MetricX HTTP 请求。
-
-## 2. 配置模型、任务和评分服务
-
-编辑 `configs/default.json`：
+以下为示例数据布局；实际路径由命令行参数指定：
 
 ```text
-model_path                   已合并的 SFT checkpoint
-manifest_path                原 train.tasks.jsonl
-output_dir                   新训练输出目录
-reward.metricx.service_url   你的服务基础地址，例如 http://METRICX_HOST:16999
-reward.metricx.service_id    固定部署标签，例如 metricx24-deployment-v1
-reward.metricx.mode          qe（默认）或 reference
+/data/flex/datasets/
+├── 1019/
+│   └── en2zh_train_gspo_1.jsonl
+└── data_001/
+    ├── example_001.wav
+    └── example_002.wav
 ```
 
-训练端不需要 MetricX 权重或 MT5 tokenizer。质量评分只通过外部 MetricX 服务取得；训练端负责计算 Q / L / C，并组合为奖励 R。
+注意 Linux 路径大小写敏感。目录名和 JSONL 文件名均可通过参数指定，不要求其他使用者改成你的命名。
 
-评分函数在 `flex_gspo/metricx_service.py`：
+原始 JSONL 每行：
 
-```python
-request_metricx_scores(
-    source_text,
-    candidate_texts,
-    reference_text=None,
-    *,
-    mode="qe",
-    service_url="",
-    service_id="",
-) -> list[float]
+```json
+{"lang":"en","key":"example_001","en":{"txt":"The meeting starts at nine."},"zh":{"txt":"会议九点开始。"}}
 ```
 
-返回与候选一一对应的 MetricX 原始错误分 `[0,25]`，越低越好。单条包装是 `ServiceMetricX.score(...) -> float`。
+运行：
 
-已实现的调用契约：
+```bash
+bash 01_prepare.sh \
+  --input-jsonl /data/flex/datasets/1019/en2zh_train_gspo_1.jsonl \
+  --audio-dir /data/flex/datasets/data_001 \
+  --output-dir /data/flex/datasets/gspo_online_prepared \
+  --workers 16
+```
 
-| 模式 | 接口 | JSON 请求 |
-|---|---|---|
-| `qe` | `POST /metricx24/qe` | `{"srcs": [...], "mts": [...]}` |
-| `reference` | `POST /metricx24` | `{"srcs": [...], "mts": [...], "refs": [...]}` |
+处理内容：按 `key` 去重、关联 `key.wav`、校验文本和 WAV 头、记录音频大小和修改时间、规划默认 1 秒一块的虚拟边界。使用流式读取、磁盘去重索引和有界并发，持续打印进度。**不做 ASR、不调用模型、不复制原音频、不生成成千上万个实体 chunk 文件。**
 
-两种模式都读取响应 `{"scores": [...]}`。请求数组按位置配对；同一音频的多个候选共享源转录，reference 模式还共享参考译文。客户端检查数量、有限数值与 `[0,25]` 范围，按服务返回顺序对应候选；服务若在内部重排同长度数组，仅凭这个响应格式无法自动发现，需人工对照或服务侧保证。
+输出：
 
-原始数据中的 `en.txt` 转成任务的 `source_text`，`zh.txt` 转成 `reference_text`，`key` 对应音频标识。**`mts` 是每条模型轨迹实际输出拼成的完整中文译文，不是 `zh.txt`。** QE 不向服务发送 `refs`，但中文参考仍用于训练端的长度预算与 LAAL 参考计数；切换 reference 模式需要重新校准奖励，不能认为机器参考一定正确。
+- `train.jsonl`：直接供在线 GSPO 使用。
+- `prepare_report.json`：数量、耗时和处理配置。
+- `rejected.jsonl`：损坏记录、缺失音频等问题。
+- `duplicates.jsonl`：重复记录诊断。
 
-客户端使用 `requests.Session`，关闭环境代理（`trust_env=False`）及重定向，连接/读取超时分别为 10/180 秒。连接错误、超时、HTTP 429/502/503/504 最多尝试两次，两次之间等待 1 秒；其余错误不重试。最终失败抛错停止，不用假分数替代。
+默认只生成训练集，不自动划出测试集。默认最大音频长度 40 秒；超长记录被报告，不会静默截断。最后不足 1 秒的块在模型输入侧补零，时延计算仍使用真实结束时间。训练默认允许单块最长 2 秒；若主动修改 prepare 的 chunk 长度，也须同步训练的 `--max-chunk-seconds`。
 
-服务响应没有模型版本字段，因此 `service_id` 只是被写入运行身份的本地部署标签，**不等于已验证的远端 checkpoint 版本**。请在服务侧固定模型、精度和部署版本；更换服务模型时同步更新声明并重新校准。当前提供的接口不需要鉴权；不要在配置地址中嵌入密钥。
+默认严格模式：发现无效记录则保留报告但不发布最终训练清单。修复数据后使用新的输出目录重跑；若明确接受过滤，可以加 `--skip-invalid`。同 key 第一条合法候选优先，重复的文本冲突会记录。输出目录有占用锁和覆盖保护，不要并发写同一个目录。
 
-公开配置中的 `service_url` 和 `service_id` 初始为空；请先填入实际值。它们缺失时，脚本会明确报错，不会向示例地址发请求。完成配置后，在训练服务器执行：
+准备后的每行有三个核心字段：
+
+```json
+{"messages":[{"role":"system","content":"原始 SFT 提示词"},{"role":"user","content":"<audio>"}],"audios":["flexaudio:v1:编码后的首块引用"],"flex_task":"编码成 JSON 字符串的任务元数据"}
+```
+
+`flex_task` 包含原音频路径、边界、英文转写、中文机器参考等。它是环境/奖励侧数据，**英文转写和参考译文不进入模型聊天内容**。初始 actor 输入只含第一块音频，后续由环境逐块释放。
+
+## 3. 训练框架与环境
+
+使用 **Megatron-SWIFT 训练 + vLLM colocate 多轮 rollout + 项目自定义插件**。GSPO 使用框架的 `rlhf_type=grpo` 入口配合 `importance_sampling_level=sequence`，不是把普通 SFT 换个名字，也不是自写一个 HF 单机 trainer。
+
+本次接口审查基于官方源码提交：
+
+```text
+modelscope/ms-swift
+f15bb91439d756d4a366b51956d72d1f088b7af6
+4.7.0.dev0
+```
+
+原 SFT 的旧版 SWIFT 环境不能默认认为具备这些多轮、音频回传和 GSPO 接口。请保留已验收的 SFT 环境，在单独环境或容器中适配训练；Python 需要至少 3.10，并需要相互兼容的 PyTorch、CUDA、vLLM、Megatron-Core、TransformerEngine 和 FlashAttention。
+
+`00_install_framework.sh` 只是安装审查过的 SWIFT 源码、mcore-bridge 和本项目轻量依赖的辅助脚本，**不是从空环境安装完整 CUDA 训练栈的一键脚本**。它不会主动升级 torch/vLLM/Megatron-Core/TransformerEngine，也不会像旧采样代码一样写死 vLLM 必须等于某个历史版本。
+
+在准备好的独立环境中，可以显式执行：
+
+```bash
+bash 00_install_framework.sh --confirm-isolated-env
+python3 check_environment.py --require-training
+```
+
+预检包含框架源码能力、相关依赖、CUDA 组件导入和 GPU 数量。导入检查仍不等于多轮 Omni 训练一定成功；真实模型测试见下面两步验收。
+
+## 4. MetricX
+
+公开配置中的 `service_url` 和 `service_id` 留空，部署前必须在 `configs/default.json` 填写你自己的服务地址（例如 `http://METRICX_HOST:16999`）和实例标识。默认 **带参考模式**：
+
+```text
+POST /metricx24
+{"srcs":["原文"],"mts":["完整候选译文"],"refs":["机器参考译文"]}
+→ {"scores":[0.4]}
+```
+
+同时支持 `/metricx24/qe`。客户端 `trust_env=False`，内网请求不走环境代理；分数越低越好。请求失败、响应维度错误或非有限分数会报错，不会用默认奖励继续训练。模型非法输出则是正常的负奖励样本，不等同于服务故障。
+
+服务器上先检查：
 
 ```bash
 python3 check_metricx_service.py --mode both
 ```
 
-脚本默认读取 `configs/default.json`，用同一合成英文的两条中文候选实际请求 QE / reference 接口，不加载 Actor，不读取音频，不启动训练。`--mode qe` 或 `--mode reference` 可单独检查；不传 `--mode` 则使用配置模式。可以用 `--config /path/to/config.json` 指定配置。成功只能证明该次请求与响应检查通过，不能证明评分能力、远端版本或训练已验收。
+该服务在独立机器运行，不占这四张卡的训练显存。服务地址或评分参数需要更改时编辑配置文件，或使用训练入口的 `--reward-config` 指定另一份配置。
 
-`reward.provider="qalco"` 是唯一的奖励配置入口；`reward.metricx.backend="service"` 指定外部文本评分服务。
+## 5. 先完成真实两步验收
 
-## 3. 04：对已有轨迹评分
-
-下列路径均为服务器示例；将轨迹目录替换成你全量 G8 采样的真实输出位置。每个 `trajectories.jsonl` 的同级 `run.json` 必须保留。
-
-只读检查：
+下面的参数直接跟路径，不需要设置 `MODEL_PATH` 变量；请替换为你的真实模型和数据路径。请在 `FLEX-GSPO` 目录中执行：
 
 ```bash
-bash 04_score.sh \
-  --tasks /data/flex/datasets/flex_gspo_prepared/train.tasks.jsonl \
-  --trajectories /data/flex/datasets/flex_sft_samples_g8_all \
-  --validate-only
+bash 02_train.sh \
+  /data/models/flex-sft-merged \
+  /data/flex/datasets/gspo_online_prepared/train.jsonl \
+  /data/flex/outputs/gspo_smoke_001 \
+  --gpu-ids 0,1,2,3 \
+  --group-size 2 \
+  --global-batch-size 4 \
+  --train-iters 2 \
+  --save-steps 1
 ```
 
-结构检查不会请求服务。`quality_service_ready` 只反映客户端配置是否就绪；即使为 `true`，也没有验证远端网络、权重或真实评分。网络检查使用上面的 `check_metricx_service.py`。
+至少需要两条合法任务。可以先在命令末尾加 `--dry-run` 查看最终参数：该模式不加载 GPU 模型、不调用服务、不写训练目录，也不代表训练通过。
 
-服务接通后评分：
+两步验收重点：真实音频能够逐块输入、第一轮输出与 SFT 推理合理一致、完整轨迹进入评分、损失和梯度有限、确实发生优化器更新、下一批 rollout 使用更新后的权重、checkpoint 能保存。所有候选相同而导致组内 advantage 为零，不是报错，但也不能称为已经获得有效学习信号。
+
+## 6. 验收后使用 G8
+
+为正式训练使用新的输出目录，不在 smoke 目录上混跑：
 
 ```bash
-bash 04_score.sh \
-  --tasks /data/flex/datasets/flex_gspo_prepared/train.tasks.jsonl \
-  --trajectories /data/flex/datasets/flex_sft_samples_g8_all \
-  --output-dir /data/flex/datasets/qalco_scores_v1
+bash 02_train.sh \
+  /data/models/flex-sft-merged \
+  /data/flex/datasets/gspo_online_prepared/train.jsonl \
+  /data/flex/outputs/gspo_g8_001 \
+  --gpu-ids 0,1,2,3 \
+  --group-size 8 \
+  --global-batch-size 16 \
+  --train-iters 1000
 ```
 
-支持多个明确文件或采样根目录。`--limit N` 只限制评分，不重新采样；`--check-audio` 额外检查音频路径。
+主要默认配置：
 
-输出包括全部候选的分数、`summary.json`、各组原子结果和运行身份记录。没有 best-only 筛选。不覆盖已有目录；失败后已完成的组保留供检查，新运行使用新目录。
+| 配置 | 初始值 |
+| --- | --- |
+| Megatron TP / EP / PP | 2 / 2 / 1 |
+| vLLM TP | 4 |
+| 训练方式 | LoRA rank 8，alpha 32；冻结音频/视觉编码器与对齐模块 |
+| 学习率 / KL 系数 | 1e-6 / 0.01 |
+| GSPO clipping 下/上范围 | 0.0003 / 0.0004 |
+| rollout prompt 预算 / 每轮新增 token | 8192 / 128；vLLM 总预算 8320 |
+| 最大音频轮数 | 64 |
+| sampling temperature / top_p | 1.0 / 1.0 |
+| 每批 rollout 后更新轮次 | 1 |
+| rollout 显存比例 | 0.4 |
+| colocate sleep / offload | sleep level 2，模型与优化器 offload |
 
-## 4. 奖励校准
+这些是起步配置，不是四卡显存和速度的保证。offload 依赖 CPU 内存和主机带宽，需结合服务器实测调整。默认采用完整合并权重同步，不假设未经验证的 Omni LoRA-only 在线刷新可用。8192 是 rollout prompt 编码预算，不是完整 teacher-forced 训练序列的绝对长度上限；框架在最终训练编码时会临时取消模板截断。
 
-默认质量门槛 `.85`、LAAL 预算 `3 秒`、长度倍率 `1.2`、权重 `.2/.1` 都是初值。
+## 7. 日志和恢复
 
-先检查实际候选是否被合理区分，再设置：
+训练目录记录启动配置、任务清单哈希、奖励配置/代码标识，以及 reward 诊断 JSONL。每条诊断包含完整候选轨迹、标签、时间、完整译文、各奖励项和有效性原因。原文与参考留在任务清单，不在每条日志重复存储。
 
-```json
-"calibration_acknowledged": true
-```
+Megatron 负责优化器、随机状态和模型 checkpoint；本入口启用了这些状态保存，并请求框架同时导出合并 HF 权重。实际产物必须以服务器保存日志和文件检查为准。
 
-自然度若不能被质量分区分，不要用更强的长度惩罚假装已经解决。详细的校准对照和限制见方法文档。
-
-## 5. 05：四卡在线 GSPO
-
-只读预检：
+恢复示例：
 
 ```bash
-NPROC_PER_NODE=4 bash 05_train.sh --validate-only
+bash 02_train.sh \
+  /data/models/flex-sft-merged \
+  /data/flex/datasets/gspo_online_prepared/train.jsonl \
+  /data/flex/outputs/gspo_g8_001 \
+  --group-size 8 --global-batch-size 16 --train-iters 1000 \
+  --resume-from /实际的Megatron原生adapter检查点目录
 ```
 
-工程冒烟，前提是服务已经接通：
+恢复目录须有框架原生 tracker 和完整分布式 checkpoint shards，不是 HF merged 导出目录。上游也会把 tracker 和部分元信息复制到 merged 目录，因此不能只看 tracker 判断可恢复；入口已对此做检查。总训练步数和关键配置保持一致，不能把“两步 smoke”直接改成 1000 步声称无缝恢复。新实验使用新输出目录。启动身份校验包含权重元信息，不宣称已对所有权重文件做内容级哈希。
+
+## 8. 奖励与验证边界
+
+详见 [QALCO 强化学习方案详解](docx/QALCO强化学习方案详解.md)。第一版是**完整译文的 MetricX 质量 + 整条轨迹的时延预算 + 超长成本**，不是每个短块单独做完整句子评分。WAIT token 参与策略梯度；FLEX 不因尚未成句就被单独判低质量。
+
+默认时延使用所有输出单元的 mean-lag 代理，避免“把输出继续拖到 EOF，指标反而下降”的截断问题。它不是精确语义延迟，也不是 GPU 墙钟延迟。当前没有独立自然度模型、逐 WAIT 反事实分支、强制语义对齐或独立标点惩罚，不能宣称已经精确解决每一次等待是否值得。
+
+本地运行测试：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 NPROC_PER_NODE=4 \
-bash 05_train.sh \
-  --max-updates 2 \
-  --output-dir /data/flex/outputs/qalco_smoke_001 \
-  --allow-uncalibrated-reward
+python3 -m unittest discover -s tests -v
 ```
 
-校准后正式训练：
+部分框架合约测试使用审查过的官方源码；其他机器可通过 `FLEX_SWIFT_SOURCE` 指定该 checkout，未提供则跳过相应源码测试。本地 CPU 测试覆盖真实 WAV + 本地 HTTP 评分替身的贯通流程；**没有执行真实 Omni 模型训练或调用用户内网 MetricX**。
 
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 NPROC_PER_NODE=4 \
-bash 05_train.sh \
-  --max-updates 1000 --epochs 1 \
-  --output-dir /data/flex/outputs/qalco_train_001
-```
+旧自写训练器、旧固定轨迹评分入口及对应不用的测试已从本目录移除。原作者本地修改前已另行备份，备份不随仓库发布；`Scripts`、`FLEX-GSPO-Data`、原音频、模型和已有 G8 结果没有删除。
 
-可用 `--model-path`、`--tasks`、`--group-size` 覆盖配置。不要将 `scored.trajectories.jsonl` 传给 `--tasks`；在线训练读任务，重新生成当前策略的轨迹。
+## 官方实现依据
 
-默认每卡一个音频、每个音频 G=8，全局每步 32 条轨迹。每卡放完整 BF16 Thinker，并非模型分片；真实显存峰值需服务器验收。
-
-与 SFT 保持一致的特殊 token ID 为 WAIT / DIRECT / FLEX：151676 / 151677 / 151678。缺失则停止，不擅自扩词表。
-
-日志按 rank 保存完整轨迹、奖励、优势和训练指标。默认每 25 步及正常结束保存 checkpoint。
-
-## 6. 恢复训练
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 NPROC_PER_NODE=4 \
-bash 05_train.sh \
-  --resume-from /data/flex/outputs/qalco_train_001/checkpoint-00000025 \
-  --max-updates 1000 --epochs 1 \
-  --output-dir /data/flex/outputs/qalco_train_001_resume
-```
-
-恢复必须使用新的输出目录。模型、音频/任务、奖励、服务声明版本、G、卡数与训练代码必须匹配；允许延长总步数/epochs 和调整日志、保存频率。
-
-代码身份不同的 checkpoint 不能直接续训；恢复时必须使用生成该 checkpoint 的一致代码和配置。
-
-仅加载自己信任的 checkpoint。声明的服务版本不等于客户端已校验远端权重，实际核对须由服务侧部署记录保证；当前 `scores` 响应不提供版本证明。
-
-## 7. 06：导出
-
-```bash
-bash 06_export.sh \
-  --base-model /data/models/flex-sft-merged \
-  --checkpoint /data/flex/outputs/qalco_train_001/checkpoint-00001000 \
-  --output-dir /data/models/flex-qalco-merged \
-  --device cpu
-```
-
-基座必须与训练时相同。CPU 合并需要较多内存，GPU 合并需要确认空闲显存。
-
-默认仅保留文字同传所需 Thinker，但保存完整 Omni 外层结构；`--include-talker` 才保留语音输出模块，且要求基座对应权重完整。
-
-导出后再用原来的离线/流式推理系统验收，不以“文件保存成功”代替真实推理检查。
+- [Megatron 多轮 GRPO 启动例子（审查提交）](https://github.com/modelscope/ms-swift/blob/f15bb91439d756d4a366b51956d72d1f088b7af6/examples/megatron/grpo/multi_turn/frozen_lake.sh)
+- [Megatron MoE colocate LoRA 例子（审查提交）](https://github.com/modelscope/ms-swift/blob/f15bb91439d756d4a366b51956d72d1f088b7af6/examples/megatron/grpo/moe_colocate_lora.sh)
+- [GSPO 官方说明](https://swift.readthedocs.io/en/latest/Instruction/GRPO/AdvancedResearch/GSPO.html)
+- [Megatron-SWIFT 参数文档](https://swift.readthedocs.io/en/latest/Megatron-SWIFT/Command-line-parameters.html)

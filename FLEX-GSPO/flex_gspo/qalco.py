@@ -1,7 +1,7 @@
-"""QALCO v1: complete-trajectory quality/latency feasibility before efficiency.
+"""QALCO: complete-trajectory quality/latency feasibility before efficiency.
 
-LAAL is a source-clock, target-length scheduling proxy, not semantic latency or
-wall-clock inference delay. Length excess is not semantic redundancy. MetricX
+Both mean lag and LAAL are source-clock, target-length scheduling proxies, not
+semantic latency or wall-clock inference delay. Length excess is not semantic redundancy. MetricX
 is a fallible quality proxy, not calibrated accuracy or independent fluency.
 """
 
@@ -35,14 +35,17 @@ def validate_settings(config):
     settings = config.get("reward", config)
     if not isinstance(settings, dict) or settings.get("provider") != "qalco":
         raise RewardError("QALCO v1 requires reward.provider=qalco")
-    allowed = {"provider", "calibration_acknowledged", "quality_floor",
+    allowed = {"provider", "quality_floor",
                "latency_budget_seconds", "reference_length_ratio", "latency_weight",
-               "length_weight", "metricx"}
+               "length_weight", "latency_metric", "metricx"}
     if set(settings) - allowed:
         raise RewardError("Unsupported QALCO setting; allowed fields: " + ", ".join(sorted(allowed)))
-    if type(settings.get("calibration_acknowledged", False)) is not bool:
-        raise RewardError("calibration_acknowledged must be boolean")
     settings = dict(settings)
+    # Online training defaults to the monotonic all-output-unit metric.
+    # Historical speech-LAAL can be selected explicitly for comparisons only.
+    settings.setdefault("latency_metric", "mean_lag")
+    if settings["latency_metric"] not in ("mean_lag", "speech_laal"):
+        raise RewardError("latency_metric must be mean_lag or speech_laal")
     settings["quality_floor"] = _number(
         settings.get("quality_floor", 0.85), "quality_floor", maximum=1, exclusive_minimum=True)
     settings["latency_budget_seconds"] = _number(
@@ -139,10 +142,16 @@ def latency_statistics(duration, emission_times, reference_units):
                 if time >= duration - TIME_TOLERANCE), count)
     denominator = max(count, reference_units)
     raw = sum(time - i * duration / denominator for i, time in enumerate(times[:tau])) / tau
+    # Unlike tau-truncated LAAL, use ALL output units and a fixed denominator
+    # for a fixed translation. Delaying any unit cannot reduce this metric.
+    # Positive parts prevent early output from cancelling later positive lag.
+    mean_lag = sum(max(0.0, time - i * duration / denominator)
+                   for i, time in enumerate(times)) / count
     gaps = [b - a for a, b in zip([0.0] + times, times + [duration])]
     return {
         "raw_laal_seconds": raw,
         "laal_seconds": max(0.0, raw),
+        "mean_lag_seconds": mean_lag,
         "diagnostics": {
             "first_output_seconds": times[0],
             "max_no_text_gap_seconds": max(gaps),
@@ -185,6 +194,7 @@ def _invalid(error, empty=False):
     return {"reward": -4.0, "components": {
         "protocol_valid": empty, "empty_translation": empty,
         "quality": None, "metricx_error": None, "laal_seconds": None,
+        "mean_lag_seconds": None, "latency_seconds": None,
         "raw_laal_seconds": None, "length_penalty": None, "tier": "invalid",
         "quality_pass": False, "latency_pass": False, "feasible": False,
         "error": str(error),
@@ -247,13 +257,17 @@ class QalcoScorer:
             for (index, statistics, excess), translation in zip(pending, hypotheses):
                 raw = lookup[translation]
                 quality = 1 - raw / 25
-                combined = combine_reward(quality, statistics["laal_seconds"], excess, self.settings)
+                use_mean_lag = self.settings["latency_metric"] == "mean_lag"
+                latency = statistics["mean_lag_seconds" if use_mean_lag else "laal_seconds"]
+                combined = combine_reward(quality, latency, excess, self.settings)
                 reward = combined.pop("reward")
                 records[index] = {"reward": reward, "components": {
                     "protocol_valid": True, "empty_translation": False,
                     "quality": quality, "metricx_error": raw, **statistics,
                     "length_penalty": excess, **combined,
-                    "latency_metric": "utterance_speech_laal",
+                    "latency_seconds": latency,
+                    "latency_metric": ("source_clock_mean_positive_lag" if use_mean_lag
+                                       else "utterance_speech_laal"),
                     "quality_metric": "metricx24_" + self.settings["metricx"]["mode"],
                     "prefix_support_checked": False,
                 }}

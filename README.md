@@ -4,7 +4,7 @@ FLEX Live 是面向 SFT 后双向中英 Qwen3-Omni 模型的流式推理系统�
 
 文件模式会先将用户选择的完整音视频上传到服务器临时目录，服务器解码后按播放进度逐块推理；**文件已上传不等于模型能看到未来音频**。普通文件由浏览器本地播放；WMV/ASF 上传后自动转为 H.264/AAC MP4，浏览器播放服务器提供的临时视频。文件模式只报告播放位置，不再实时抓取播放器声音，不依赖 ScriptProcessorNode 或 AudioWorklet。视频烧录字幕或另选的 WebVTT 字幕仍可用于人工对照翻译时机，外部 VTT 不上传。
 
-仓库根目录保留独立的 Web 推理系统及单音频推理入口；本分支新增 [FLEX-GSPO](FLEX-GSPO/README.md)，提供 QALCO 奖励、MetricX HTTP 评分、在线 GSPO 训练、LoRA 导出与测试文档。两部分使用各自的依赖和配置，不需要为运行 Web 系统安装训练依赖。仓库不包含模型权重、训练数据、私有服务地址、数据准备工程或蒸馏 prompt。前端无需 Node 构建；Node 仅用于音频处理逻辑测试。
+仓库根目录保留独立的 Web 推理系统及单音频推理入口；[FLEX-GSPO](FLEX-GSPO/README.md) 提供原始 JSONL + WAV 的任务准备、Megatron-SWIFT 在线 GSPO、QALCO 奖励、MetricX HTTP 评分和训练文档。多轨迹在训练过程中由当前策略生成，不要求先完成全量离线 G8 采样。两部分使用各自的依赖和配置，不需要为运行 Web 系统安装训练依赖。仓库不包含模型权重、训练数据、实际 MetricX 服务地址或蒸馏 prompt。前端无需 Node 构建；Node 仅用于音频处理逻辑测试。
 
 > 当前版本：一份模型默认接纳 4 路独立同传、滚动模型上下文、每路默认最长 8 小时。完整结果落盘，页面保留当前会话全部已收到的译文，可滚动回看；正常等待、暂时变慢和服务故障分别显示。目标部署是一张 A800 80 GB；CPU/mock 并发测试不等于真实 GPU 四路实时性或数小时稳定性验收，实际吞吐和翻译质量仍需在目标服务器测量。mock 不是语音翻译模型。
 
@@ -39,7 +39,7 @@ cd FLEX
 仓库根目录即 Web 应用根目录，后面的 Web 命令在此目录执行。强化学习请进入 `FLEX-GSPO/`，按该目录 README 配置模型、任务文件和 MetricX 服务；公开配置不包含真实内网地址。
 
 - [真实模型启动](#1-先用真实模型启动) / [无 GPU 演示](#2-无-gpu-的功能演示)
-- [QALCO / GSPO 评分、训练与导出](FLEX-GSPO/README.md)
+- [Megatron 在线 GSPO：任务准备、训练与恢复](FLEX-GSPO/README.md)
 - [强化学习方法、奖励公式与完整示例](FLEX-GSPO/docx/QALCO强化学习方案详解.md)
 - [先做单音频流式 S2TT，不启动网页](docs/S2TT.md)
 - [客户端/服务端协议](docs/PROTOCOL.md)
