@@ -50,6 +50,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--master-port", type=int, default=29581)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--dataset-num-proc", type=int, default=4)
+    p.add_argument("--rollout-log-every", type=int, default=5,
+                   help="Log multi-turn collective/generation progress every N rounds (also first, idle, and final rounds)")
     p.add_argument("--resume-from", help="Native Megatron adapter checkpoint including optimizer/RNG; not HF merged weights")
     p.add_argument("--swift-source", help="Optional local audited ms-swift source checkout")
     p.add_argument("--dry-run", action="store_true", help="Print only: no file writes, scoring, or GPU use")
@@ -61,7 +63,7 @@ def validate_options(a: argparse.Namespace) -> None:
     if len(gpu_ids) != 4 or len(set(gpu_ids)) != 4:
         raise ValueError("This recipe requires four distinct GPU IDs, e.g. --gpu-ids 0,1,2,3")
     for name in ("group_size", "global_batch_size", "micro_batch_size", "steps_per_generation", "train_iters",
-                 "max_turns", "max_length", "max_new_tokens", "lora_rank", "save_steps", "vllm_max_num_seqs", "dataset_num_proc"):
+                 "max_turns", "max_length", "max_new_tokens", "lora_rank", "save_steps", "vllm_max_num_seqs", "dataset_num_proc", "rollout_log_every"):
         if getattr(a, name) <= 0:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
     if a.group_size < 2:
@@ -147,7 +149,8 @@ def build_environment(a: argparse.Namespace) -> dict[str, str]:
     env.update({"CUDA_VISIBLE_DEVICES": a.gpu_ids, "ENABLE_AUDIO_OUTPUT": "0", "PYTHONUNBUFFERED": "1",
                 "CUDA_DEVICE_MAX_CONNECTIONS": "1", "TOKENIZERS_PARALLELISM": "false",
                 "FLEX_REWARD_CONFIG": str(Path(a.reward_config).resolve()),
-                "FLEX_REWARD_LOG_DIR": str(Path(a.output).resolve() / "rewards")})
+                "FLEX_REWARD_LOG_DIR": str(Path(a.output).resolve() / "rewards"),
+                "FLEX_ROLLOUT_LOG_EVERY": str(a.rollout_log_every)})
     paths = [str(ROOT)]
     if a.swift_source:
         paths.insert(0, str(Path(a.swift_source).resolve()))
@@ -253,7 +256,7 @@ def run_identity(a: argparse.Namespace, manifest: dict) -> dict:
     weights = {p.name: {"bytes": p.stat().st_size, "mtime_ns": p.stat().st_mtime_ns}
                for p in sorted(model.glob("*.safetensors"))}
     ignored = {"output", "dataset", "reward_config", "resume_from", "dry_run", "gpu_ids", "master_port",
-               "save_steps", "dataset_num_proc"}
+               "save_steps", "dataset_num_proc", "rollout_log_every"}
     # Include train_iters: changing the LR decay horizon mid-run is not exact resume.
     settings = {k: v for k, v in vars(a).items() if k not in ignored}
     source_files = [ROOT / "swift_plugin.py", ROOT / "train_megatron.py", *sorted((ROOT / "flex_gspo").glob("*.py"))]
@@ -289,7 +292,8 @@ def main(argv: list[str] | None = None) -> int:
         cmd, env = build_command(a), build_environment(a)
         plan = {"audited_swift_commit": AUDITED_SWIFT_COMMIT, "argv": cmd,
                 "environment": {k: env[k] for k in ("CUDA_VISIBLE_DEVICES", "ENABLE_AUDIO_OUTPUT", "FLEX_REWARD_CONFIG",
-                                                     "FLEX_REWARD_LOG_DIR", "PYTHONPATH")},
+                                                     "FLEX_REWARD_LOG_DIR", "FLEX_ROLLOUT_LOG_EVERY", "PYTHONPATH")},
+                "rollout_sync": "FLEX plugin: completion predicate uses actual vLLM TP group; Megatron data groups unchanged",
                 "sampling": {"group_size": a.group_size, "generation_batch_size": a.global_batch_size * a.steps_per_generation,
                              "fresh_prompts_per_generation": a.global_batch_size * a.steps_per_generation // a.group_size},
                 "note": "Source-audited recipe; CPU checks do not certify GPU training or translation quality."}

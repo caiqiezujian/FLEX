@@ -58,6 +58,18 @@ class TestMegatronLauncher(unittest.TestCase):
         self.assertEqual(env["ENABLE_AUDIO_OUTPUT"], "0")
         self.assertIn("FLEX_REWARD_CONFIG", env)
         self.assertIn("FLEX_REWARD_LOG_DIR", env)
+        self.assertEqual(env["FLEX_ROLLOUT_LOG_EVERY"], "5")
+
+    def test_rollout_logging_is_local_not_an_unsupported_swift_flag(self):
+        a = self.args("--rollout-log-every", "1", "--global-batch-size", "32")
+        cmd = launcher.build_command(a)
+        self.assertEqual(launcher.build_environment(a)["FLEX_ROLLOUT_LOG_EVERY"], "1")
+        self.assertNotIn("--rollout_log_every", cmd)
+        self.assertEqual(cmd[cmd.index("--tensor_model_parallel_size") + 1], "2")
+        self.assertEqual(cmd[cmd.index("--vllm_tensor_parallel_size") + 1], "4")
+        self.assertEqual(cmd[cmd.index("--log_completions") + 1], "true")
+        with self.assertRaisesRegex(ValueError, "rollout-log-every"):
+            launcher.build_command(self.args("--rollout-log-every", "0"))
 
     def test_dry_run_no_files_or_framework_import(self):
         with tempfile.TemporaryDirectory() as temp:

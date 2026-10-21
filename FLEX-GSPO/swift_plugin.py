@@ -19,6 +19,7 @@ from swift.template.templates.qwen import Qwen3OmniTemplate, QwenTemplateMeta
 from flex_gspo.audio import materialize_chunk_refs
 from flex_gspo.online import FlexStreamHooks
 from flex_gspo.online_reward import OnlineQalcoReward
+from flex_gspo.rollout_sync import install_rollout_sync_patch
 
 
 class FlexQwen3OmniTemplate(Qwen3OmniTemplate):
@@ -31,7 +32,11 @@ class FlexQwen3OmniTemplate(Qwen3OmniTemplate):
 
 
 class FlexStreamScheduler(FlexStreamHooks, MultiTurnScheduler):
-    pass
+    def __init__(self, *args, **kwargs):
+        # The trainer module is fully imported now; only patch its FLEX path.
+        # The vLLM process group is looked up later, after engine creation.
+        install_rollout_sync_patch()
+        super().__init__(*args, **kwargs)
 
 
 class QalcoOnlineORM(ORM):

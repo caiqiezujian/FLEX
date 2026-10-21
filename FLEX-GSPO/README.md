@@ -8,6 +8,8 @@
 
 **实现和 CPU 合约测试已完成；真实 checkpoint、4 卡前向/反向、权重同步和内网 MetricX 仍须在服务器验收。不能把单元测试通过理解为已经完成 GPU 训练。**
 
+**针对四卡训练停在 `Train: 0/2` 的更新：** 已增加 FLEX 专用多轮退出同步修复。Megatron TP2 / vLLM TP4 时，退出判定必须覆盖真正参与推理的四卡，不能只覆盖两个训练进程。补丁随插件自动安装，不修改 `site-packages`，不改变训练数据分配或奖励公式。已有环境和 `train.jsonl` 可以复用；上传代码后请使用新输出目录完成两步复测。具体命令见 [多轮同步死锁修复与复测](docx/多轮同步死锁修复与复测.md)。
+
 ## 1. 目录与 SFT 的关系
 
 ```text
@@ -25,6 +27,7 @@ FLEX-GSPO/
 │   ├── prepare.py              # 有界并发元数据校验、去重、原子发布任务
 │   ├── audio.py                # 因果切片，只读取当前已释放的音频区间
 │   ├── online.py               # 每块音频一次决策，构成完整多轮轨迹
+│   ├── rollout_sync.py         # FLEX-colocate 退出判定按真实 vLLM TP 组同步
 │   ├── online_reward.py        # 完整轨迹评分、服务批量调用和诊断日志
 │   ├── qalco.py                # 质量门槛、时延预算、长度成本
 │   ├── metricx.py              # 用户提供的 MetricX HTTP 协议
@@ -190,6 +193,8 @@ bash 02_train.sh \
 ## 7. 日志和恢复
 
 训练目录记录启动配置、任务清单哈希、奖励配置/代码标识，以及 reward 诊断 JSONL。每条诊断包含完整候选轨迹、标签、时间、完整译文、各奖励项和有效性原因。原文与参考留在任务清单，不在每条日志重复存储。
+
+新增控制台阶段日志：`patch_installed`、`generation_begin`、`sync_ready`、`completion_check_begin/end`、`continuation_begin/end`、`generation_end`、`reward_begin/end`。包含 rank、当前轮次、本地请求数、组内仍活跃的进程数与耗时；不打印音频或参考文本。默认每 5 轮打印，首轮、本地活跃状态变化、空批次和最终退出也打印。排查时加 `--rollout-log-every 1` 可逐轮查看。`local_requests=0` 不代表故障：该进程已经完成自己的候选，但仍在配合同组其他进程通信。两步验收通过后可去掉该参数，恢复默认日志频率。
 
 Megatron 负责优化器、随机状态和模型 checkpoint；本入口启用了这些状态保存，并请求框架同时导出合并 HF 权重。实际产物必须以服务器保存日志和文件检查为准。
 

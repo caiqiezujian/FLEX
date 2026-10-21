@@ -114,6 +114,9 @@ def inventory(model: str | None = None, require_training: bool = False, required
         root = Path(spec.origin).resolve().parent.parent
         result["swift_source"] = str(root)
         result["capabilities"] = source_capabilities(root)
+        from flex_gspo.rollout_sync import validate_rollout_sync_source
+        result["flex_rollout_sync"] = validate_rollout_sync_source(
+            (root / "swift/megatron/trainers/rollout_mixin.py").read_text(encoding="utf-8"))
         absent = [f"{file}: {needle}" for file, checks in result["capabilities"].items() for needle, ok in checks.items() if not ok]
         if absent:
             result["errors"].append("Installed SWIFT lacks audited multi-turn/GSPO/audio APIs: " + "; ".join(absent))

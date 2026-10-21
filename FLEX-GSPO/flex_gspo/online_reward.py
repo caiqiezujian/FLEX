@@ -22,6 +22,7 @@ import time
 from .qalco import QalcoScorer, validate_settings, validate_task
 from .protocol import collect_translation
 from .rewards import RewardError
+from .rollout_sync import progress
 
 
 LOG = logging.getLogger("flex.online_reward")
@@ -115,6 +116,8 @@ class OnlineQalcoReward:
         self.last_records = []
         if not size:
             return []
+        started = time.monotonic()
+        progress(f"reward_begin local_candidates={size}")
         tasks = _batch(flex_task, size, "flex_task")
         infos = _batch(rollout_infos, size, "rollout_infos")
         identities = {}
@@ -163,6 +166,7 @@ class OnlineQalcoReward:
         self.last_records = records
         self._calls += 1
         self._log_records(records, kwargs.get("trainer_state"))
+        progress(f"reward_end local_candidates={size} elapsed={time.monotonic()-started:.1f}s")
         return [float(record["reward"]) for record in records]
 
     def _log_records(self, records, trainer_state):
