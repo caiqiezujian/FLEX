@@ -47,6 +47,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--save-steps", type=int, default=50)
     p.add_argument("--vllm-memory", type=float, default=0.40)
     p.add_argument("--vllm-max-num-seqs", type=int, default=16)
+    p.add_argument("--vllm-mm-processor-cache-gb", type=float, default=0.0,
+                   help="0 disables multimodal processor/transport caches to bypass the observed vLLM 0.19.1 cache-clear hang; KV prefix caching stays enabled")
     p.add_argument("--recompute-granularity", choices=("full", "selective"), default="full",
                    help="Keep full for the accepted recipe; selective is an opt-in speed/memory experiment")
     p.add_argument("--performance-log", choices=("on", "off"), default="off",
@@ -84,8 +86,11 @@ def validate_options(a: argparse.Namespace) -> None:
         raise ValueError("Four ranks require at least four trajectories per generation batch")
     if not 0 < a.vllm_memory < 0.9:
         raise ValueError("--vllm-memory must be between 0 and 0.9; GPUs are shared with training")
-    if not all(math.isfinite(v) for v in (a.lr, a.temperature, a.kl_beta, a.lora_alpha, a.vllm_memory, a.max_chunk_seconds)):
+    if not all(math.isfinite(v) for v in (a.lr, a.temperature, a.kl_beta, a.lora_alpha, a.vllm_memory,
+                                        a.max_chunk_seconds, a.vllm_mm_processor_cache_gb)):
         raise ValueError("All floating-point arguments must be finite (no NaN/Infinity)")
+    if a.vllm_mm_processor_cache_gb < 0:
+        raise ValueError("--vllm-mm-processor-cache-gb must be nonnegative; use 0 to disable multimodal caches")
     if not 0.1 <= a.max_chunk_seconds <= 8:
         raise ValueError("--max-chunk-seconds must be in 0.1..8 seconds")
     if a.lr <= 0 or a.temperature <= 0 or a.kl_beta < 0 or a.lora_alpha <= 0:
@@ -132,7 +137,7 @@ def build_command(a: argparse.Namespace) -> list[str]:
         "vllm_max_num_seqs": a.vllm_max_num_seqs, "vllm_enforce_eager": "true",
         "vllm_limit_mm_per_prompt": json.dumps({"audio": {"count": a.max_turns, "length": round(a.max_chunk_seconds * 16000)},
                                                 "image": a.image_slots, "video": 0}, separators=(",", ":")),
-        "vllm_enable_prefix_caching": "true", "vllm_mm_processor_cache_gb": "1",
+        "vllm_enable_prefix_caching": "true", "vllm_mm_processor_cache_gb": a.vllm_mm_processor_cache_gb,
         "sleep_level": "2", "offload_model": "true", "offload_optimizer": "true", "offload_bridge": "false",
         "save_safetensors": "true", "merge_lora": "true", "save_steps": a.save_steps,
         "no_save_optim": "false", "no_save_rng": "false", "save_total_limit": "3",
@@ -306,6 +311,11 @@ def main(argv: list[str] | None = None) -> int:
     a = parser().parse_args(argv)
     try:
         cmd, env = build_command(a), build_environment(a)
+        if a.vllm_mm_processor_cache_gb > 0:
+            print("[launch] WARNING: Multimodal caches are enabled explicitly. This removes the default "
+                  "bypass for the observed vLLM 0.19.1 cache-clear hang; verify an upstream fix and a "
+                  "multi-step sleep/wake test before a long run. KV prefix caching is independent.",
+                  file=sys.stderr, flush=True)
         plan = {"audited_swift_commit": AUDITED_SWIFT_COMMIT, "argv": cmd,
                 "environment": {k: env[k] for k in ("CUDA_VISIBLE_DEVICES", "ENABLE_AUDIO_OUTPUT", "FLEX_REWARD_CONFIG",
                                                      "FLEX_REWARD_LOG_DIR", "FLEX_ROLLOUT_LOG_EVERY", "PYTHONPATH")},
@@ -315,6 +325,7 @@ def main(argv: list[str] | None = None) -> int:
                 "performance": {"phase_logging": a.performance_log,
                                 "log_dir": env.get("FLEX_PERF_LOG_DIR"),
                                 "vllm_max_num_seqs": a.vllm_max_num_seqs,
+                                "vllm_mm_processor_cache_gb": a.vllm_mm_processor_cache_gb,
                                 "micro_batch_size": a.micro_batch_size,
                                 "recompute_granularity": a.recompute_granularity,
                                 "note": "Candidate configuration, not a measured speedup; compare steady-state throughput and peak VRAM."},

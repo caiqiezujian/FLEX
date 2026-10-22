@@ -5,7 +5,7 @@ import shlex
 import tempfile
 import unittest
 from unittest.mock import patch
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,6 +54,32 @@ class TestMegatronLauncher(unittest.TestCase):
         cmd = launcher.build_command(self.args("--max-turns", "42"))
         self.assertEqual(json.loads(cmd[cmd.index("--vllm_limit_mm_per_prompt") + 1]),
                          {"audio": {"count": 42, "length": 32000}, "image": 1, "video": 0})
+
+    def test_mm_cache_bypass_default_and_override_do_not_change_other_flags(self):
+        baseline = launcher.build_command(self.args())
+        override = launcher.build_command(self.args("--vllm-mm-processor-cache-gb", "1.5"))
+        cache_index = baseline.index("--vllm_mm_processor_cache_gb") + 1
+        self.assertEqual(baseline[cache_index], "0.0")
+        self.assertEqual(override[cache_index], "1.5")
+        self.assertEqual([i for i, (a, b) in enumerate(zip(baseline, override)) if a != b], [cache_index])
+        self.assertEqual(len(baseline), len(override))
+        for flag, value in (("--vllm_enable_prefix_caching", "true"), ("--sleep_level", "2"),
+                            ("--offload_model", "true"), ("--offload_optimizer", "true")):
+            self.assertEqual(baseline[baseline.index(flag) + 1], value)
+        self.assertEqual(launcher.build_command(self.args("--vllm-mm-processor-cache-gb", "0")), baseline)
+
+    def test_mm_cache_rejects_negative_and_nonfinite_values(self):
+        for value in ("-0.1", "nan", "inf", "-inf"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                launcher.build_command(self.args("--vllm-mm-processor-cache-gb=" + value))
+
+    def test_mm_cache_positive_override_warns_even_in_dry_run(self):
+        for value, warning_expected in (("0", False), ("1", True)):
+            with self.subTest(value=value), redirect_stdout(StringIO()), redirect_stderr(StringIO()) as err:
+                code = launcher.main(["/missing/model", "/missing/data", "/missing/output", "--dry-run",
+                                      "--vllm-mm-processor-cache-gb", value])
+            self.assertEqual(code, 0)
+            self.assertEqual("cache-clear hang" in err.getvalue(), warning_expected)
 
     def test_environment_keeps_reward_external(self):
         env = launcher.build_environment(self.args())

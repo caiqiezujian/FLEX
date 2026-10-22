@@ -254,11 +254,45 @@ bash 02_train.sh \
 
 恢复目录须有框架原生 tracker 和完整分布式 checkpoint shards，不是 HF merged 导出目录。上游也会把 tracker 和部分元信息复制到 merged 目录，因此不能只看 tracker 判断可恢复；入口已对此做检查。总训练步数和关键配置保持一致，不能把“两步 smoke”直接改成 1000 步声称无缝恢复。新实验使用新输出目录。启动身份校验包含权重元信息，不宣称已对所有权重文件做内容级哈希。
 
+### 7.2 第 68 步停滞后的最小可靠性修正
+
+服务器栈位于 vLLM 0.19.1 的 `sleep → reset_mm_cache → LRU.clear → popitem`，与缺失 key 残留在 LRU 顺序表导致的清理循环高度匹配。启动入口现在默认 `--vllm-mm-processor-cache-gb 0`，在新建引擎时关闭多模态处理/传输缓存，绕开这条清理路径。**没有关闭音频、KV prefix caching 或 sleep/offload，也没有升级框架包。** 正数覆盖会给出警告，只有确认所用框架修复且完成多步验收后才考虑重新启用。关闭缓存可能增加历史音频预处理成本，不能宣称这项本身提速。
+
+`--performance-log on`（04 默认开启）现在还写 `performance/phases-rank*-pid*.jsonl`：generation、权重同步、逐轮请求、CPU 卸载、GPU 回载和 vLLM sleep 各自都有 `begin/end`。卡住时未结束的阶段仍有 begin 记录。`vllm_sleep_seconds` 包含 SWIFT 的整个 sleep 包装与相关清理，不是单独的缓存耗时；仍不做 CUDA synchronize 或新增 collective。
+
+### 7.3 先分析已停止的旧运行，不重复推理
+
+以下为示例路径与日志 PID，请替换为实际运行对应值后执行：
+
+```bash
+cd /data/flex/FLEX-GSPO
+python3 analyze_training_run.py \
+  /data/flex/outputs/gspo_throughput_4100_001 \
+  --native-log /data/flex/outputs/gspo_throughput_4100_001/v0-20261022-173943/logging.jsonl \
+  --pids 111,112,113,114 \
+  --dataset /data/flex/datasets/gspo_online_prepared_clean/train.jsonl \
+  --reward-config /data/flex/FLEX-GSPO/configs/default.json \
+  --output-dir /data/flex/outputs/gspo_throughput_4100_001_audit_01 \
+  --window 10 \
+  --examples 2
+```
+
+这里 PID 来自旧 reward 文件名，不是宿主机 PID。脚本仅依赖 Python 标准库及本项目的轻量模块；不加载模型、不调用 MetricX、不读取 WAV、不改原日志。只扫描指定任务清单以关联少量示例的原文和机器参考。输出目录必须是新目录，重复执行请更换后缀。
+
+- `summary.json`：训练窗口、各 rank/PID 的奖励窗口、空译文/invalid 原因、同译文不同时间的对照数量、性能统计、实际保存间隔和 checkpoint 元信息。
+- `examples.jsonl`：早期/近期异常案例、相同译文不同调度，以及同任务局部候选中分差较大的对照，附原文和机器参考。它是定向诊断样本，不是随机评测集；分享前确认文本范围。
+- 只有当前配置的哈希与旧 launch identity 匹配时，才用当前公式复算旧奖励；`formula_recheck.enabled=false` 不代表检查通过。算术吻合也不证明奖励设计符合研究目标。
+- 不将一个 rank 的 8 条候选自动当作完整同源 G8；旧日志没有 callback 结束标记，最后一个连续前缀仍可能不完整。checkpoint 文件存在也不等于实际恢复成功。
+
+第二次长跑前应先完成：旧候选奖励排序审查；短 GPU 验收并验证 native checkpoint 保存/恢复；使用正式形状的较长稳定性运行，覆盖此前第 68 步的失效点。仅“两步跑通”不足以证明长跑稳定。可在第二轮显式设 `--save-steps 20` 或 `50` 减少未保存风险，但合并导出有额外时间和磁盘成本。恢复时总步数/LR horizon、数据、奖励和代码身份必须保持一致，不能把五步 smoke 改成 4100 步当作无缝恢复。
+
 ## 8. 奖励与验证边界
 
 详见 [QALCO 强化学习方案详解](docx/QALCO强化学习方案详解.md)。第一版是**完整译文的 MetricX 质量 + 整条轨迹的时延预算 + 超长成本**，不是每个短块单独做完整句子评分。WAIT token 参与策略梯度；FLEX 不因尚未成句就被单独判低质量。
 
 默认时延使用所有输出单元的 mean-lag 代理，避免“把输出继续拖到 EOF，指标反而下降”的截断问题。它不是精确语义延迟，也不是 GPU 墙钟延迟。当前没有独立自然度模型、逐 WAIT 反事实分支、强制语义对齐或独立标点惩罚，不能宣称已经精确解决每一次等待是否值得。
+
+当前严格分层奖励还有需要校准的边界：`Q < 0.85` 时只比较质量，不比较时延/长度；质量通过但时延超预算时只比较时延，且达到预算两倍后饱和。因此 `Q=0.80,L=1` 和 `Q=0.80,L=12` 都得到约 `-2.0588`。`.85` 等价于 MetricX 错误分 `3.75`，不是 85% 准确率。长度项只惩罚超过参考长度 1.2 倍的输出，不独立保证地道、简洁或少碎句。本次缓存/诊断修正**没有改变奖励公式或阈值**；应先用旧候选审查这些分支的实际排序，再确定下一版，不把“实现符合公式”误认为“研究目标已充分实现”。
 
 本地运行测试：
 
