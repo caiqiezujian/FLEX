@@ -20,7 +20,7 @@ class LoopbackCOMET22Tests(unittest.TestCase):
                 self.send_response(503 if retry else 200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(json.dumps({"scores": [0.7, 0.3]}).encode("utf-8"))
+                self.wfile.write(json.dumps({"score": [0.7, 0.3]}).encode("utf-8"))
 
             def log_message(self, *args):
                 pass
@@ -29,7 +29,8 @@ class LoopbackCOMET22Tests(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            scorer = ServiceCOMET22({"service_url": f"http://127.0.0.1:{server.server_port}/22"})
+            scorer = ServiceCOMET22({"service_url": f"http://127.0.0.1:{server.server_port}/22",
+                                    "response_key": "score"})
             with patch("flex_gspo.comet22.time.sleep"):
                 result = scorer.score_batch("Source", ["译文甲", "译文乙"], "参考")
             self.assertEqual(result, [0.7, 0.3])

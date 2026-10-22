@@ -47,7 +47,9 @@ def validate_comet22_settings(settings):
         value = normalized[name]
         if not isinstance(value, str) or not value.strip() or value != value.strip():
             raise RewardError(f"comet22.{name} must be nonempty text without surrounding whitespace")
-    if normalized["response_key"] in ("system_score", "mean", "average", "score"):
+    # The deployed service uses "score" for a per-candidate ARRAY. A singular
+    # key is not evidence of aggregation; _parse_scores enforces shape/count.
+    if normalized["response_key"] in ("system_score", "mean", "average"):
         raise RewardError("comet22.response_key must identify per-candidate scores, not an aggregate")
     url = normalized["service_url"]
     try:

@@ -53,7 +53,7 @@ $$
 新训练只调用COMET22：
 http://10.185.1.72:6668/22
 
-输入是srcs/mts/refs等长数组，mts为整条完整译文。按用户服务约定返回逐条分数；默认支持flat数组或{"scores":[...]}。response_key可配置明确的其他顶层数组键，拒绝整体均分。声明模型Unbabel/wmt22-comet-da，不代表已远程核验权重。
+输入是srcs/mts/refs等长数组，mts为整条完整译文。用户已确认服务返回{"score":[...]}逐候选数组，项目配置response_key="score"；也支持flat数组，其他顶层数组键须显式配置。score这个单数键名不代表整体均分，必须按数组类型、长度和数值检查；标量均分仍拒绝。声明模型Unbabel/wmt22-comet-da，不代表已远程核验权重。
 
 $$
 Q=\mathrm{COMET22}(x,\hat y,y_{\mathrm{ref}})

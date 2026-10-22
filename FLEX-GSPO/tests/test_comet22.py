@@ -53,6 +53,32 @@ class COMET22Tests(unittest.TestCase):
                 self.session.post.return_value = self.response(body=body)
                 self.assertEqual(self.score(**config), [0.2, 0.7])
 
+    def test_deployed_score_key_with_production_config(self):
+        config_path = Path(__file__).resolve().parents[1] / "configs" / "default.json"
+        settings = json.loads(config_path.read_text(encoding="utf-8"))["reward"]["comet22"]
+        self.assertEqual(settings["response_key"], "score")
+        scores = [0.9610479474067688, 0.86544269323349]
+        self.session.post.return_value = self.response(body={"score": scores})
+        scorer = ServiceCOMET22(settings)
+        self.assertEqual(scorer.score_batch("Source", ["译文甲", "译文乙"], "参考"), scores)
+        self.session.post.assert_called_once()
+
+    def test_score_key_still_rejects_aggregates_bad_values_and_wrong_count(self):
+        bodies = [{"score": 0.9}, {"score": [0.9]}, {"score": [0.9, 0.4, 0.2]},
+                  {"score": [[0.9, 0.4]]}, {"scores": [0.9, 0.4]}]
+        bodies += [{"score": [value, 0.1]} for value in
+                   (True, None, "0.9", float("nan"), float("inf"), -0.1, 90, 1.01)]
+        for body in bodies:
+            with self.subTest(body=body):
+                self.session.post.return_value = self.response(body=body)
+                with self.assertRaisesRegex(RewardError, "no reward assigned"):
+                    self.score(response_key="score")
+
+    def test_explicit_score_key_does_not_guess_other_fields(self):
+        self.session.post.return_value = self.response(
+            body={"score": [0.9, 0.4], "scores": [0.1, 0.2], "system_score": 0.65})
+        self.assertEqual(self.score(response_key="score"), [0.9, 0.4])
+
     def test_aggregate_not_mistaken_for_segment_scores(self):
         bodies = [0.9, {"system_score": 0.9}, {"scores": [[0.9, 0.4], 0.65]},
                   {"scores": [0.9]}, {"scores": [0.9, 0.4, 0.2]}, {"score": [0.9, 0.4]}]

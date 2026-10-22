@@ -111,7 +111,7 @@ class OnlinePipelineTests(unittest.TestCase):
                     payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                     received.append((self.path, payload))
                     scores = [0.95 if mt == reference else 0.2 for mt in payload["mts"]]
-                    encoded = json.dumps({"scores": scores}).encode()
+                    encoded = json.dumps({"score": scores}).encode()
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(encoded)))

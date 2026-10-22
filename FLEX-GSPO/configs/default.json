@@ -15,7 +15,7 @@
       "service_url": "http://10.185.1.72:6668/22",
       "service_id": "comet22-internal-6668",
       "model_id": "Unbabel/wmt22-comet-da",
-      "response_key": "scores",
+      "response_key": "score",
       "timeout_seconds": 300,
       "max_attempts": 2
     },
