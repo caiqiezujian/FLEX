@@ -1,312 +1,196 @@
-# FLEX：Megatron-SWIFT 在线 GSPO
+# FLEX-GSPO：QALCO v2 在线同传强化学习
 
-当前主流程是：**原始 JSONL + 原音频 → 在线训练任务 → 当前策略生成多条完整同传轨迹 → QALCO 评分 → GSPO 更新。**
+当前正式配置：**3000 次优化更新，每 500 步保存 checkpoint**。使用原 SFT 合并 checkpoint 起跑，4 张 A800 80GB；训练框架仍是 **MS-SWIFT 的 Megatron RLHF**，GSPO 采用 sequence-level importance sampling，不是把离线候选当成新策略。
 
-不需要先把全量数据离线采样成固定 G8 轨迹。已有离线轨迹可以保留用于分析和对照，但不是本训练入口的必需输入，也不会被当作当前策略的新采样直接回放。
+这次改动针对上一轮三类实际问题：质量指标放过复读、末尾 WAIT 没有收尾机会、多卡同步及 vLLM 缓存清理卡死。**本地测试不等于真实四卡验收；不能保证零故障或保证质量提升。**
 
-适用范围：英→中、已合并的 Qwen3-Omni-30B-A3B SFT checkpoint、4 张 A800 80GB、独立部署的 MetricX 服务。这里输出文字，不训练语音播报。
+## 1. 这版改变与保留什么
 
-**实现和 CPU 合约测试已完成；真实 checkpoint、4 卡前向/反向、权重同步和内网 MetricX 仍须在服务器验收。不能把单元测试通过理解为已经完成 GPU 训练。**
+- 质量主分数改为 **COMET22 带参考评分**，不接 COMET20。MetricX 仅保留历史审计及可选诊断对照，不参与默认新训练奖励。
+- 严重循环复读进入独立失败分支，不能被质量分抵消；不按句号数量或普通 FLEX 语义锚点重复处罚。
+- 保留原 SFT system prompt，音频全部输入后增加一次文本 EOF 观察和增量收尾。最终没有待译内容时仍可 WAIT；不强制 DIRECT、不重译历史、不输入转录或参考。
+- 完整音频 N 轮 + EOF 1 轮；默认 max-turns=65，可容纳64个音频块。已有 prepared train.jsonl 可以直接使用，无须重切 WAV。
+- 新奖励版本2在低质量区也计入有限等待成本；超时区不再在两倍预算处直接饱和。仍有质量/时延门槛，不是无约束加权求和。
+- 保留现有 TP2/EP2、vLLM TP4、多轮全局完成同步、offload、sleep_level=2、full recompute、eager 和 log_completions=false。
+- 默认 vllm_mm_processor_cache_gb=0，规避此前缓存清理卡死路径；KV prefix cache 仍保留。没有升级训练环境或修改 site-packages。
+- 新日志包含 reward_version、run_id、session_id、COMET22、严重复读标记和 EOF 指标；旧日志仍可读取。
 
-**针对四卡训练停在 `Train: 0/2` 的更新：** 已增加 FLEX 专用多轮退出同步修复。Megatron TP2 / vLLM TP4 时，退出判定必须覆盖真正参与推理的四卡，不能只覆盖两个训练进程。补丁随插件自动安装，不修改 `site-packages`，不改变训练数据分配或奖励公式。已有环境和 `train.jsonl` 可以复用；上传代码后请使用新输出目录完成两步复测。具体命令见 [多轮同步死锁修复与复测](docx/多轮同步死锁修复与复测.md)。
+**COMET22 也有误判。默认 quality_floor=0.80、3秒时延预算和0.5秒 EOF 调度代理成本均是待校准的实验起点，不是准确率或已验证的最优值。先审真实候选，再决定是否调整。**
 
-## 1. 目录与 SFT 的关系
+## 2. 入口
 
-```text
-FLEX-GSPO/
-├── 00_install_framework.sh     # 独立环境中的显式安装辅助，不替换 CUDA 栈
-├── 01_prepare.sh               # 原始 JSONL + WAV → train.jsonl
-├── 02_train.sh                 # Megatron-SWIFT 在线 GSPO 入口
-├── 03_train_4100.sh            # 已通过两步验证后使用的 G8/B32、4100 步参数入口
-├── 04_train_throughput.sh      # 可选提速试验：B32/micro2/推理并发32/显存预算0.50
-├── monitor_training.py         # 独立进程：已有奖励/耗时日志 → TensorBoard，不参与训练
-├── prepare_data.py
-├── train_megatron.py           # 参数、预检、四卡启动与恢复检查
-├── swift_plugin.py             # Omni 音频模板、多轮环境、奖励函数注册
-├── check_environment.py
-├── check_metricx_service.py
-├── configs/default.json        # 当前 QALCO 奖励参数和 MetricX 地址
-├── flex_gspo/
-│   ├── prepare.py              # 有界并发元数据校验、去重、原子发布任务
-│   ├── audio.py                # 因果切片，只读取当前已释放的音频区间
-│   ├── online.py               # 每块音频一次决策，构成完整多轮轨迹
-│   ├── rollout_sync.py         # FLEX-colocate 退出判定按真实 vLLM TP 组同步
-│   ├── performance.py          # 可选本地阶段计时，不新增 CUDA 同步或分布式通信
-│   ├── monitoring.py           # 训练外日志观察器，导出曲线/文本与可选 GPU 读数
-│   ├── online_reward.py        # 完整轨迹评分、服务批量调用和诊断日志
-│   ├── qalco.py                # 质量门槛、时延预算、长度成本
-│   ├── metricx.py              # 用户提供的 MetricX HTTP 协议
-│   └── prompts.py             # 原始 SFT system prompt
-├── tests/
-└── docx/                      # Markdown 文档，不是 Word 文件
-```
+| 文件 | 用途 |
+|---|---|
+| 01_prepare.sh / prepare_data.py | 原始JSONL + WAV目录 → 在线任务清单 |
+| check_comet22_service.py | COMET22连通、返回数组、基本语义排序与反序批量一致性检查 |
+| audit_reward_candidates.py | 利用旧候选检查新评分与复读保护；不生成新轨迹、不伪造EOF |
+| 02_train.sh / train_megatron.py | 通用 Megatron-SWIFT 启动器 |
+| 03_train_3000.sh | G8/B32、micro1、vLLM0.4/16并发，3000步/每500步保存 |
+| 04_train_throughput.sh | 相同目标，micro2、vLLM0.5/32并发，开启阶段计时 |
+| monitor_training.py | 将奖励、EOF、性能和样例日志转成 TensorBoard |
+| analyze_training_run.py | 停止后的离线日志审查，无评分API |
+| configs/default.json | 当前 v2 奖励及服务配置 |
+| docx/QALCO强化学习方案详解.md | 公式、边界与验收说明 |
 
-原项目的 SFT 入口为 `Scripts/train_duplex_sft.sh`，本次没有修改；该脚本不包含在这个公开仓库中。训练消息保持原始 SFT 提示词和 `<|WAIT|>` / `<|FLEX|>` / `<|DIRECT|>` 协议，不通过另写一个新 prompt 改变任务定义。
+原 03_train_4100.sh 已重命名为 03_train_3000.sh，不再作为入口。手动上传时请同步整个文件夹，避免只更新一两个 Python 文件。
 
-必须使用正确合并的 SFT checkpoint，且三个协议 token 已在该 checkpoint 中训练。启动预检检查单 token 编码、不同 ID、解码和词表尺寸；不会重新随机初始化这些 token。该检查不能代替对 checkpoint 训练来源的确认。
+## 3. 环境与输入
 
-## 2. 从你的服务器原始数据准备
+在**此前已验收的 Docker 内**激活虚拟环境，不能只看提示符判断环境：
 
-以下为示例数据布局；实际路径由命令行参数指定：
+~~~bash
+cd /data/yb/Code/FLEX/FLEX-GSPO
+source /data/yb/venvs/flex-gspo-online/bin/activate
+python3 -c "import sys; print(sys.executable)"
+~~~
 
-```text
-/data/flex/datasets/
-├── 1019/
-│   └── en2zh_train_gspo_1.jsonl
-└── data_001/
-    ├── example_001.wav
-    └── example_002.wav
-```
+应看到 /data/yb/venvs/flex-gspo-online/bin/python3。本次没有新增必装依赖；HTTP使用已有 requests，训练端不安装COMET模型。不要为了本次更新重新安装 torch、CUDA、vLLM 或 cachetools。
 
-注意 Linux 路径大小写敏感。目录名和 JSONL 文件名均可通过参数指定，不要求其他使用者改成你的命名。
+此前准备好的输入可继续用：
+/data/yb/FLEX/datasets/gspo_online_prepared_clean/train.jsonl
 
-原始 JSONL 每行：
+只有尚未 prepare 才运行：
 
-```json
-{"lang":"en","key":"example_001","en":{"txt":"The meeting starts at nine."},"zh":{"txt":"会议九点开始。"}}
-```
-
-运行：
-
-```bash
+~~~bash
 bash 01_prepare.sh \
-  --input-jsonl /data/flex/datasets/1019/en2zh_train_gspo_1.jsonl \
-  --audio-dir /data/flex/datasets/data_001 \
-  --output-dir /data/flex/datasets/gspo_online_prepared \
-  --workers 16
-```
+  --input-jsonl /data/yb/Flex/datasets/1019/en2zh_train_gspo_1.jsonl \
+  --audio-dir /data/yb/Flex/datasets/data_001 \
+  --output-dir /data/yb/FLEX/datasets/gspo_online_prepared_v2 \
+  --workers 16 \
+  --skip-invalid
+~~~
 
-处理内容：按 `key` 去重、关联 `key.wav`、校验文本和 WAV 头、记录音频大小和修改时间、规划默认 1 秒一块的虚拟边界。使用流式读取、磁盘去重索引和有界并发，持续打印进度。**不做 ASR、不调用模型、不复制原音频、不生成成千上万个实体 chunk 文件。**
+原始一行仍是 key、lang、en.txt、zh.txt，key对应key.wav。准备阶段保留原音频位置，输出虚拟分块；不制造离线G8轨迹。源文和机器参考仅用于奖励，不进入actor消息。Linux路径区分 Flex 与 FLEX，请确认真实路径。
 
-输出：
+## 4. 先检查 COMET22
 
-- `train.jsonl`：直接供在线 GSPO 使用。
-- `prepare_report.json`：数量、耗时和处理配置。
-- `rejected.jsonl`：损坏记录、缺失音频等问题。
-- `duplicates.jsonl`：重复记录诊断。
+默认完整URL为 http://10.185.1.72:6668/22，请求 srcs/mts/refs；禁用环境代理。支持有序数值数组或 {"scores":[...]}，实际响应若是其他顶层键，在配置 response_key 中填写。拒绝整体均分、嵌套数组、缺失项、NaN、字符串或百分制分数。
 
-默认只生成训练集，不自动划出测试集。默认最大音频长度 40 秒；超长记录被报告，不会静默截断。最后不足 1 秒的块在模型输入侧补零，时延计算仍使用真实结束时间。训练默认允许单块最长 2 秒；若主动修改 prepare 的 chunk 长度，也须同步训练的 `--max-chunk-seconds`。
+~~~bash
+python3 check_comet22_service.py \
+  --config /data/yb/Code/FLEX/FLEX-GSPO/configs/default.json
+~~~
 
-默认严格模式：发现无效记录则保留报告但不发布最终训练清单。修复数据后使用新的输出目录重跑；若明确接受过滤，可以加 `--skip-invalid`。同 key 第一条合法候选优先，重复的文本冲突会记录。输出目录有占用锁和覆盖保护，不要并发写同一个目录。
+检查包括正确译文相对否定翻转、明显无关译文的排序。循环复读排名另作诊断，因为新复读保护独立于模型分数。模型身份只是操作者声明；服务没有提供截断信息时，客户端不能证明远端没有截断。检查失败不要用 transport-only 绕过正式训练；该选项只用于定位网络/响应协议问题。
 
-准备后的每行有三个核心字段：
+可用 --cases-jsonl 加载人工核查的真实成对例子，格式：
 
-```json
-{"messages":[{"role":"system","content":"原始 SFT 提示词"},{"role":"user","content":"<audio>"}],"audios":["flexaudio:v1:编码后的首块引用"],"flex_task":"编码成 JSON 字符串的任务元数据"}
-```
+~~~json
+{"id":"reviewed-1","source_text":"We leave on Friday.","reference_text":"我们星期五出发。","preferred":"我们周五出发。","dispreferred":["我们星期一回来了。"]}
+~~~
 
-`flex_task` 包含原音频路径、边界、英文转写、中文机器参考等。它是环境/奖励侧数据，**英文转写和参考译文不进入模型聊天内容**。初始 actor 输入只含第一块音频，后续由环境逐块释放。
+不要把错误机器参考当成真值；人工核查需要以音频为准。
 
-## 3. 训练框架与环境
+## 5. 用旧训练结果检查新奖励盲区
 
-使用 **Megatron-SWIFT 训练 + vLLM colocate 多轮 rollout + 项目自定义插件**。GSPO 使用框架的 `rlhf_type=grpo` 入口配合 `importance_sampling_level=sequence`，不是把普通 SFT 换个名字，也不是自写一个 HF 单机 trainer。
+以下脚本只读旧日志及数据清单，调用COMET22，不加载Omni、不读取WAV。输出文件必须不存在：
 
-本次接口审查基于官方源码提交：
+~~~bash
+python3 audit_reward_candidates.py \
+  --run-dir /data/yb/FLEX/outputs/gspo_throughput_4100_001 \
+  --dataset /data/yb/FLEX/datasets/gspo_online_prepared_clean/train.jsonl \
+  --output /data/yb/FLEX/outputs/gspo_reward_audit_3000_001.jsonl \
+  --config /data/yb/Code/FLEX/FLEX-GSPO/configs/default.json \
+  --pids 1795291,1795292,1795293,1795294 \
+  --limit 100
+~~~
 
-```text
-modelscope/ms-swift
-f15bb91439d756d4a366b51956d72d1f088b7af6
-4.7.0.dev0
-```
+如需同时对照原MetricX，加 --compare-metricx。生成诊断JSONL及其 .summary.json。选样刻意覆盖空译文、疑似循环、协议错误及普通候选，不是随机评估；不能据此估计总体质量。旧轨迹没有新EOF，脚本**不会伪造一次收尾，也不会声称算出了其真实v2训练奖励**。
 
-原 SFT 的旧版 SWIFT 环境不能默认认为具备这些多轮、音频回传和 GSPO 接口。请保留已验收的 SFT 环境，在单独环境或容器中适配训练；Python 需要至少 3.10，并需要相互兼容的 PyTorch、CUDA、vLLM、Megatron-Core、TransformerEngine 和 FlashAttention。
+旧分析工具的公式重算需要对应旧运行原始配置。不能拿现在的v2 default.json去证明旧v1公式错误；未匹配旧launch哈希时重算会跳过。
 
-`00_install_framework.sh` 只是安装审查过的 SWIFT 源码、mcore-bridge 和本项目轻量依赖的辅助脚本，**不是从空环境安装完整 CUDA 训练栈的一键脚本**。它不会主动升级 torch/vLLM/Megatron-Core/TransformerEngine，也不会像旧采样代码一样写死 vLLM 必须等于某个历史版本。
+## 6. 服务器短验收：独立目录
 
-在准备好的独立环境中，可以显式执行：
+先检查解释器、服务和环境，再验收新EOF实际模型输出及保存。以下2步测试用于检查贯通，**不能证明100步或3000步稳定**：
 
-```bash
-bash 00_install_framework.sh --confirm-isolated-env
-python3 check_environment.py --require-training
-```
-
-预检包含框架源码能力、相关依赖、CUDA 组件导入和 GPU 数量。导入检查仍不等于多轮 Omni 训练一定成功；真实模型测试见下面两步验收。
-
-## 4. MetricX
-
-公开配置中的 `service_url` 和 `service_id` 留空，部署前必须在 `configs/default.json` 填写你自己的服务地址（例如 `http://METRICX_HOST:16999`）和实例标识。默认 **带参考模式**：
-
-```text
-POST /metricx24
-{"srcs":["原文"],"mts":["完整候选译文"],"refs":["机器参考译文"]}
-→ {"scores":[0.4]}
-```
-
-同时支持 `/metricx24/qe`。客户端 `trust_env=False`，内网请求不走环境代理；分数越低越好。请求失败、响应维度错误或非有限分数会报错，不会用默认奖励继续训练。模型非法输出则是正常的负奖励样本，不等同于服务故障。
-
-服务器上先检查：
-
-```bash
-python3 check_metricx_service.py --mode both
-```
-
-该服务在独立机器运行，不占这四张卡的训练显存。服务地址或评分参数需要更改时编辑配置文件，或使用训练入口的 `--reward-config` 指定另一份配置。
-
-## 5. 先完成真实两步验收
-
-下面的参数直接跟路径，不需要设置 `MODEL_PATH` 变量；请替换为你的真实模型和数据路径。请在 `FLEX-GSPO` 目录中执行：
-
-```bash
-bash 02_train.sh \
-  /data/models/flex-sft-merged \
-  /data/flex/datasets/gspo_online_prepared/train.jsonl \
-  /data/flex/outputs/gspo_smoke_001 \
-  --gpu-ids 0,1,2,3 \
-  --group-size 2 \
-  --global-batch-size 4 \
+~~~bash
+bash 04_train_throughput.sh \
+  /data/data_process/lzy/qwen3_omni_mega/train/megatron_output/Qwen3-Omni-Flex/v3-20261016-172842/checkpoint-4410-merged \
+  /data/yb/FLEX/datasets/gspo_online_prepared_clean/train.jsonl \
+  /data/yb/FLEX/outputs/gspo_comet22_smoke_001 \
   --train-iters 2 \
-  --save-steps 1
-```
+  --save-steps 2
+~~~
 
-至少需要两条合法任务。可以先在命令末尾加 `--dry-run` 查看最终参数：该模式不加载 GPU 模型、不调用服务、不写训练目录，也不代表训练通过。
+确认每个rank进入reward和optimizer更新；检查EOF没有重复历史、全WAIT失败不被丢掉、原生checkpoint和合并导出实际存在。保存/恢复还需在服务器验证，HF merged目录不等于含optimizer/RNG的原生checkpoint。
 
-两步验收重点：真实音频能够逐块输入、第一轮输出与 SFT 推理合理一致、完整轨迹进入评分、损失和梯度有限、确实发生优化器更新、下一批 rollout 使用更新后的权重、checkpoint 能保存。所有候选相同而导致组内 advantage 为零，不是报错，但也不能称为已经获得有效学习信号。
+2步测试的LR总周期与3000不同，不能将其作为3000步的无缝恢复点。正式训练从原SFT重新开始，使用新目录。
 
-## 6. 验收后使用 G8
+## 7. 正式训练：3000步，每500步保存
 
-为正式训练使用新的输出目录，不在 smoke 目录上混跑：
+与上一轮实际使用的吞吐配置一致：G8 / global batch32 / micro2 / 每次生成更新1步，vLLM内存0.5、并发32。额外保留缓存规避与新EOF：
 
-```bash
-bash 02_train.sh \
-  /data/models/flex-sft-merged \
-  /data/flex/datasets/gspo_online_prepared/train.jsonl \
-  /data/flex/outputs/gspo_g8_001 \
+~~~bash
+bash 04_train_throughput.sh \
+  /data/data_process/lzy/qwen3_omni_mega/train/megatron_output/Qwen3-Omni-Flex/v3-20261016-172842/checkpoint-4410-merged \
+  /data/yb/FLEX/datasets/gspo_online_prepared_clean/train.jsonl \
+  /data/yb/FLEX/outputs/gspo_comet22_g8_b32_3000_001 \
   --gpu-ids 0,1,2,3 \
   --group-size 8 \
-  --global-batch-size 16 \
-  --train-iters 1000
-```
+  --global-batch-size 32 \
+  --micro-batch-size 2 \
+  --steps-per-generation 1 \
+  --train-iters 3000 \
+  --save-steps 500 \
+  --max-length 8192 \
+  --max-new-tokens 128 \
+  --max-turns 65 \
+  --vllm-memory 0.5 \
+  --vllm-max-num-seqs 32 \
+  --vllm-mm-processor-cache-gb 0 \
+  --performance-log on
+~~~
 
-主要默认配置：
+命令末尾加 --dry-run 可只打印计划，无文件写入、无服务请求、无GPU。
+正式保存点：500、1000、1500、2000、2500、3000；框架save_total_limit=3，不承诺六个历史checkpoint都永久保留。首次500步前没有周期checkpoint，这是用户指定的间隔；不能误以为50或100步会自动保存。warmup比例0.03，即90步。
 
-| 配置 | 初始值 |
-| --- | --- |
-| Megatron TP / EP / PP | 2 / 2 / 1 |
-| vLLM TP | 4 |
-| 训练方式 | LoRA rank 8，alpha 32；冻结音频/视觉编码器与对齐模块 |
-| 学习率 / KL 系数 | 1e-6 / 0.01 |
-| GSPO clipping 下/上范围 | 0.0003 / 0.0004 |
-| rollout prompt 预算 / 每轮新增 token | 8192 / 128；vLLM 总预算 8320 |
-| 最大音频轮数 | 64 |
-| sampling temperature / top_p | 1.0 / 1.0 |
-| 每批 rollout 后更新轮次 | 1 |
-| rollout 显存比例 | 0.4 |
-| colocate sleep / offload | sleep level 2，模型与优化器 offload |
+每次生成计划4条音频×8候选=32条轨迹，3000步计划约12000次任务采样、96000条轨迹，不等于全量数据一个epoch，不保证任务不重复。EOF可能让步骤时间增加，不能承诺比旧轮次更快。微批次2若长轨迹接近显存上限，可在新实验回退03入口；不要中途随意改变精确恢复配置。
 
-这些是起步配置，不是四卡显存和速度的保证。offload 依赖 CPU 内存和主机带宽，需结合服务器实测调整。默认采用完整合并权重同步，不假设未经验证的 Omni LoRA-only 在线刷新可用。8192 是 rollout prompt 编码预算，不是完整 teacher-forced 训练序列的绝对长度上限；框架在最终训练编码时会临时取消模板截断。
+开始正式训练后仍须观察超过此前68步失效点，例如到100步，检查日志持续推进、缓存sleep/wake、奖励服务以及峰值显存。两步、100步通过均不等于终身无故障。不要自动杀掉长轮次；先看phase日志及各rank栈。
 
-### 6.1 已跑通 G8/B32 后，正式训练 4100 步
+### 恢复
 
-`03_train_4100.sh` 是 `02_train.sh` 的参数快捷入口，不是新的训练阶段。在已经完成两步验收的 Docker 和虚拟环境中执行：
+使用同一完整代码、奖励、数据、模型和3000步LR总周期，在原命令追加 --resume-from 指向实际的原生 checkpoint-500 等目录。必须有optimizer/RNG及分片，不是 checkpoint-500-merged。启动器验证run identity，改变奖励或EOF协议后不得接着旧v1 optimizer跑；这次必须新起一轮。
 
-```bash
-cd /data/flex/FLEX-GSPO
-source /data/venvs/flex-gspo-online/bin/activate
+## 8. TensorBoard 与日志
 
-bash 03_train_4100.sh \
-  /data/models/flex-sft-merged \
-  /data/flex/datasets/gspo_online_prepared_clean/train.jsonl \
-  /data/flex/outputs/gspo_g8_b32_4100_001
-```
+另一个终端（训练环境或能读取同目录且装了TensorBoard的环境）：
 
-模型、JSONL 和输出目录都是直接传参，也可替换为其他路径。命令末尾可加 `--dry-run` 检查配置，不会启动训练。必须使用新的输出目录；本轮从原始合并 SFT checkpoint 开始，不恢复两步排障实验，以便学习率计划按 4100 步重新建立。
+~~~bash
+python3 monitor_training.py \
+  /data/yb/FLEX/outputs/gspo_comet22_g8_b32_3000_001 \
+  --watch \
+  --dataset /data/yb/FLEX/datasets/gspo_online_prepared_clean/train.jsonl
 
-配置保留 G8、global batch 32、micro batch 1、每次生成更新 1 步、学习率 `1e-6`、KL `0.01`、LoRA rank 8/alpha 32、8192/128 token 预算、64 轮上限和 vLLM 显存比例 0.4。训练 4100 次优化更新，每 100 步保存，框架保存保留上限仍为 3；合并模型导出仍启用，应预留充足磁盘空间。warmup 比例仍为 0.03，对应 123 步。4100 不是 epoch 数。
+python3 -m tensorboard.main \
+  --logdir /data/yb/FLEX/outputs/gspo_comet22_g8_b32_3000_001 \
+  --host 0.0.0.0 \
+  --port 6006
+~~~
 
-按本配置，每次生成计划使用 4 条源音频任务，每条 8 个候选；4100 步计划约 16,400 次任务采样、131,200 条候选轨迹。它不等于全量约 25 万条数据训练一遍，也不保证这些任务全部互不重复；编码失败重采样等行为可能增加实际读取量。
+monitor是常驻进程；TensorBoard在第三个终端运行。暴露端口时注意网络访问控制。也可仅读取原始 rewards/ 和 performance/ JSONL。
 
-快捷脚本清除 `CUDA_LAUNCH_BLOCKING`、C++ 堆栈、分布式详细调试等排障设置，将多轮进度日志恢复为每 5 轮打印，不改变 allocator 或已验收的 offload 设置。单次显存占用不到 40GB 不等于整个训练峰值只到 40GB；不要仅凭这个读数直接关闭 offload 或翻倍 batch。
+优先看：
 
-当前启动器明确使用 `log_completions=false`：该固定框架的 prompt 日志会仅携 messages 调用音频编码，触发缺少 audios 的错误。关闭的是框架额外的 prompt/completion 展示，不是 QALCO 轨迹记录；`rewards/` 中完整轨迹与奖励日志、训练指标及 TensorBoard 仍然保留。此配置不放松真实模型输入的音频校验。固定上游的 reward/advantage 展示缓存为有限长度 deque，不会因关闭 completion 日志而无限堆积。
+- comet22_score/mean、quality_pass_fraction、feasible_fraction；
+- empty_translation_fraction、severe_repetition_fraction、tier/degenerate_fraction；
+- latency_seconds/mean、diagnostics/eof_text_fraction、eof_generation_seconds；
+- actions/WAIT/FLEX/DIRECT_fraction **只统计音频轮**，eof_actions/*单列，避免正常收尾WAIT污染主策略比例；
+- KL、grad_norm、reward_std、frac_reward_zero_std、非有限值；
+- generation_seconds、offload/reload、weight_sync 与原始 train_speed。
 
-使用此入口前，同步本次修改的 `train_megatron.py`；仅复制新 shell 文件而保留旧的 `log_completions=true` 启动器会重新触发日志错误。服务器的实际 MetricX 配置保持不变。正式运行的最终质量、速度和稳定性仍以服务器观测为准，两步成功不是长程效果保证。
+final_wait_fraction可能是“已译完后的正常EOF WAIT”，不等于整条空译文。各rank回调汇总不是完整全局G8组；不要用局部8条就断言全部候选相同。run_id/session_id用于避免重启日志混淆。
 
-## 7. 日志和恢复
+固定验证音频对比SFT与checkpoint，抽查事实/数字/否定、漏译、自然性、复读、输出时机。reward上升或loss下降都不能单独证明翻译变好；COMET22若用于训练，也不能再当完全独立的效果证据。
 
-### 7.1 安全提速与 TensorBoard
+## 9. 测试与范围
 
-保留原 `02_train.sh` / `03_train_4100.sh` 稳定配置。新 `04_train_throughput.sh` 只把训练 micro batch 从 1 改为 2、vLLM `max_num_seqs` 从 16 改为 32、vLLM 显存预算从 0.40 改为 0.50，并打开可关闭的阶段计时。G8、global batch 32、每批生成更新 1 步、学习率、KL、奖励公式、音频分块、多轮完成同步、TP/EP、完整重计算、eager 和 offload 全部保持原设置。它是待服务器验证的提速候选，不是已测出的加速倍数。
-
-先用新输出目录验证 5 步及保存，再决定是否启动 4100 步；完整命令、回退方法、监控启动及曲线判读见 [提速与训练监控](docx/提速与训练监控.md)。不需要重新 prepare、采样离线轨迹或安装新版本训练框架。
-
-`--performance-log on` 仅添加进程本地墙钟计时，不做 CUDA synchronize 或新增分布式通信。计时记录在 `performance/`，包含生成总耗时、权重同步、逐轮请求总耗时、CPU 卸载与 GPU 回载；它不是精确 CUDA kernel profiler，不要把四个 rank 的耗时相加当成一次更新耗时。默认关闭；`04` 默认打开，末尾可传 `--performance-log off` 关闭。
-
-`monitor_training.py` 由另一个终端启动，只读现有日志并在 `monitor/` 写派生 TensorBoard 事件。不加载 Omni、不调用 MetricX、不占用模型训练显存、不重新启用 `log_completions`。框架已有的 loss、学习率、梯度范数、KL、reward_std、`frac_reward_zero_std` 等指标仍由原 TensorBoard 日志提供；新增质量、时延、长度成本、门槛通过率、动作比例和文本样本帮助解释奖励。应将整个实验输出目录作为 TensorBoard logdir。
-
-不要把“loss 下降”或“奖励上升”单独当成翻译变好：还要看质量/时延门槛、无效率、实际译文和固定独立验证集。质量为 MetricX 代理、时延为源时间轴代理；当前并没有独立的自然度分数。
-
-训练目录记录启动配置、任务清单哈希、奖励配置/代码标识，以及 reward 诊断 JSONL。每条诊断包含完整候选轨迹、标签、时间、完整译文、各奖励项和有效性原因。原文与参考留在任务清单，不在每条日志重复存储。
-
-新增控制台阶段日志：`patch_installed`、`generation_begin`、`sync_ready`、`completion_check_begin/end`、`continuation_begin/end`、`generation_end`、`reward_begin/end`。包含 rank、当前轮次、本地请求数、组内仍活跃的进程数与耗时；不打印音频或参考文本。默认每 5 轮打印，首轮、本地活跃状态变化、空批次和最终退出也打印。排查时加 `--rollout-log-every 1` 可逐轮查看。`local_requests=0` 不代表故障：该进程已经完成自己的候选，但仍在配合同组其他进程通信。两步验收通过后可去掉该参数，恢复默认日志频率。
-
-Megatron 负责优化器、随机状态和模型 checkpoint；本入口启用了这些状态保存，并请求框架同时导出合并 HF 权重。实际产物必须以服务器保存日志和文件检查为准。
-
-恢复示例：
-
-```bash
-bash 02_train.sh \
-  /data/models/flex-sft-merged \
-  /data/flex/datasets/gspo_online_prepared/train.jsonl \
-  /data/flex/outputs/gspo_g8_001 \
-  --group-size 8 --global-batch-size 16 --train-iters 1000 \
-  --resume-from /实际的Megatron原生adapter检查点目录
-```
-
-恢复目录须有框架原生 tracker 和完整分布式 checkpoint shards，不是 HF merged 导出目录。上游也会把 tracker 和部分元信息复制到 merged 目录，因此不能只看 tracker 判断可恢复；入口已对此做检查。总训练步数和关键配置保持一致，不能把“两步 smoke”直接改成 1000 步声称无缝恢复。新实验使用新输出目录。启动身份校验包含权重元信息，不宣称已对所有权重文件做内容级哈希。
-
-### 7.2 第 68 步停滞后的最小可靠性修正
-
-服务器栈位于 vLLM 0.19.1 的 `sleep → reset_mm_cache → LRU.clear → popitem`，与缺失 key 残留在 LRU 顺序表导致的清理循环高度匹配。启动入口现在默认 `--vllm-mm-processor-cache-gb 0`，在新建引擎时关闭多模态处理/传输缓存，绕开这条清理路径。**没有关闭音频、KV prefix caching 或 sleep/offload，也没有升级框架包。** 正数覆盖会给出警告，只有确认所用框架修复且完成多步验收后才考虑重新启用。关闭缓存可能增加历史音频预处理成本，不能宣称这项本身提速。
-
-`--performance-log on`（04 默认开启）现在还写 `performance/phases-rank*-pid*.jsonl`：generation、权重同步、逐轮请求、CPU 卸载、GPU 回载和 vLLM sleep 各自都有 `begin/end`。卡住时未结束的阶段仍有 begin 记录。`vllm_sleep_seconds` 包含 SWIFT 的整个 sleep 包装与相关清理，不是单独的缓存耗时；仍不做 CUDA synchronize 或新增 collective。
-
-### 7.3 先分析已停止的旧运行，不重复推理
-
-以下为示例路径与日志 PID，请替换为实际运行对应值后执行：
-
-```bash
-cd /data/flex/FLEX-GSPO
-python3 analyze_training_run.py \
-  /data/flex/outputs/gspo_throughput_4100_001 \
-  --native-log /data/flex/outputs/gspo_throughput_4100_001/v0-20261022-173943/logging.jsonl \
-  --pids 111,112,113,114 \
-  --dataset /data/flex/datasets/gspo_online_prepared_clean/train.jsonl \
-  --reward-config /data/flex/FLEX-GSPO/configs/default.json \
-  --output-dir /data/flex/outputs/gspo_throughput_4100_001_audit_01 \
-  --window 10 \
-  --examples 2
-```
-
-这里 PID 来自旧 reward 文件名，不是宿主机 PID。脚本仅依赖 Python 标准库及本项目的轻量模块；不加载模型、不调用 MetricX、不读取 WAV、不改原日志。只扫描指定任务清单以关联少量示例的原文和机器参考。输出目录必须是新目录，重复执行请更换后缀。
-
-- `summary.json`：训练窗口、各 rank/PID 的奖励窗口、空译文/invalid 原因、同译文不同时间的对照数量、性能统计、实际保存间隔和 checkpoint 元信息。
-- `examples.jsonl`：早期/近期异常案例、相同译文不同调度，以及同任务局部候选中分差较大的对照，附原文和机器参考。它是定向诊断样本，不是随机评测集；分享前确认文本范围。
-- 只有当前配置的哈希与旧 launch identity 匹配时，才用当前公式复算旧奖励；`formula_recheck.enabled=false` 不代表检查通过。算术吻合也不证明奖励设计符合研究目标。
-- 不将一个 rank 的 8 条候选自动当作完整同源 G8；旧日志没有 callback 结束标记，最后一个连续前缀仍可能不完整。checkpoint 文件存在也不等于实际恢复成功。
-
-第二次长跑前应先完成：旧候选奖励排序审查；短 GPU 验收并验证 native checkpoint 保存/恢复；使用正式形状的较长稳定性运行，覆盖此前第 68 步的失效点。仅“两步跑通”不足以证明长跑稳定。可在第二轮显式设 `--save-steps 20` 或 `50` 减少未保存风险，但合并导出有额外时间和磁盘成本。恢复时总步数/LR horizon、数据、奖励和代码身份必须保持一致，不能把五步 smoke 改成 4100 步当作无缝恢复。
-
-## 8. 奖励与验证边界
-
-详见 [QALCO 强化学习方案详解](docx/QALCO强化学习方案详解.md)。第一版是**完整译文的 MetricX 质量 + 整条轨迹的时延预算 + 超长成本**，不是每个短块单独做完整句子评分。WAIT token 参与策略梯度；FLEX 不因尚未成句就被单独判低质量。
-
-默认时延使用所有输出单元的 mean-lag 代理，避免“把输出继续拖到 EOF，指标反而下降”的截断问题。它不是精确语义延迟，也不是 GPU 墙钟延迟。当前没有独立自然度模型、逐 WAIT 反事实分支、强制语义对齐或独立标点惩罚，不能宣称已经精确解决每一次等待是否值得。
-
-当前严格分层奖励还有需要校准的边界：`Q < 0.85` 时只比较质量，不比较时延/长度；质量通过但时延超预算时只比较时延，且达到预算两倍后饱和。因此 `Q=0.80,L=1` 和 `Q=0.80,L=12` 都得到约 `-2.0588`。`.85` 等价于 MetricX 错误分 `3.75`，不是 85% 准确率。长度项只惩罚超过参考长度 1.2 倍的输出，不独立保证地道、简洁或少碎句。本次缓存/诊断修正**没有改变奖励公式或阈值**；应先用旧候选审查这些分支的实际排序，再确定下一版，不把“实现符合公式”误认为“研究目标已充分实现”。
-
-本地运行测试：
-
-```bash
+~~~bash
 python3 -m unittest discover -s tests -v
-```
+~~~
 
-部分框架合约测试使用审查过的官方源码；其他机器可通过 `FLEX_SWIFT_SOURCE` 指定该 checkout，未提供则跳过相应源码测试。本地 CPU 测试覆盖真实 WAV + 本地 HTTP 评分替身的贯通流程；**没有执行真实 Omni 模型训练或调用用户内网 MetricX**。
+CPU测试覆盖真实WAV切片、本地HTTP、EOF原始token/mask/logprob、四rank不同结束长度模拟、退化保护、奖励数学和旧日志兼容。部分源码契约测试用本地审计过的SWIFT源码，可设置FLEX_SWIFT_SOURCE；没有该源码的机器会跳过。
 
-旧自写训练器、旧固定轨迹评分入口及对应不用的测试已从本目录移除。原作者本地修改前已另行备份，备份不随仓库发布；`Scripts`、`FLEX-GSPO-Data`、原音频、模型和已有 G8 结果没有删除。
+本轮不改训练框架安装、不删用户数据、音频、权重或旧实验。当前工作区未做GPU实训或调用内网COMET；真正的服务响应格式、模型身份、长文本截断和新EOF策略效果必须服务器验收。VAD是后续部署触发边界的机制，不代替这里的训练收尾协议。
 
-## 官方实现依据
-
-- [Megatron 多轮 GRPO 启动例子（审查提交）](https://github.com/modelscope/ms-swift/blob/f15bb91439d756d4a366b51956d72d1f088b7af6/examples/megatron/grpo/multi_turn/frozen_lake.sh)
-- [Megatron MoE colocate LoRA 例子（审查提交）](https://github.com/modelscope/ms-swift/blob/f15bb91439d756d4a366b51956d72d1f088b7af6/examples/megatron/grpo/moe_colocate_lora.sh)
-- [GSPO 官方说明](https://swift.readthedocs.io/en/latest/Instruction/GRPO/AdvancedResearch/GSPO.html)
-- [Megatron-SWIFT 参数文档](https://swift.readthedocs.io/en/latest/Megatron-SWIFT/Command-line-parameters.html)
+详见 [QALCO v2方案](docx/QALCO强化学习方案详解.md) 和 [训练监控](docx/提速与训练监控.md)。

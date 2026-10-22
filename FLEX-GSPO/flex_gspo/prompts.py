@@ -11,6 +11,16 @@ SYSTEM_PROMPT = (
 PROTOCOL_TOKEN_IDS = {"<|WAIT|>": 151676, "<|DIRECT|>": 151677, "<|FLEX|>": 151678}
 AUDIO_PLACEHOLDER = "<|audio_start|><|audio_pad|><|audio_end|>"
 
+# Environment observation, not source content or a new system instruction.
+# Used identically by the bounded training drain and a future deployment drain.
+EOF_PROMPT = (
+    "本次音频输入已结束，不会再有新的音频。这不是新增的待翻译内容。"
+    "请只根据已经听到的音频，输出此前尚未输出且有把握的新增译文，"
+    "仍使用<|FLEX|>或<|DIRECT|>标签；不要重复、修改或重译此前的译文，"
+    "不要补写未听到的信息，也不要强行补全被截断的句子。"
+    "如果没有剩余可翻译内容，只输出<|WAIT|>。"
+)
+
 
 def initial_messages():
     return [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": "<audio>"}]

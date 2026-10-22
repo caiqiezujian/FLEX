@@ -1,7 +1,7 @@
 """CPU preparation -> causal waveform rollout -> real HTTP reward integration.
 
 The policy responses are controlled test fixtures. The audio reader, scheduler
-hooks, MetricX HTTP client, QALCO scorer, and ORM delegate are real. The HTTP
+hooks, COMET22 HTTP client, QALCO scorer, and ORM delegate are real. The HTTP
 service binds only localhost; no cloud/private service or GPU is contacted.
 This does not validate model generation, backpropagation, or Megatron/vLLM.
 """
@@ -70,6 +70,7 @@ class OnlinePipelineTests(unittest.TestCase):
                 ["<|DIRECT|>胡扯", "<|WAIT|>", "<|DIRECT|>胡扯"],
                 ["<|DIRECT|>会议", "<|DIRECT|>九点开始。", "<|WAIT|>"],
             ]
+            plans = [plan + ["<|WAIT|>"] if len(plan) == 3 else plan for plan in plans]
             requests = [SimpleNamespace(messages=deepcopy(row["messages"]), audios=list(row["audios"]),
                                         data_dict={"flex_task": row["flex_task"]}, images=[], videos=[],
                                         uuid=f"candidate-{index}") for index in range(len(plans))]
@@ -79,14 +80,16 @@ class OnlinePipelineTests(unittest.TestCase):
                 for turn, text in enumerate(plan, 1):
                     # This is the same materializer called by the Swift template.
                     payloads = materialize_chunk_refs(request.audios)
-                    self.assertEqual(len(payloads), turn)
+                    self.assertEqual(len(payloads), min(turn, len(task["chunks"])))
                     waveforms = [sf.read(io.BytesIO(payload), dtype="float32")[0] for payload in payloads]
                     self.assertTrue(all(len(waveform) == 16000 for waveform in waveforms))
                     self.assertAlmostEqual(float(waveforms[0][0]), 1000 / 32768)
                     if turn == 3:
                         self.assertAlmostEqual(float(waveforms[-1][0]), 3000 / 32768)
                         self.assertTrue((waveforms[-1][4000:] == 0).all())
-                    chat = json.dumps(request.messages, ensure_ascii=False)
+                    # The actor may already have produced the reference verbatim;
+                    # only observations/instructions must not leak scoring texts.
+                    chat = json.dumps([m for m in request.messages if m["role"] != "assistant"], ensure_ascii=False)
                     self.assertNotIn(source, chat)
                     self.assertNotIn(reference, chat)
                     choice = SimpleNamespace(message=SimpleNamespace(content=text), token_ids=[10, 11],
@@ -107,7 +110,7 @@ class OnlinePipelineTests(unittest.TestCase):
                 def do_POST(self):
                     payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                     received.append((self.path, payload))
-                    scores = [0.5 if mt == reference else 20.0 for mt in payload["mts"]]
+                    scores = [0.95 if mt == reference else 0.2 for mt in payload["mts"]]
                     encoded = json.dumps({"scores": scores}).encode()
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
@@ -123,8 +126,8 @@ class OnlinePipelineTests(unittest.TestCase):
             thread.start()
             try:
                 config = load_reward_config()
-                config["reward"]["metricx"].update(service_url=f"http://127.0.0.1:{server.server_port}",
-                                                   service_id="cpu-loopback-fixture", mode="reference")
+                config["reward"]["comet22"].update(service_url=f"http://127.0.0.1:{server.server_port}/22",
+                                                    service_id="cpu-loopback-fixture")
                 reward = OnlineQalcoReward(config, log_dir=str(root / "reward_logs"))
                 scores = reward(completions, flex_task=[row["flex_task"]] * len(plans), rollout_infos=infos)
             finally:
@@ -145,7 +148,7 @@ class OnlinePipelineTests(unittest.TestCase):
             self.assertEqual(reward.last_records[5]["trajectory"]["turns"][-1]["response"], "<|WAIT|>")
             self.assertEqual(len(received), 1)
             endpoint, payload = received[0]
-            self.assertEqual(endpoint, "/metricx24")
+            self.assertEqual(endpoint, "/22")
             self.assertEqual(payload, {"srcs": [source, source], "mts": [reference, "胡扯胡扯"],
                                        "refs": [reference, reference]})
             self.assertEqual(infos[0]["audios"], requests[0].audios)

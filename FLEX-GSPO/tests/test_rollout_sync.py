@@ -185,49 +185,51 @@ class FourRankRolloutTests(unittest.TestCase):
             self.assertFalse(any(thread.is_alive() for thread in threads), "Simulator must never leave hung threads")
         return collective, results, errors
 
-    def assert_preserved(self, results, expected_turns, invalid_ranks=()):
-        for rank, turns in enumerate(expected_turns):
-            if not turns:
+    def assert_preserved(self, results, expected_audio_turns, invalid_ranks=()):
+        for rank, audio_turns in enumerate(expected_audio_turns):
+            if not audio_turns:
                 self.assertEqual(results[rank], [])
                 continue
+            turns = audio_turns if rank in invalid_ranks else audio_turns + 1
             result, = results[rank]
             self.assertEqual(result.rollout_infos["num_turns"], turns)
-            self.assertEqual(len(result.rollout_infos["audios"]), turns)
+            self.assertEqual(len(result.rollout_infos["audios"]), audio_turns)
             self.assertEqual(result.response_loss_mask, [[1, 1]] * turns)
             self.assertEqual(result.rollout_logprobs, [[-.1, -.1]] * turns)
             self.assertEqual(result.response_token_ids,
                              ([[3, 151645]] if rank in invalid_ranks else [[151676, 151645]] * turns))
             self.assertEqual(result.rollout_infos["flex_trajectory"]["valid"], rank not in invalid_ranks)
+            self.assertEqual(result.rollout_infos["flex_trajectory"]["episode_complete"], rank not in invalid_ranks)
 
     def test_old_two_rank_termination_breaks_four_rank_inference(self):
         collective, results, errors = self.run_case([1, 1, 3, 4], OLD_GROUPS)
         self.assertEqual(set(results), {0, 1})
         self.assertEqual(set(errors), {2, 3})
         self.assertTrue(all(isinstance(error, CollectiveParticipationError) for error in errors.values()))
-        self.assertEqual(collective.inference_calls[0], [[]])
-        self.assertEqual(collective.inference_calls[1], [[]])
+        self.assertEqual(collective.inference_calls[0], [[1], []])
+        self.assertEqual(collective.inference_calls[1], [[1], []])
 
     def test_four_rank_termination_keeps_completed_ranks_participating(self):
         collective, results, errors = self.run_case([1, 1, 3, 4])
         self.assertEqual(errors, {})
         self.assert_preserved(results, [1, 1, 3, 4])
-        self.assertEqual(collective.inference_calls[0], [[], [], [], []])
-        self.assertEqual(collective.inference_calls[1], [[], [], [], []])
-        self.assertEqual(collective.inference_calls[2], [[2], [3], [], []])
-        self.assertEqual(collective.inference_calls[3], [[2], [3], [4], []])
+        self.assertEqual(collective.inference_calls[0], [[1], [], [], [], []])
+        self.assertEqual(collective.inference_calls[1], [[1], [], [], [], []])
+        self.assertEqual(collective.inference_calls[2], [[2], [3], [3], [], []])
+        self.assertEqual(collective.inference_calls[3], [[2], [3], [4], [4], []])
 
     def test_rank_with_no_initial_requests_still_participates(self):
         collective, results, errors = self.run_case([0, 1, 3, 4])
         self.assertEqual(errors, {})
         self.assert_preserved(results, [0, 1, 3, 4])
-        self.assertEqual(collective.inference_calls[0], [[], [], [], []])
+        self.assertEqual(collective.inference_calls[0], [[], [], [], [], []])
 
     def test_invalid_early_stop_is_not_regenerated_or_dropped(self):
         collective, results, errors = self.run_case([4, 1, 3, 4], invalid_ranks={0})
         self.assertEqual(errors, {})
         self.assert_preserved(results, [1, 1, 3, 4], invalid_ranks={0})
         self.assertFalse(results[0][0].rollout_infos["flex_trajectory"]["complete_input"])
-        self.assertEqual(collective.inference_calls[0], [[], [], [], []])
+        self.assertEqual(collective.inference_calls[0], [[], [], [], [], []])
 
     def test_all_empty_ranks_exit_without_inference(self):
         collective, results, errors = self.run_case([0, 0, 0, 0])

@@ -65,7 +65,7 @@ def compact(record):
     traj = record.get("trajectory") or {}
     return {"reward": record.get("reward"), "components": record.get("components", {}),
             "trajectory": {"complete_input": traj.get("complete_input"), "turns": [
-                {"response": slim_response(t.get("response", ""))}
+                {"response": slim_response(t.get("response", "")), "kind": t.get("kind", "audio")}
                 for t in traj.get("turns", [])]}}
 
 

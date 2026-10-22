@@ -147,21 +147,23 @@ def _summary(values):
 def reward_summary(records):
     """Local callback summaries only; no inferred global G8 groups/advantages."""
     result = {"candidates": len(records)}
-    scalar_fields = ("quality", "metricx_error", "latency_seconds", "mean_lag_seconds", "length_penalty")
+    scalar_fields = ("quality", "metricx_error", "comet22_score", "latency_seconds", "mean_lag_seconds", "length_penalty")
     for key in ("reward", *scalar_fields):
         values = [r.get("reward") if key == "reward" else r.get("components", {}).get(key) for r in records]
         for name, value in _summary([float(v) for v in values if number(v)]).items():
             result[key + "/" + name] = value
         result[key + "/scored_count"] = sum(number(v) for v in values)
-    for key in ("first_output_seconds", "max_no_text_gap_seconds", "eof_text_fraction", "emitted_units", "reference_units"):
+    for key in ("first_output_seconds", "max_no_text_gap_seconds", "eof_text_fraction", "emitted_units", "reference_units",
+                "eof_generation_seconds", "eof_delay_proxy_seconds"):
         values = [(r.get("components", {}).get("diagnostics") or {}).get(key) for r in records]
         for name, value in _summary([float(v) for v in values if number(v)]).items():
             result["diagnostics/" + key + "/" + name] = value
-    for flag in ("protocol_valid", "empty_translation", "quality_pass", "latency_pass", "feasible"):
+    for flag in ("protocol_valid", "empty_translation", "quality_pass", "latency_pass", "feasible", "severe_repetition"):
         result[flag + "_fraction"] = sum(r.get("components", {}).get(flag) is True for r in records) / len(records)
-    for tier in ("feasible", "quality_fail", "latency_fail", "invalid"):
+    for tier in ("feasible", "quality_fail", "latency_fail", "invalid", "degenerate"):
         result["tier/" + tier + "_fraction"] = sum(r.get("components", {}).get("tier") == tier for r in records) / len(records)
     actions = Counter()
+    eof_actions = Counter()
     complete = complete_known = final_wait = 0
     for record in records:
         trajectory = record.get("trajectory") or {}
@@ -171,7 +173,13 @@ def reward_summary(records):
         if turns and turns[-1].get("response", "").strip() == "<|WAIT|>":
             final_wait += 1
         for turn in turns:
-            actions[action_label(turn.get("response", ""))] += 1
+            counter = eof_actions if turn.get("kind") == "eof" else actions
+            counter[action_label(turn.get("response", ""))] += 1
+    eof_count = sum(eof_actions.values())
+    result["eof_completed_count"] = eof_count
+    if eof_count:
+        for action in ("WAIT", "FLEX", "DIRECT", "UNRECOGNIZED"):
+            result["eof_actions/" + action + "_fraction"] = eof_actions[action] / eof_count
     result["complete_input_known_count"] = complete_known
     if complete_known:
         result["complete_input_fraction"] = complete / complete_known
@@ -307,7 +315,7 @@ class Monitor:
                         # long translations, source text or complete raw turns.
                         slim = {k: row.get(k) for k in ("reward", "components", "call", "global_step", "timestamp_unix")}
                         slim["trajectory"] = {"complete_input": row["trajectory"].get("complete_input"),
-                                              "turns": [{"response": slim_response(t["response"])}
+                                              "turns": [{"response": slim_response(t["response"]), "kind": t.get("kind", "audio")}
                                                                for t in (row.get("trajectory") or {}).get("turns", [])]}
                         pending["rows"].append(slim)
                         dirty = True

@@ -99,8 +99,8 @@ class TestMegatronLauncher(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "rollout-log-every"):
             launcher.build_command(self.args("--rollout-log-every", "0"))
 
-    def test_formal_4100_recipe_keeps_accepted_batch_and_disables_audio_log_reencode(self):
-        script = (ROOT / "03_train_4100.sh").read_text(encoding="utf-8")
+    def test_formal_3000_recipe_keeps_accepted_batch_and_disables_audio_log_reencode(self):
+        script = (ROOT / "03_train_3000.sh").read_text(encoding="utf-8")
         command = script[script.index("exec bash "):].replace("\\\n", " ")
         tokens = shlex.split(command)
         self.assertEqual(tokens[:2], ["exec", "bash"])
@@ -108,9 +108,9 @@ class TestMegatronLauncher(unittest.TestCase):
         self.assertEqual(tokens[-1], "$@")
         a = self.args(*tokens[3:-1])
         cmd = launcher.build_command(a)
-        for flag, expected in (("--train_iters", "4100"), ("--num_generations", "8"),
+        for flag, expected in (("--train_iters", "3000"), ("--num_generations", "8"),
                                ("--global_batch_size", "32"), ("--micro_batch_size", "1"),
-                               ("--steps_per_generation", "1"), ("--save_steps", "100"),
+                               ("--steps_per_generation", "1"), ("--save_steps", "500"),
                                ("--save_total_limit", "3"), ("--log_completions", "false"),
                                ("--offload_model", "true"), ("--offload_optimizer", "true")):
             self.assertEqual(cmd[cmd.index(flag) + 1], expected)
@@ -134,8 +134,8 @@ class TestMegatronLauncher(unittest.TestCase):
             self.assertEqual(tokens[2], "${SCRIPT_DIR}/" + target)
             self.assertEqual(tokens[-1], "$@")
             return tokens[3:-1]
-        stable = options("03_train_4100.sh", "02_train.sh")
-        fast = options("04_train_throughput.sh", "03_train_4100.sh")
+        stable = options("03_train_3000.sh", "02_train.sh")
+        fast = options("04_train_throughput.sh", "03_train_3000.sh")
         a = self.args(*stable, *fast)
         command = launcher.build_command(a)
         baseline = launcher.build_command(self.args(*stable))
@@ -147,7 +147,7 @@ class TestMegatronLauncher(unittest.TestCase):
         self.assertEqual({k for k in before if before[k] != after[k]},
                          {"--micro_batch_size", "--vllm_max_num_seqs", "--vllm_gpu_memory_utilization"})
         self.assertEqual((a.group_size, a.global_batch_size, a.micro_batch_size,
-                          a.vllm_max_num_seqs, a.vllm_memory, a.train_iters), (8, 32, 2, 32, 0.5, 4100))
+                          a.vllm_max_num_seqs, a.vllm_memory, a.train_iters), (8, 32, 2, 32, 0.5, 3000))
         self.assertEqual(a.performance_log, "on")
         self.assertEqual(launcher.build_environment(a)["FLEX_PERF_LOG_DIR"],
                          str(Path(a.output).resolve() / "performance"))

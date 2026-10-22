@@ -1,16 +1,28 @@
 {
   "reward": {
     "provider": "qalco",
-    "quality_floor": 0.85,
+    "version": 2,
+    "quality_provider": "comet22",
+    "quality_floor": 0.80,
+    "eof_delay_seconds": 0.5,
     "latency_metric": "mean_lag",
-    "latency_budget_seconds": 3,
+    "latency_budget_seconds": 3.0,
     "reference_length_ratio": 1.2,
     "latency_weight": 0.2,
     "length_weight": 0.1,
+    "comet22": {
+      "backend": "service",
+      "service_url": "http://10.185.1.72:6668/22",
+      "service_id": "comet22-internal-6668",
+      "model_id": "Unbabel/wmt22-comet-da",
+      "response_key": "scores",
+      "timeout_seconds": 300,
+      "max_attempts": 2
+    },
     "metricx": {
       "backend": "service",
-      "service_url": "",
-      "service_id": "",
+      "service_url": "http://10.185.1.72:16999",
+      "service_id": "metricx24-internal-16999",
       "mode": "reference"
     }
   }

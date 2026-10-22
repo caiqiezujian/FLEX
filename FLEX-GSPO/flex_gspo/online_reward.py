@@ -23,6 +23,7 @@ from .qalco import QalcoScorer, validate_settings, validate_task
 from .protocol import collect_translation
 from .rewards import RewardError
 from .rollout_sync import progress
+from .trajectory import validate_turn_schedule
 
 
 LOG = logging.getLogger("flex.online_reward")
@@ -79,11 +80,11 @@ def _trajectory(info, task):
             raise RewardError("Scheduler turn.response must preserve the raw string")
         if turn["finish_reason"] not in ("stop", "eos", "length"):
             raise RewardError("Scheduler turn.finish_reason is not a supported generation result")
-        end = turn["audio_end_seconds"]
-        if (isinstance(end, bool) or not isinstance(end, (int, float))
-                or not math.isfinite(end) or index >= len(task["chunks"])
-                or abs(end - task["chunks"][index]["end_seconds"]) > 1 / 16000 + 1e-6):
-            raise RewardError("Scheduler trajectory timing disagrees with task chunk schedule")
+    schedule = validate_turn_schedule(task, turns)
+    if trajectory.get("schema_version") == 2:
+        for flag in ("complete_input", "episode_complete", "eof_completed"):
+            if type(trajectory.get(flag)) is not bool or trajectory[flag] != schedule[flag]:
+                raise RewardError(f"Scheduler trajectory {flag} disagrees with turn schedule")
     trajectory["error"] = trajectory.get("invalid_reason") or trajectory.get("error")
     return trajectory
 
@@ -105,9 +106,10 @@ class OnlineQalcoReward:
         self._calls = 0
         self._log_lock = threading.Lock()
         LOG.warning(
-            "QALCO online thresholds are exploratory: MetricX quality is a proxy, not accuracy; "
+            "QALCO online thresholds are exploratory: %s quality is a proxy, not accuracy; "
             "latency=%s is a source-clock scheduling proxy, not semantic or wall-clock delay. "
-            "No offline candidate/calibration artifact is required.", self.settings["latency_metric"])
+            "Inspect fixed validation outputs; synthetic service probes are not quality certification.",
+            self.settings["quality_provider"], self.settings["latency_metric"])
 
     def __call__(self, completions, flex_task=None, rollout_infos=None, **kwargs):
         if not isinstance(completions, (list, tuple)):
@@ -133,6 +135,9 @@ class OnlineQalcoReward:
             task = _object(raw_task, "flex_task item")
             validate_task(task)
             trajectory = _trajectory(info, task)
+            if self.settings["version"] == 2 and (type(trajectory.get("schema_version")) is not int
+                                                  or trajectory["schema_version"] != 2):
+                raise RewardError("QALCO v2 requires scheduler schema_version=2; refusing legacy/mixed rollout deployment")
             # ID alone is insufficient: a corrupt manifest may reuse an ID
             # with different text/audio/timing. Full canonical data is safer.
             try:
@@ -159,6 +164,8 @@ class OnlineQalcoReward:
                     translation = None  # Preserve bad raw responses; never repair.
                 records[index] = {
                     "task_id": group["task"].get("id"),
+                    "duration_seconds": group["task"]["duration_seconds"],
+                    "reward_version": self.settings["version"],
                     **{name: values[index] for name, values in identities.items()},
                     "candidate_index_in_local_batch": index,
                     "trajectory": copy.deepcopy(trajectory), "translation": translation, **score,
@@ -176,6 +183,8 @@ class OnlineQalcoReward:
         rank = "".join(c for c in rank if c.isalnum() or c in "-_") or "0"
         path = Path(self.log_dir) / f"rewards-rank{rank}-pid{os.getpid()}.jsonl"
         envelope = {"timestamp_unix": time.time(), "call": self._calls,
+                    "run_id": os.environ.get("FLEX_RUN_ID"),
+                    "session_id": os.environ.get("FLEX_SESSION_ID"),
                     "global_step": getattr(trainer_state, "global_step", None)}
         try:
             with self._log_lock:

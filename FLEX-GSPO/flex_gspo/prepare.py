@@ -38,9 +38,9 @@ class PreparationError(ValueError):
 
 @dataclass(frozen=True)
 class PrepareOptions:
-    input_jsonl: str = "/data/flex/datasets/1019/en2zh_train_gspo_1.jsonl"
-    audio_dir: str = "/data/flex/datasets/data_001"
-    output_dir: str = "/data/flex/datasets/gspo_online_prepared"
+    input_jsonl: str = "/data/yb/Flex/datasets/1019/en2zh_train_gspo_1.jsonl"
+    audio_dir: str = "/data/yb/Flex/datasets/data_001"
+    output_dir: str = "/data/yb/Flex/datasets/gspo_online_prepared"
     chunk_seconds: int = 1
     workers: int = 8
     progress_seconds: float = 5.0

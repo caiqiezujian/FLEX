@@ -18,8 +18,8 @@ import unittest
 from unittest.mock import patch
 
 from flex_gspo.audio import encode_chunk_ref
-from flex_gspo.online import FlexStreamHooks
-from flex_gspo.prompts import initial_messages
+from flex_gspo.online import FlexStreamHooks, STATE_KEY
+from flex_gspo.prompts import EOF_PROMPT, initial_messages
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -94,7 +94,7 @@ class ActualUpstreamContractTests(unittest.TestCase):
     def test_real_driver_preserves_all_turn_ids_masks_logprobs_and_audio(self):
         scheduler_type = type("TestScheduler", (FlexStreamHooks, self.ns["MultiTurnScheduler"]), {})
         scheduler = scheduler_type(tokenizer=Tokenizer(), template=SimpleNamespace(_get_response_prefix=lambda _: ""),
-                                   max_turns=3)
+                                   max_turns=4)
         requests = [request("normal"), request("bad")]
         asyncio.run(scheduler.on_trajectory_start(requests))
         first = [output([151676, 151645], "<|WAIT|>"), output([3, 151645], "BAD")]
@@ -109,23 +109,30 @@ class ActualUpstreamContractTests(unittest.TestCase):
                 if len(req.audios) == 2:
                     self.assertEqual(req.messages[2]["content"], [151676, 151645])
                     results.append(output([151678, 1, 151645], "<|FLEX|>你好"))
-                else:
+                elif len(req.data_dict[STATE_KEY]["turns"]) == 2:
                     self.assertEqual(len(req.audios), 3)
                     self.assertEqual(req.messages[4]["content"], [151678, 1, 151645])
                     results.append(output([151677, 2, 151645], "<|DIRECT|>世界。"))
+                else:
+                    self.assertEqual(len(req.audios), 3)
+                    self.assertEqual(req.messages[-1], {"role": "user", "content": EOF_PROMPT})
+                    self.assertEqual(req.messages[-2]["content"], [151677, 2, 151645])
+                    results.append(output([151676, 151645], "<|WAIT|>"))
             return results
 
         with patch.dict("sys.modules", {"swift.template": SimpleNamespace(StdTemplateInputs=lambda **kw: SimpleNamespace(**kw))}):
-            outputs = self.ns["run_multi_turn"](requests, first, scheduler, generate, SimpleNamespace(), max_turns=3)
+            outputs = self.ns["run_multi_turn"](requests, first, scheduler, generate, SimpleNamespace(), max_turns=4)
         normal, bad = outputs
-        self.assertEqual(normal.response_token_ids, [[151676, 151645], [151678, 1, 151645], [151677, 2, 151645]])
-        self.assertEqual(normal.response_loss_mask, [[1, 1], [1, 1, 1], [1, 1, 1]])
-        self.assertEqual([len(lp) for lp in normal.rollout_logprobs], [2, 3, 3])
+        self.assertEqual(normal.response_token_ids, [[151676, 151645], [151678, 1, 151645],
+                                                    [151677, 2, 151645], [151676, 151645]])
+        self.assertEqual(normal.response_loss_mask, [[1, 1], [1, 1, 1], [1, 1, 1], [1, 1]])
+        self.assertEqual([len(lp) for lp in normal.rollout_logprobs], [2, 3, 3, 2])
         self.assertEqual(len(normal.rollout_infos["audios"]), 3)
         self.assertTrue(normal.rollout_infos["flex_trajectory"]["complete_input"])
+        self.assertTrue(normal.rollout_infos["flex_trajectory"]["episode_complete"])
         self.assertFalse(bad.rollout_infos["flex_trajectory"]["valid"])
         self.assertEqual(bad.response_loss_mask, [[1, 1]])  # Invalid policy output is NOT hidden.
-        self.assertEqual(seen, [[2], [3], []])
+        self.assertEqual(seen, [[2], [3], [3], []])
 
         # Run actual upstream sample merge: it MUST transfer all observed audio.
         ns = {"dataclass": dataclass, "field": field, "fields": fields, "copy": copy,

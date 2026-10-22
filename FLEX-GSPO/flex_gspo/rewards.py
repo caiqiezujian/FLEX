@@ -1,6 +1,7 @@
 """QALCO reward entry points.
 
-Quality comes exclusively from the separate MetricX text-scoring service.
+Quality comes from the separate COMET22 service in v2. MetricX v1 remains
+available only to reproduce historical stopped-run diagnostics.
 Infrastructure failures must never become bad-policy rewards or fake quality.
 The ``qalco`` provider combines quality, latency and length cost into a
 complete-trajectory reward without loading MetricX on the training GPUs.

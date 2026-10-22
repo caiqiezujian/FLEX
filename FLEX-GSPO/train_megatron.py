@@ -16,6 +16,7 @@ from pathlib import Path
 import shlex
 import subprocess
 import sys
+import uuid
 
 ROOT = Path(__file__).resolve().parent
 AUDITED_SWIFT_COMMIT = "f15bb91439d756d4a366b51956d72d1f088b7af6"
@@ -32,8 +33,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--global-batch-size", type=int, default=16)
     p.add_argument("--micro-batch-size", type=int, default=1)
     p.add_argument("--steps-per-generation", type=int, default=1)
-    p.add_argument("--train-iters", type=int, default=1000)
-    p.add_argument("--max-turns", type=int, default=64)
+    p.add_argument("--train-iters", type=int, default=3000)
+    p.add_argument("--max-turns", type=int, default=65, help="Includes one EOF text round; 65 allows 64 audio chunks")
     p.add_argument("--max-chunk-seconds", type=float, default=2.0, help="vLLM audio profiling length cap; must cover prepared input_seconds")
     p.add_argument("--image-slots", type=int, choices=(0, 1), default=1,
                    help="Keep one image profiling slot for accepted Omni initialization compatibility; requests stay audio-only")
@@ -44,7 +45,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--lora-rank", type=int, default=8)
     p.add_argument("--lora-alpha", type=float, default=32.0)
-    p.add_argument("--save-steps", type=int, default=50)
+    p.add_argument("--save-steps", type=int, default=500)
     p.add_argument("--vllm-memory", type=float, default=0.40)
     p.add_argument("--vllm-max-num-seqs", type=int, default=16)
     p.add_argument("--vllm-mm-processor-cache-gb", type=float, default=0.0,
@@ -217,8 +218,8 @@ def validate_local_inputs(a: argparse.Namespace) -> dict:
                 raise ValueError(f"Line {line_number}: initial actor input differs from SFT prompt + first virtual audio chunk")
             if row.get("images") or row.get("videos"):
                 raise ValueError(f"Line {line_number}: audio-only training cannot contain images/videos")
-            if len(task["chunks"]) > a.max_turns:
-                raise ValueError(f"Line {line_number}: task needs {len(task['chunks'])} turns but --max-turns={a.max_turns}")
+            if len(task["chunks"]) + 1 > a.max_turns:
+                raise ValueError(f"Line {line_number}: task needs {len(task['chunks']) + 1} turns including EOF but --max-turns={a.max_turns}")
             if any(chunk["input_seconds"] > a.max_chunk_seconds for chunk in task["chunks"]):
                 raise ValueError(f"Line {line_number}: audio chunk exceeds --max-chunk-seconds={a.max_chunk_seconds}")
             count += 1
@@ -337,18 +338,26 @@ def main(argv: list[str] | None = None) -> int:
         manifest = validate_local_inputs(a)
         plan["run_identity"] = run_identity(a, manifest)
         verify_resume_identity(a, plan["run_identity"])
-        # Fail before launching four GPU workers if the remote scorer is unreachable.
-        subprocess.run([sys.executable, str(ROOT / "check_metricx_service.py"), "--config", a.reward_config], env=env, check=True)
+        from flex_gspo.online_reward import load_reward_config
+        from flex_gspo.qalco import validate_settings
+        settings = validate_settings(load_reward_config(a.reward_config))
+        if settings["version"] != 2:
+            raise ValueError("New training requires QALCO v2 / COMET22 / EOF. v1 is retained for historical audit only.")
+        # Fail before GPU initialization; check both transport and basic semantic ordering.
+        subprocess.run([sys.executable, str(ROOT / "check_comet22_service.py"), "--config", a.reward_config], env=env, check=True)
         subprocess.run([sys.executable, str(ROOT / "check_environment.py"), "--model", a.model,
                         "--require-training", "--required-gpus", "4"], env=env, check=True)
         output = Path(a.output)
         output.mkdir(parents=True, exist_ok=True)
         stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+        env["FLEX_RUN_ID"] = hashlib.sha256(json.dumps(plan["run_identity"], sort_keys=True).encode()).hexdigest()
+        env["FLEX_SESSION_ID"] = uuid.uuid4().hex
+        plan.update(run_id=env["FLEX_RUN_ID"], session_id=env["FLEX_SESSION_ID"])
         with (output / f"launch_{stamp}.json").open("x", encoding="utf-8") as f:
             json.dump(plan, f, ensure_ascii=False, indent=2)
         print("[launch] Starting four ranks; fresh online rollouts, no offline candidate file.", flush=True)
         return subprocess.run(cmd, env=env, check=False).returncode
-    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
         print(f"[launch] ERROR: {exc}", file=sys.stderr, flush=True)
         return 2
 

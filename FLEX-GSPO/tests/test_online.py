@@ -14,7 +14,7 @@ import unittest
 
 from flex_gspo.audio import encode_chunk_ref
 from flex_gspo.online import FlexStreamHooks, STATE_KEY, unpack_task
-from flex_gspo.prompts import SYSTEM_PROMPT, initial_messages
+from flex_gspo.prompts import EOF_PROMPT, SYSTEM_PROMPT, initial_messages
 
 
 def task_fixture():
@@ -83,19 +83,23 @@ class OnlineHooksTests(unittest.TestCase):
         self.assertEqual(len(result["rollout_infos"]["audios"]), 1)
 
     def test_final_wait_is_valid_and_complete_not_a_forced_translation(self):
-        for turn in range(1, 4):
+        for turn in range(1, 5):
             choice, result = self.observe(turn=turn)
-            if turn < 3:
+            if turn < 4:
                 self.hooks.step(self.request, choice, turn)
         trajectory = result["rollout_infos"]["flex_trajectory"]
         self.assertTrue(result["done"])
         self.assertTrue(trajectory["valid"])
         self.assertTrue(trajectory["complete_input"])
+        self.assertTrue(trajectory["episode_complete"])
+        self.assertTrue(trajectory["eof_completed"])
+        self.assertEqual(trajectory["turns"][-1]["kind"], "eof")
+        self.assertGreaterEqual(trajectory["eof_elapsed_seconds"], 0)
         self.assertEqual(trajectory["turns"][-1]["response"], "<|WAIT|>")
         self.assertEqual(trajectory["turns"][-1]["audio_end_seconds"], 2.25)
         self.assertEqual(len(result["rollout_infos"]["audios"]), 3)
         with self.assertRaises(RuntimeError):
-            self.hooks.step(self.request, choice, 3)
+            self.hooks.step(self.request, choice, 4)
 
     def test_flex_then_direct_are_preserved_without_sentence_repair(self):
         outputs = ("<|FLEX|>这场会议", "<|DIRECT|>将在周末", "<|DIRECT|>举行。")
@@ -163,7 +167,7 @@ class OnlineHooksTests(unittest.TestCase):
 
     def test_context_and_task_contract_fail_before_first_inference(self):
         self.hooks.max_turns = 2
-        with self.assertRaisesRegex(ValueError, "needs 3 turns"):
+        with self.assertRaisesRegex(ValueError, "needs 4 turns"):
             asyncio.run(self.hooks.on_trajectory_start([request_fixture()]))
         self.hooks.max_turns = 40
         request = request_fixture()
@@ -264,7 +268,8 @@ class UpstreamRolloutDriverContractTests(unittest.TestCase):
         plans = {
             "candidate-a": [("<|WAIT|>", [151676, 151645]),
                             ("<|FLEX|>会议", [151678, 201, 151645]),
-                            ("<|DIRECT|>开始。", [151677, 202, 151645])],
+                            ("<|DIRECT|>开始。", [151677, 202, 151645]),
+                            ("<|WAIT|>", [151676, 151645])],
             "candidate-b": [("bad-tag-output", [203, 151645])],
         }
         token_to_text = {tuple(ids): text for plan in plans.values() for text, ids in plan}
@@ -285,10 +290,13 @@ class UpstreamRolloutDriverContractTests(unittest.TestCase):
             calls.append([request.uuid for request in active_requests])
             outputs = []
             for request in active_requests:
-                turn = len(request.audios) - 1
+                turn = len(request.data_dict[STATE_KEY]["turns"])
                 if turn:
                     assistants = [message for message in request.messages if message["role"] == "assistant"]
                     self.assertTrue(all(isinstance(message["content"], list) for message in assistants))
+                if turn == 3:
+                    self.assertEqual(request.messages[-1], {"role": "user", "content": EOF_PROMPT})
+                    self.assertEqual(len(request.audios), 3)
                 text, ids = plans[request.uuid][turn]
                 choice = choice_fixture(text, ids)
                 outputs.append(Output(response=SimpleNamespace(choices=[choice])))
@@ -298,11 +306,12 @@ class UpstreamRolloutDriverContractTests(unittest.TestCase):
         outputs = namespace["run_multi_turn"](requests, first, scheduler, rollout_fn, None, max_turns=40)
         first_output, invalid_output = outputs
         self.assertEqual(first_output.response_token_ids, [ids for _, ids in plans["candidate-a"]])
-        self.assertEqual(first_output.response_loss_mask, [[1, 1], [1, 1, 1], [1, 1, 1]])
-        self.assertEqual(first_output.rollout_logprobs, [[-0.2, -0.2], [-0.2] * 3, [-0.2] * 3])
+        self.assertEqual(first_output.response_loss_mask, [[1, 1], [1, 1, 1], [1, 1, 1], [1, 1]])
+        self.assertEqual(first_output.rollout_logprobs, [[-0.2, -0.2], [-0.2] * 3, [-0.2] * 3, [-0.2] * 2])
         self.assertEqual(first_output.rollout_infos["audios"], [encode_chunk_ref(task_fixture(), i) for i in range(3)])
-        self.assertEqual(first_output.rollout_infos["num_turns"], 3)
+        self.assertEqual(first_output.rollout_infos["num_turns"], 4)
         self.assertTrue(first_output.rollout_infos["flex_trajectory"]["complete_input"])
+        self.assertTrue(first_output.rollout_infos["flex_trajectory"]["episode_complete"])
         self.assertFalse(invalid_output.rollout_infos["flex_trajectory"]["valid"])
         self.assertEqual(invalid_output.rollout_infos["num_turns"], 1)
         self.assertEqual(calls[:3], [["candidate-a", "candidate-b"], ["candidate-a"], ["candidate-a"]])

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Formal G8/B32 run, using the same trainer as 02_train.sh.
-# Usage: bash 03_train_4100.sh /model /prepared/train.jsonl /new/output [options]
+# Usage: bash 03_train_3000.sh /model /prepared/train.jsonl /new/output [options]
 # Activate the accepted training environment before calling this script.
 # Extra options at the end may override this recipe; --dry-run is supported.
 set -euo pipefail
@@ -19,8 +19,8 @@ exec bash "${SCRIPT_DIR}/02_train.sh" \
   --global-batch-size 32 \
   --micro-batch-size 1 \
   --steps-per-generation 1 \
-  --train-iters 4100 \
-  --save-steps 100 \
+  --train-iters 3000 \
+  --save-steps 500 \
   --lr 1e-6 \
   --kl-beta 0.01 \
   --temperature 1.0 \
@@ -28,9 +28,11 @@ exec bash "${SCRIPT_DIR}/02_train.sh" \
   --lora-alpha 32 \
   --max-length 8192 \
   --max-new-tokens 128 \
-  --max-turns 64 \
+  --max-turns 65 \
   --vllm-memory 0.4 \
   --vllm-max-num-seqs 16 \
+  --vllm-mm-processor-cache-gb 0 \
+  --performance-log on \
   --dataset-num-proc 4 \
   --rollout-log-every 5 \
   "$@"

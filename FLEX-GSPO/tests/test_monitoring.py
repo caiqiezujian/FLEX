@@ -36,6 +36,19 @@ def record(call=1, reward=.5, step=0):
 
 
 class MonitorTests(unittest.TestCase):
+    def test_eof_wait_is_separate_from_audio_policy_actions(self):
+        row = record()
+        row["components"].update(comet22_score=.91, severe_repetition=True, tier="degenerate")
+        row["trajectory"]["turns"].append({"kind": "eof", "response": "<|WAIT|>",
+                                            "audio_end_seconds": 3.})
+        summary = reward_summary([row])
+        self.assertAlmostEqual(summary["actions/WAIT_fraction"], 1 / 3)
+        self.assertEqual(summary["eof_actions/WAIT_fraction"], 1)
+        self.assertEqual(summary["eof_completed_count"], 1)
+        self.assertEqual(summary["comet22_score/mean"], .91)
+        self.assertEqual(summary["severe_repetition_fraction"], 1)
+        self.assertEqual(summary["tier/degenerate_fraction"], 1)
+
     def test_slim_action_state_drops_raw_prose_and_keeps_invalid_wait_distinct(self):
         self.assertEqual(slim_response("secret words without a tag"), "[unrecognized]")
         self.assertEqual(slim_response(" <|FLEX|>abc"), "<|FLEX|>[text]")
