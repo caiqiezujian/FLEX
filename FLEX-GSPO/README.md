@@ -181,6 +181,23 @@ monitor是常驻进程；TensorBoard在第三个终端运行。暴露端口时�
 
 final_wait_fraction可能是“已译完后的正常EOF WAIT”，不等于整条空译文。各rank回调汇总不是完整全局G8组；不要用局部8条就断言全部候选相同。run_id/session_id用于避免重启日志混淆。
 
+训练到20～30步时，可在另一个终端用标准库诊断脚本提取可发送的文本快照，不需要停止训练：
+
+~~~bash
+cd /data/yb/Code/FLEX/FLEX-GSPO
+
+python3 collect_training_status.py \
+  /data/yb/FLEX/outputs/gspo_comet22_g8_b32_3000_001 \
+  --dataset /data/yb/FLEX/datasets/gspo_online_prepared_clean/train.jsonl \
+  --reward-config /data/yb/Code/FLEX/FLEX-GSPO/configs/default.json \
+  --window 10 \
+  --examples 3 \
+  --gpu-ids 0,1,2,3 \
+  --output /data/yb/FLEX/outputs/gspo_comet22_g8_b32_3000_001/diagnostics/status_20_30_steps_001.txt
+~~~
+
+该脚本只用Python标准库，不需要训练环境、TensorBoard、PyTorch或评分服务，只需在能读取这些绝对路径的宿主机或容器运行。报告同时打印到终端、写入指定新文件；再次采集请改文件名为002，避免覆盖。报告包含最近5步、前后两个局部窗口、COMET22/奖励/空输出/严重复读/WAIT及EOF指标、各rank阶段耗时与少量原文/机器参考/译文样例。每个JSONL仅读取最后16MiB，尾部半行忽略；若回调窗口不足，报告会显示实际数量。当前session由最新launch记录选择，未确认结束的局部奖励回调不进入摘要。样例是诊断选取，不能作为随机评估或全局G8统计。`--gpu-ids`查询整卡占用，包含其他进程；不传即可跳过GPU采样。
+
 固定验证音频对比SFT与checkpoint，抽查事实/数字/否定、漏译、自然性、复读、输出时机。reward上升或loss下降都不能单独证明翻译变好；COMET22若用于训练，也不能再当完全独立的效果证据。
 
 ## 9. 测试与范围
