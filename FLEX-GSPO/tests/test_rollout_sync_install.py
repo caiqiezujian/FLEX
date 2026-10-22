@@ -10,10 +10,12 @@ import ast
 import asyncio
 from contextlib import nullcontext
 import inspect
+import json
 import os
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 import unittest
+import tempfile
 from unittest.mock import patch
 
 from flex_gspo.online import FlexStreamHooks
@@ -163,6 +165,24 @@ class RolloutSyncInstallTests(unittest.TestCase):
         self.assertIs(module.MegatronRolloutMixin._generate_completions, installed_generate)
         self.assertEqual(self.run_generate(self.trainer(module)), ["first-output"])
         self.assertEqual(module.state.driver_calls, 1)
+
+    def test_optional_telemetry_preserves_real_upstream_generation_collectives(self):
+        module = self.make_module()
+        trainer = self.trainer(module)
+        # A class-level method models upstream, rather than the other tests'
+        # deliberately instance-level stub, so the telemetry wrapper can bind.
+        module.MegatronRolloutMixin._rollout_requests = lambda self, requests, config: list(requests)
+        del trainer._rollout_requests
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"FLEX_PERF_LOG_DIR": directory}):
+            self.install(module)
+            self.assertEqual(self.run_generate(trainer), ["first-output"])
+            self.assertEqual(module.state.gathers, [([True], module.engine_group)])
+            paths = list(Path(directory).glob("performance-*.jsonl"))
+            self.assertEqual(len(paths), 1)
+            row = json.loads(paths[0].read_text(encoding="utf-8"))
+            self.assertEqual(row["rollout_requests_count"], 2)
+            self.assertEqual(row["status"], "ok")
+            self.assertEqual(row["local_trajectories"], 1)
 
     def test_original_exception_is_preserved_and_context_is_reset(self):
         module = self.make_module()

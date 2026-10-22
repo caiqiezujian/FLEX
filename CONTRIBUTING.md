@@ -2,7 +2,7 @@
 
 本仓库包含 FLEX Live Web 推理系统、`infer_audio.py` 单音频入口及 `FLEX-GSPO/` 在线强化学习工程。模型权重、训练数据、原始 SFT 脚本与蒸馏 prompt 不随此仓库发布。
 
-强化学习改动在 `FLEX-GSPO/` 内运行 `python3 -m unittest discover -s tests -v`，并对三个 shell 入口执行 `bash -n`。官方源码合约测试可通过 `FLEX_SWIFT_SOURCE` 指定审查过的 ms-swift checkout；未提供源码时对应测试会跳过。完整环境、源码提交和真实四卡验收要求见该目录 README。不要把 CPU 测试通过描述为已通过真实模型训练。
+强化学习改动在 `FLEX-GSPO/` 内运行 `python3 -m unittest discover -s tests -v`，并对 `00`～`04` 五个 shell 入口执行 `bash -n`。官方源码合约测试可通过 `FLEX_SWIFT_SOURCE` 指定审查过的 ms-swift checkout；未提供源码时对应测试会跳过。完整环境、源码提交和真实四卡验收要求见该目录 README。不要把 CPU 测试通过描述为已通过真实模型训练。
 
 公开的 MetricX 配置保留空地址和实例标识，部署者自行配置；提交时不要写入实际内网服务地址、访问凭证或个人服务器路径。
 

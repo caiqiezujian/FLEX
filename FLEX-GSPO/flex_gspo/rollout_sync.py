@@ -129,6 +129,8 @@ def install_rollout_sync_patch(module=None):
         raise RuntimeError("SWIFT multi-turn driver signature changed; cannot safely install FLEX patch")
     original_generate = module.MegatronRolloutMixin._generate_completions
     from .online import FlexStreamHooks
+    from .performance import finish_generation, install_phase_timers, start_generation
+    install_phase_timers(module.MegatronRolloutMixin)
 
     @wraps(original_generate)
     def generate_with_context(trainer, *args, **kwargs):
@@ -138,15 +140,19 @@ def install_rollout_sync_patch(module=None):
             return original_generate(trainer, *args, **kwargs)
         token = _ACTIVE_TRAINER.set(trainer)
         started = time.monotonic()
+        telemetry = start_generation(trainer)
+        telemetry_status, trajectory_count = "error", None
         progress("generation_begin (weight sync, wake-up, first inference, then multi-turn)")
         try:
             result = original_generate(trainer, *args, **kwargs)
+            telemetry_status, trajectory_count = "ok", len(result)
             progress(f"generation_end local_trajectories={len(result)} elapsed={time.monotonic()-started:.1f}s")
             return result
         except BaseException:
             progress("generation_failed; original exception follows")
             raise
         finally:
+            finish_generation(telemetry, status=telemetry_status, local_trajectories=trajectory_count)
             _ACTIVE_TRAINER.reset(token)
 
     @wraps(original_driver)

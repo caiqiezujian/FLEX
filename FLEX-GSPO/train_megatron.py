@@ -47,6 +47,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--save-steps", type=int, default=50)
     p.add_argument("--vllm-memory", type=float, default=0.40)
     p.add_argument("--vllm-max-num-seqs", type=int, default=16)
+    p.add_argument("--recompute-granularity", choices=("full", "selective"), default="full",
+                   help="Keep full for the accepted recipe; selective is an opt-in speed/memory experiment")
+    p.add_argument("--performance-log", choices=("on", "off"), default="off",
+                   help="Optional CPU wall-clock phase JSONL; no CUDA synchronization or new collectives")
     p.add_argument("--master-port", type=int, default=29581)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--dataset-num-proc", type=int, default=4)
@@ -113,7 +117,7 @@ def build_command(a: argparse.Namespace) -> list[str]:
         "pipeline_model_parallel_size": "1", "context_parallel_size": "1",
         "sequence_parallel": "true", "padding_free": "false",
         "moe_grouped_gemm": "true", "moe_permute_fusion": "true", "moe_aux_loss_coeff": "0",
-        "recompute_granularity": "full", "recompute_method": "uniform", "recompute_num_layers": "1",
+        "recompute_granularity": a.recompute_granularity,
         "gradient_accumulation_fusion": "false", "attention_backend": "flash",
         "lr": a.lr, "min_lr": a.lr * 0.1, "lr_warmup_fraction": "0.03", "clip_grad": "1",
         "beta": a.kl_beta, "importance_sampling_level": "sequence", "epsilon": "0.0003",
@@ -133,10 +137,17 @@ def build_command(a: argparse.Namespace) -> list[str]:
         "save_safetensors": "true", "merge_lora": "true", "save_steps": a.save_steps,
         "no_save_optim": "false", "no_save_rng": "false", "save_total_limit": "3",
         "finetune": "false" if a.resume_from else "true", "no_load_optim": "false", "no_load_rng": "false",
-        "logging_steps": "1", "log_completions": "true", "report_to": "tensorboard",
+        # Upstream completion logging re-encodes messages without their audios.
+        # Keep it disabled for this audio-only recipe. Our complete trajectory
+        # and reward JSONL records remain enabled independently.
+        "logging_steps": "1", "log_completions": "false", "report_to": "tensorboard",
         "dataset_num_proc": a.dataset_num_proc, "dataloader_num_workers": "0",
         "dataloader_persistent_workers": "false", "seed": a.seed,
     }
+    # Selective recomputation rejects recompute_method in the audited framework.
+    # Keep the original full-mode flags exactly; never pass them in selective mode.
+    if a.recompute_granularity == "full":
+        pairs.update({"recompute_method": "uniform", "recompute_num_layers": "1"})
     if a.resume_from:
         pairs["mcore_adapter"] = a.resume_from
     for key, value in pairs.items():
@@ -151,6 +162,11 @@ def build_environment(a: argparse.Namespace) -> dict[str, str]:
                 "FLEX_REWARD_CONFIG": str(Path(a.reward_config).resolve()),
                 "FLEX_REWARD_LOG_DIR": str(Path(a.output).resolve() / "rewards"),
                 "FLEX_ROLLOUT_LOG_EVERY": str(a.rollout_log_every)})
+    # Explicit off must override an inherited experiment setting.
+    if a.performance_log == "on":
+        env["FLEX_PERF_LOG_DIR"] = str(Path(a.output).resolve() / "performance")
+    else:
+        env.pop("FLEX_PERF_LOG_DIR", None)
     paths = [str(ROOT)]
     if a.swift_source:
         paths.insert(0, str(Path(a.swift_source).resolve()))
@@ -256,7 +272,7 @@ def run_identity(a: argparse.Namespace, manifest: dict) -> dict:
     weights = {p.name: {"bytes": p.stat().st_size, "mtime_ns": p.stat().st_mtime_ns}
                for p in sorted(model.glob("*.safetensors"))}
     ignored = {"output", "dataset", "reward_config", "resume_from", "dry_run", "gpu_ids", "master_port",
-               "save_steps", "dataset_num_proc", "rollout_log_every"}
+               "save_steps", "dataset_num_proc", "rollout_log_every", "performance_log"}
     # Include train_iters: changing the LR decay horizon mid-run is not exact resume.
     settings = {k: v for k, v in vars(a).items() if k not in ignored}
     source_files = [ROOT / "swift_plugin.py", ROOT / "train_megatron.py", *sorted((ROOT / "flex_gspo").glob("*.py"))]
@@ -296,6 +312,12 @@ def main(argv: list[str] | None = None) -> int:
                 "rollout_sync": "FLEX plugin: completion predicate uses actual vLLM TP group; Megatron data groups unchanged",
                 "sampling": {"group_size": a.group_size, "generation_batch_size": a.global_batch_size * a.steps_per_generation,
                              "fresh_prompts_per_generation": a.global_batch_size * a.steps_per_generation // a.group_size},
+                "performance": {"phase_logging": a.performance_log,
+                                "log_dir": env.get("FLEX_PERF_LOG_DIR"),
+                                "vllm_max_num_seqs": a.vllm_max_num_seqs,
+                                "micro_batch_size": a.micro_batch_size,
+                                "recompute_granularity": a.recompute_granularity,
+                                "note": "Candidate configuration, not a measured speedup; compare steady-state throughput and peak VRAM."},
                 "note": "Source-audited recipe; CPU checks do not certify GPU training or translation quality."}
         print(json.dumps(plan, ensure_ascii=False, indent=2), flush=True)
         print("[launch] " + shlex.join(cmd), flush=True)

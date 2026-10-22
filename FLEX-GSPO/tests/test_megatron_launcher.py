@@ -1,8 +1,10 @@
 import importlib.util
 import json
 from pathlib import Path
+import shlex
 import tempfile
 import unittest
+from unittest.mock import patch
 from contextlib import redirect_stdout
 from io import StringIO
 
@@ -67,9 +69,29 @@ class TestMegatronLauncher(unittest.TestCase):
         self.assertNotIn("--rollout_log_every", cmd)
         self.assertEqual(cmd[cmd.index("--tensor_model_parallel_size") + 1], "2")
         self.assertEqual(cmd[cmd.index("--vllm_tensor_parallel_size") + 1], "4")
-        self.assertEqual(cmd[cmd.index("--log_completions") + 1], "true")
+        self.assertEqual(cmd[cmd.index("--log_completions") + 1], "false")
         with self.assertRaisesRegex(ValueError, "rollout-log-every"):
             launcher.build_command(self.args("--rollout-log-every", "0"))
+
+    def test_formal_4100_recipe_keeps_accepted_batch_and_disables_audio_log_reencode(self):
+        script = (ROOT / "03_train_4100.sh").read_text(encoding="utf-8")
+        command = script[script.index("exec bash "):].replace("\\\n", " ")
+        tokens = shlex.split(command)
+        self.assertEqual(tokens[:2], ["exec", "bash"])
+        self.assertEqual(tokens[2], "${SCRIPT_DIR}/02_train.sh")
+        self.assertEqual(tokens[-1], "$@")
+        a = self.args(*tokens[3:-1])
+        cmd = launcher.build_command(a)
+        for flag, expected in (("--train_iters", "4100"), ("--num_generations", "8"),
+                               ("--global_batch_size", "32"), ("--micro_batch_size", "1"),
+                               ("--steps_per_generation", "1"), ("--save_steps", "100"),
+                               ("--save_total_limit", "3"), ("--log_completions", "false"),
+                               ("--offload_model", "true"), ("--offload_optimizer", "true")):
+            self.assertEqual(cmd[cmd.index(flag) + 1], expected)
+        self.assertEqual(a.global_batch_size * a.steps_per_generation // a.group_size, 4)
+        self.assertEqual(a.rollout_log_every, 5)
+        self.assertIn("unset CUDA_LAUNCH_BLOCKING TORCH_SHOW_CPP_STACKTRACES TORCH_DISTRIBUTED_DEBUG", script)
+        self.assertNotIn("--resume-from", script)
 
     def test_dry_run_no_files_or_framework_import(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -78,6 +100,52 @@ class TestMegatronLauncher(unittest.TestCase):
                 code = launcher.main(["/missing/model", "/missing/data", str(output), "--dry-run"])
             self.assertEqual(code, 0)
             self.assertFalse(output.exists())
+
+    def test_throughput_recipe_is_opt_in_and_preserves_objective(self):
+        def options(name, target):
+            script = (ROOT / name).read_text(encoding="utf-8")
+            tokens = shlex.split(script[script.index("exec bash "):].replace("\\\n", " "))
+            self.assertEqual(tokens[2], "${SCRIPT_DIR}/" + target)
+            self.assertEqual(tokens[-1], "$@")
+            return tokens[3:-1]
+        stable = options("03_train_4100.sh", "02_train.sh")
+        fast = options("04_train_throughput.sh", "03_train_4100.sh")
+        a = self.args(*stable, *fast)
+        command = launcher.build_command(a)
+        baseline = launcher.build_command(self.args(*stable))
+        # Ignore only the three explicitly changed runtime capacity flags.
+        def flags(cmd):
+            start = cmd.index("--rlhf_type")
+            return dict(zip(cmd[start::2], cmd[start + 1::2]))
+        before, after = flags(baseline), flags(command)
+        self.assertEqual({k for k in before if before[k] != after[k]},
+                         {"--micro_batch_size", "--vllm_max_num_seqs", "--vllm_gpu_memory_utilization"})
+        self.assertEqual((a.group_size, a.global_batch_size, a.micro_batch_size,
+                          a.vllm_max_num_seqs, a.vllm_memory, a.train_iters), (8, 32, 2, 32, 0.5, 4100))
+        self.assertEqual(a.performance_log, "on")
+        self.assertEqual(launcher.build_environment(a)["FLEX_PERF_LOG_DIR"],
+                         str(Path(a.output).resolve() / "performance"))
+        # Trailing arguments still allow a 5-step isolated smoke or rollback.
+        overridden = self.args(*stable, *fast, "--train-iters", "5", "--micro-batch-size", "1")
+        self.assertEqual((overridden.train_iters, overridden.micro_batch_size), (5, 1))
+
+    def test_selective_recompute_omits_incompatible_full_options(self):
+        full = launcher.build_command(self.args())
+        selective = launcher.build_command(self.args("--recompute-granularity", "selective"))
+        self.assertEqual(full[full.index("--recompute_granularity") + 1], "full")
+        self.assertEqual(full[full.index("--recompute_method") + 1], "uniform")
+        self.assertEqual(selective[selective.index("--recompute_granularity") + 1], "selective")
+        self.assertNotIn("--recompute_method", selective)
+        self.assertNotIn("--recompute_num_layers", selective)
+
+    def test_micro_two_alignment_and_explicit_disabled_observation(self):
+        for batch in (32, 64):
+            launcher.build_command(self.args("--global-batch-size", str(batch), "--micro-batch-size", "2"))
+        with self.assertRaisesRegex(ValueError, "Prompt count"):
+            launcher.build_command(self.args("--global-batch-size", "48", "--micro-batch-size", "2"))
+        with patch.dict("os.environ", {"FLEX_PERF_LOG_DIR": "/old/experiment"}):
+            self.assertNotIn("FLEX_PERF_LOG_DIR", launcher.build_environment(self.args()))
+            self.assertNotIn("FLEX_PERF_LOG_DIR", launcher.build_environment(self.args("--performance-log", "off")))
 
     def prepared_fixture(self, root):
         from flex_gspo.audio import encode_chunk_ref

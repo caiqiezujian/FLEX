@@ -17,6 +17,9 @@ FLEX-GSPO/
 ├── 00_install_framework.sh     # 独立环境中的显式安装辅助，不替换 CUDA 栈
 ├── 01_prepare.sh               # 原始 JSONL + WAV → train.jsonl
 ├── 02_train.sh                 # Megatron-SWIFT 在线 GSPO 入口
+├── 03_train_4100.sh            # 已通过两步验证后使用的 G8/B32、4100 步参数入口
+├── 04_train_throughput.sh      # 可选提速试验：B32/micro2/推理并发32/显存预算0.50
+├── monitor_training.py         # 独立进程：已有奖励/耗时日志 → TensorBoard，不参与训练
 ├── prepare_data.py
 ├── train_megatron.py           # 参数、预检、四卡启动与恢复检查
 ├── swift_plugin.py             # Omni 音频模板、多轮环境、奖励函数注册
@@ -28,6 +31,8 @@ FLEX-GSPO/
 │   ├── audio.py                # 因果切片，只读取当前已释放的音频区间
 │   ├── online.py               # 每块音频一次决策，构成完整多轮轨迹
 │   ├── rollout_sync.py         # FLEX-colocate 退出判定按真实 vLLM TP 组同步
+│   ├── performance.py          # 可选本地阶段计时，不新增 CUDA 同步或分布式通信
+│   ├── monitoring.py           # 训练外日志观察器，导出曲线/文本与可选 GPU 读数
 │   ├── online_reward.py        # 完整轨迹评分、服务批量调用和诊断日志
 │   ├── qalco.py                # 质量门槛、时延预算、长度成本
 │   ├── metricx.py              # 用户提供的 MetricX HTTP 协议
@@ -190,7 +195,45 @@ bash 02_train.sh \
 
 这些是起步配置，不是四卡显存和速度的保证。offload 依赖 CPU 内存和主机带宽，需结合服务器实测调整。默认采用完整合并权重同步，不假设未经验证的 Omni LoRA-only 在线刷新可用。8192 是 rollout prompt 编码预算，不是完整 teacher-forced 训练序列的绝对长度上限；框架在最终训练编码时会临时取消模板截断。
 
+### 6.1 已跑通 G8/B32 后，正式训练 4100 步
+
+`03_train_4100.sh` 是 `02_train.sh` 的参数快捷入口，不是新的训练阶段。在已经完成两步验收的 Docker 和虚拟环境中执行：
+
+```bash
+cd /data/flex/FLEX-GSPO
+source /data/venvs/flex-gspo-online/bin/activate
+
+bash 03_train_4100.sh \
+  /data/models/flex-sft-merged \
+  /data/flex/datasets/gspo_online_prepared_clean/train.jsonl \
+  /data/flex/outputs/gspo_g8_b32_4100_001
+```
+
+模型、JSONL 和输出目录都是直接传参，也可替换为其他路径。命令末尾可加 `--dry-run` 检查配置，不会启动训练。必须使用新的输出目录；本轮从原始合并 SFT checkpoint 开始，不恢复两步排障实验，以便学习率计划按 4100 步重新建立。
+
+配置保留 G8、global batch 32、micro batch 1、每次生成更新 1 步、学习率 `1e-6`、KL `0.01`、LoRA rank 8/alpha 32、8192/128 token 预算、64 轮上限和 vLLM 显存比例 0.4。训练 4100 次优化更新，每 100 步保存，框架保存保留上限仍为 3；合并模型导出仍启用，应预留充足磁盘空间。warmup 比例仍为 0.03，对应 123 步。4100 不是 epoch 数。
+
+按本配置，每次生成计划使用 4 条源音频任务，每条 8 个候选；4100 步计划约 16,400 次任务采样、131,200 条候选轨迹。它不等于全量约 25 万条数据训练一遍，也不保证这些任务全部互不重复；编码失败重采样等行为可能增加实际读取量。
+
+快捷脚本清除 `CUDA_LAUNCH_BLOCKING`、C++ 堆栈、分布式详细调试等排障设置，将多轮进度日志恢复为每 5 轮打印，不改变 allocator 或已验收的 offload 设置。单次显存占用不到 40GB 不等于整个训练峰值只到 40GB；不要仅凭这个读数直接关闭 offload 或翻倍 batch。
+
+当前启动器明确使用 `log_completions=false`：该固定框架的 prompt 日志会仅携 messages 调用音频编码，触发缺少 audios 的错误。关闭的是框架额外的 prompt/completion 展示，不是 QALCO 轨迹记录；`rewards/` 中完整轨迹与奖励日志、训练指标及 TensorBoard 仍然保留。此配置不放松真实模型输入的音频校验。固定上游的 reward/advantage 展示缓存为有限长度 deque，不会因关闭 completion 日志而无限堆积。
+
+使用此入口前，同步本次修改的 `train_megatron.py`；仅复制新 shell 文件而保留旧的 `log_completions=true` 启动器会重新触发日志错误。服务器的实际 MetricX 配置保持不变。正式运行的最终质量、速度和稳定性仍以服务器观测为准，两步成功不是长程效果保证。
+
 ## 7. 日志和恢复
+
+### 7.1 安全提速与 TensorBoard
+
+保留原 `02_train.sh` / `03_train_4100.sh` 稳定配置。新 `04_train_throughput.sh` 只把训练 micro batch 从 1 改为 2、vLLM `max_num_seqs` 从 16 改为 32、vLLM 显存预算从 0.40 改为 0.50，并打开可关闭的阶段计时。G8、global batch 32、每批生成更新 1 步、学习率、KL、奖励公式、音频分块、多轮完成同步、TP/EP、完整重计算、eager 和 offload 全部保持原设置。它是待服务器验证的提速候选，不是已测出的加速倍数。
+
+先用新输出目录验证 5 步及保存，再决定是否启动 4100 步；完整命令、回退方法、监控启动及曲线判读见 [提速与训练监控](docx/提速与训练监控.md)。不需要重新 prepare、采样离线轨迹或安装新版本训练框架。
+
+`--performance-log on` 仅添加进程本地墙钟计时，不做 CUDA synchronize 或新增分布式通信。计时记录在 `performance/`，包含生成总耗时、权重同步、逐轮请求总耗时、CPU 卸载与 GPU 回载；它不是精确 CUDA kernel profiler，不要把四个 rank 的耗时相加当成一次更新耗时。默认关闭；`04` 默认打开，末尾可传 `--performance-log off` 关闭。
+
+`monitor_training.py` 由另一个终端启动，只读现有日志并在 `monitor/` 写派生 TensorBoard 事件。不加载 Omni、不调用 MetricX、不占用模型训练显存、不重新启用 `log_completions`。框架已有的 loss、学习率、梯度范数、KL、reward_std、`frac_reward_zero_std` 等指标仍由原 TensorBoard 日志提供；新增质量、时延、长度成本、门槛通过率、动作比例和文本样本帮助解释奖励。应将整个实验输出目录作为 TensorBoard logdir。
+
+不要把“loss 下降”或“奖励上升”单独当成翻译变好：还要看质量/时延门槛、无效率、实际译文和固定独立验证集。质量为 MetricX 代理、时延为源时间轴代理；当前并没有独立的自然度分数。
 
 训练目录记录启动配置、任务清单哈希、奖励配置/代码标识，以及 reward 诊断 JSONL。每条诊断包含完整候选轨迹、标签、时间、完整译文、各奖励项和有效性原因。原文与参考留在任务清单，不在每条日志重复存储。
 
