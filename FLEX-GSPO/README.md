@@ -198,6 +198,20 @@ python3 collect_training_status.py \
 
 该脚本只用Python标准库，不需要训练环境、TensorBoard、PyTorch或评分服务，只需在能读取这些绝对路径的宿主机或容器运行。报告同时打印到终端、写入指定新文件；再次采集请改文件名为002，避免覆盖。报告包含最近5步、前后两个局部窗口、COMET22/奖励/空输出/严重复读/WAIT及EOF指标、各rank阶段耗时与少量原文/机器参考/译文样例。每个JSONL仅读取最后16MiB，尾部半行忽略；若回调窗口不足，报告会显示实际数量。当前session由最新launch记录选择，未确认结束的局部奖励回调不进入摘要。样例是诊断选取，不能作为随机评估或全局G8统计。`--gpu-ids`查询整卡占用，包含其他进程；不传即可跳过GPU采样。
 
+若要专门审查“少WAIT是否伴随更多找补和更长译文”，导出约160条同音频候选：
+
+~~~bash
+python3 collect_brevity_samples.py \
+  /data/yb/FLEX/outputs/gspo_comet22_g8_b32_3000_001 \
+  --dataset /data/yb/FLEX/datasets/gspo_online_prepared_clean/train.jsonl \
+  --max-candidates 160 \
+  --max-tasks 25 \
+  --include-increments \
+  --output /data/yb/FLEX/outputs/gspo_comet22_g8_b32_3000_001/diagnostics/brevity_160_001.txt
+~~~
+
+保留最近不同音频的全部观测候选，不按质量或长度筛选，不拆组凑数；通常20条音频各8候选约160条。每组原文/参考只写一次，每条候选完整保留最终译文，附长度、原长度惩罚、COMET22、时延、音频WAIT/FLEX/DIRECT次数及独立EOF动作；开启include-increments时还保留所有非空增量。脚本只读已有本轮日志，不重新采样、解码音频或请求评分服务。字数沿用训练text_units口径，相关性仅在同组有效非空候选中描述，不是因果或语义冗余判断；缺prompt_id时按同任务/同训练步整理观测组，不声称重建了GSPO全局分组。若已有同名TXT，改用002。
+
 固定验证音频对比SFT与checkpoint，抽查事实/数字/否定、漏译、自然性、复读、输出时机。reward上升或loss下降都不能单独证明翻译变好；COMET22若用于训练，也不能再当完全独立的效果证据。
 
 ## 9. 测试与范围
