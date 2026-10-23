@@ -165,8 +165,18 @@ def audit_rewards(path, window, settings, examples_limit):
             quality_fail_delays.append(c["latency_seconds"])
         if settings is not None:
             values = [c.get(k) for k in ("quality", "latency_seconds", "length_penalty")]
-            if tier == "invalid":
+            if tier in ("invalid", "degenerate"):
                 expected = -4.0
+            elif settings.get("version") == 3:
+                repetition = c.get("repetition_penalty")
+                if (record.get("reward_version") != 3 or c.get("group_finalized") is not True
+                        or not all(number(v) for v in values + [repetition])):
+                    uncheckable += 1
+                    continue
+                from flex_gspo.gated_reward import combine_v3
+                # This per-rank audit checks arithmetic using the logged C.
+                # It does NOT reconstruct complete world-wide candidate groups.
+                expected = combine_v3(*values, repetition, settings)["reward"]
             elif all(number(v) for v in values):
                 expected = combine_reward(*values, settings)["reward"]
             else:
@@ -185,7 +195,7 @@ def audit_rewards(path, window, settings, examples_limit):
             "repeated_callback_keys": repeated_callbacks, "noncontiguous_candidate_index_callbacks": malformed_indices,
             "callback_completeness": "No end marker in legacy logs; a contiguous final prefix may still be partial.",
             "formula_recheck": {"enabled": settings is not None, "checked": formula_checked, "mismatches": formula_mismatches, "uncheckable": uncheckable,
-                                "note": "Uses supplied current formula/config; hash match does not prove quality-model identity or semantic reward validity."}}, selected + list(recent_invalid) + timing_pairs, pairs
+                                "note": "Uses supplied current formula/config; hash match does not prove quality-model identity or semantic reward validity. For v3, uses logged C and P, not independent global-anchor or repetition recomputation."}}, selected + list(recent_invalid) + timing_pairs, pairs
 
 
 def load_settings(config_path, run_dir):
@@ -203,7 +213,7 @@ def load_settings(config_path, run_dir):
         return None, {"status": "not rechecked: missing/mixed launch identities or changed config", "config_sha256": digest}
     settings = validate_settings(json.loads(data.decode("utf-8-sig")))
     return settings, {"status": "config hash matches launch identity", "launch_files": matched,
-                      "settings": {key: settings[key] for key in ("quality_floor", "latency_metric", "latency_budget_seconds", "reference_length_ratio", "latency_weight", "length_weight")}}
+                      "settings": {key: settings[key] for key in ("version", "quality_floor", "latency_metric", "latency_budget_seconds", "reference_length_ratio", "latency_weight", "length_weight", "v3") if key in settings}}
 
 
 def attach_sources(examples, dataset):

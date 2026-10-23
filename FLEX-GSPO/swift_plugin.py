@@ -18,8 +18,10 @@ from swift.template.templates.qwen import Qwen3OmniTemplate, QwenTemplateMeta
 
 from flex_gspo.audio import materialize_chunk_refs
 from flex_gspo.online import FlexStreamHooks
-from flex_gspo.online_reward import OnlineQalcoReward
+from flex_gspo.online_reward import OnlineQalcoReward, load_reward_config
 from flex_gspo.rollout_sync import install_rollout_sync_patch
+from flex_gspo.group_reward import install_group_reward_patch, is_group_scoring_active
+from flex_gspo.rewards import RewardError
 
 
 class FlexQwen3OmniTemplate(Qwen3OmniTemplate):
@@ -36,6 +38,8 @@ class FlexStreamScheduler(FlexStreamHooks, MultiTurnScheduler):
         # The trainer module is fully imported now; only patch its FLEX path.
         # The vLLM process group is looked up later, after engine creation.
         install_rollout_sync_patch()
+        if load_reward_config()["reward"].get("version", 1) == 3:
+            install_group_reward_patch()
         super().__init__(*args, **kwargs)
 
 
@@ -43,8 +47,15 @@ class QalcoOnlineORM(ORM):
     def __init__(self, **kwargs):
         super().__init__()
         self.scorer = OnlineQalcoReward()
+        if self.scorer.settings["version"] == 3:
+            # Reward construction occurs inside the fully imported trainer.
+            # Idempotent confirmation covers config changes between creation
+            # of the scheduler and ORM; no provisional reward may escape.
+            install_group_reward_patch()
 
     def __call__(self, completions, **kwargs):
+        if self.scorer.settings["version"] == 3 and not is_group_scoring_active():
+            raise RewardError("QALCO v3 ORM requires the synchronized complete-group scoring bridge")
         return self.scorer(completions, **kwargs)
 
 

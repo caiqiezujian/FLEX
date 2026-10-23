@@ -88,6 +88,33 @@ class TestMegatronLauncher(unittest.TestCase):
         self.assertIn("FLEX_REWARD_LOG_DIR", env)
         self.assertEqual(env["FLEX_ROLLOUT_LOG_EVERY"], "5")
 
+    def test_v3_config_does_not_change_accepted_engine_arguments(self):
+        baseline = self.args("--global-batch-size", "32", "--micro-batch-size", "2",
+                             "--vllm-memory", "0.5", "--vllm-max-num-seqs", "32")
+        experiment = self.args("--global-batch-size", "32", "--micro-batch-size", "2",
+                               "--vllm-memory", "0.5", "--vllm-max-num-seqs", "32",
+                               "--reward-config", str(ROOT / "configs" / "qalco_v3.json"))
+        self.assertEqual(launcher.build_command(baseline), launcher.build_command(experiment))
+        self.assertNotEqual(launcher.build_environment(baseline)["FLEX_REWARD_CONFIG"],
+                            launcher.build_environment(experiment)["FLEX_REWARD_CONFIG"])
+        command = launcher.build_command(experiment)
+        self.assertEqual(command[command.index("--train_iters") + 1], "3000")
+        self.assertEqual(command[command.index("--save_steps") + 1], "500")
+
+    def test_v3_shell_explicitly_selects_new_config_and_allows_overrides(self):
+        script = (ROOT / "05_train_qalco_v3.sh").read_text(encoding="utf-8")
+        tokens = shlex.split(script[script.index("exec bash "):].replace("\\\n", " "))
+        self.assertEqual(tokens[2], "${SCRIPT_DIR}/04_train_throughput.sh")
+        self.assertEqual(tokens[-1], "$@")
+        self.assertEqual(tokens[3:5], ["--reward-config", "${SCRIPT_DIR}/configs/qalco_v3.json"])
+        with redirect_stdout(StringIO()) as out:
+            code = launcher.main(["/missing/model", "/missing/train.jsonl", "/missing/new-run",
+                                  "--reward-config", str(ROOT / "configs" / "qalco_v3.json"), "--dry-run"])
+        self.assertEqual(code, 0)
+        plan = json.JSONDecoder().raw_decode(out.getvalue())[0]
+        self.assertEqual(plan["reward_settings"]["version"], 3)
+        self.assertEqual(plan["reward_settings"]["v3"]["brevity_weight"], .08)
+
     def test_rollout_logging_is_local_not_an_unsupported_swift_flag(self):
         a = self.args("--rollout-log-every", "1", "--global-batch-size", "32")
         cmd = launcher.build_command(a)

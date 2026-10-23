@@ -91,6 +91,30 @@ class TrainingAuditTests(unittest.TestCase):
             self.assertFalse(inventory[0]["nonmetadata_payload_present"])
             self.assertFalse(inventory[0]["resumability_verified"])
 
+    def test_v3_arithmetic_recheck_uses_logged_group_cost_not_old_formula(self):
+        from flex_gspo.gated_reward import combine_v3
+        from flex_gspo.qalco import validate_settings
+        config = Path(__file__).resolve().parents[1] / "configs" / "qalco_v3.json"
+        settings = validate_settings(json.loads(config.read_text(encoding="utf-8")))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "launch_1.json").write_text(json.dumps({"run_identity": {
+                "reward_config_sha256": hashlib.sha256(config.read_bytes()).hexdigest()}}), encoding="utf-8")
+            loaded, info = audit.load_settings(config, root)
+            self.assertEqual(loaded["version"], 3)
+            self.assertIn("v3", info["settings"])
+            result = combine_v3(.9, 1, .25, .1, settings)
+            row = self.candidate()
+            row.update(reward_version=3, reward=result["reward"])
+            row["components"].update(result, quality=.9, latency_seconds=1,
+                                     repetition_penalty=.1, group_finalized=True)
+            path = root / "rewards-rank0-pid1.jsonl"
+            self.write_rows(path, [row])
+            report, _, _ = audit.audit_rewards(path, 1, loaded, 2)
+            self.assertEqual(report["formula_recheck"]["checked"], 1)
+            self.assertEqual(report["formula_recheck"]["mismatches"], 0)
+            self.assertIn("logged C", report["formula_recheck"]["note"])
+
     def test_end_to_end_no_overwrite_and_pid_selection(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)/"run"

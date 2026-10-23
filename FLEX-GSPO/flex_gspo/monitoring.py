@@ -147,7 +147,10 @@ def _summary(values):
 def reward_summary(records):
     """Local callback summaries only; no inferred global G8 groups/advantages."""
     result = {"candidates": len(records)}
-    scalar_fields = ("quality", "metricx_error", "comet22_score", "latency_seconds", "mean_lag_seconds", "length_penalty")
+    scalar_fields = ("quality", "metricx_error", "comet22_score", "latency_seconds", "mean_lag_seconds", "length_penalty",
+                     "quality_deficit_penalty", "quality_gate", "latency_cost_raw", "latency_penalty",
+                     "group_brevity_excess", "weighted_brevity_penalty", "repetition_penalty",
+                     "weighted_repetition_penalty", "group_length_anchor", "anchor_pool_size")
     for key in ("reward", *scalar_fields):
         values = [r.get("reward") if key == "reward" else r.get("components", {}).get(key) for r in records]
         for name, value in _summary([float(v) for v in values if number(v)]).items():
@@ -158,7 +161,7 @@ def reward_summary(records):
         values = [(r.get("components", {}).get("diagnostics") or {}).get(key) for r in records]
         for name, value in _summary([float(v) for v in values if number(v)]).items():
             result["diagnostics/" + key + "/" + name] = value
-    for flag in ("protocol_valid", "empty_translation", "quality_pass", "latency_pass", "feasible", "severe_repetition"):
+    for flag in ("protocol_valid", "empty_translation", "quality_pass", "latency_pass", "feasible", "severe_repetition", "group_finalized"):
         result[flag + "_fraction"] = sum(r.get("components", {}).get(flag) is True for r in records) / len(records)
     for tier in ("feasible", "quality_fail", "latency_fail", "invalid", "degenerate"):
         result["tier/" + tier + "_fraction"] = sum(r.get("components", {}).get("tier") == tier for r in records) / len(records)

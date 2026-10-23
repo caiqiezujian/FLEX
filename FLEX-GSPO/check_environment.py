@@ -6,6 +6,7 @@ import argparse
 import importlib.metadata
 import importlib.util
 import json
+import os
 from pathlib import Path
 import platform
 import shutil
@@ -117,6 +118,13 @@ def inventory(model: str | None = None, require_training: bool = False, required
         from flex_gspo.rollout_sync import validate_rollout_sync_source
         result["flex_rollout_sync"] = validate_rollout_sync_source(
             (root / "swift/megatron/trainers/rollout_mixin.py").read_text(encoding="utf-8"))
+        if os.environ.get("FLEX_REWARD_CONFIG"):
+            from flex_gspo.online_reward import load_reward_config
+            config = load_reward_config()
+            if config["reward"].get("version") == 3:
+                from flex_gspo.group_reward import validate_group_reward_source
+                result["flex_group_reward"] = validate_group_reward_source(
+                    (root / "swift/megatron/trainers/grpo_trainer.py").read_text(encoding="utf-8"))
         absent = [f"{file}: {needle}" for file, checks in result["capabilities"].items() for needle, ok in checks.items() if not ok]
         if absent:
             result["errors"].append("Installed SWIFT lacks audited multi-turn/GSPO/audio APIs: " + "; ".join(absent))

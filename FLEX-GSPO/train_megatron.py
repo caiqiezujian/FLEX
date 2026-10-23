@@ -312,12 +312,16 @@ def main(argv: list[str] | None = None) -> int:
     a = parser().parse_args(argv)
     try:
         cmd, env = build_command(a), build_environment(a)
+        from flex_gspo.online_reward import load_reward_config
+        from flex_gspo.qalco import validate_settings
+        settings = validate_settings(load_reward_config(a.reward_config))
         if a.vllm_mm_processor_cache_gb > 0:
             print("[launch] WARNING: Multimodal caches are enabled explicitly. This removes the default "
                   "bypass for the observed vLLM 0.19.1 cache-clear hang; verify an upstream fix and a "
                   "multi-step sleep/wake test before a long run. KV prefix caching is independent.",
                   file=sys.stderr, flush=True)
         plan = {"audited_swift_commit": AUDITED_SWIFT_COMMIT, "argv": cmd,
+                "reward_settings": settings,
                 "environment": {k: env[k] for k in ("CUDA_VISIBLE_DEVICES", "ENABLE_AUDIO_OUTPUT", "FLEX_REWARD_CONFIG",
                                                      "FLEX_REWARD_LOG_DIR", "FLEX_ROLLOUT_LOG_EVERY", "PYTHONPATH")},
                 "rollout_sync": "FLEX plugin: completion predicate uses actual vLLM TP group; Megatron data groups unchanged",
@@ -338,11 +342,8 @@ def main(argv: list[str] | None = None) -> int:
         manifest = validate_local_inputs(a)
         plan["run_identity"] = run_identity(a, manifest)
         verify_resume_identity(a, plan["run_identity"])
-        from flex_gspo.online_reward import load_reward_config
-        from flex_gspo.qalco import validate_settings
-        settings = validate_settings(load_reward_config(a.reward_config))
-        if settings["version"] != 2:
-            raise ValueError("New training requires QALCO v2 / COMET22 / EOF. v1 is retained for historical audit only.")
+        if settings["version"] not in (2, 3):
+            raise ValueError("New training requires QALCO v2/v3 / COMET22 / EOF. v1 is retained for historical audit only.")
         # Fail before GPU initialization; check both transport and basic semantic ordering.
         subprocess.run([sys.executable, str(ROOT / "check_comet22_service.py"), "--config", a.reward_config], env=env, check=True)
         subprocess.run([sys.executable, str(ROOT / "check_environment.py"), "--model", a.model,

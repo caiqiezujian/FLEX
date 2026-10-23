@@ -1,4 +1,23 @@
-# FLEX-GSPO：QALCO v2 在线同传强化学习
+# FLEX-GSPO：QALCO 在线同传强化学习
+
+## 最新实验入口：QALCO v3
+
+2026-10-23 新增 **05_train_qalco_v3.sh + configs/qalco_v3.json**：质量门控时延、完整同音频 G8 的质量约束长度基准、局部循环复读成本。只使用已有 COMET22 服务，不增加模型服务，不重做数据，不改变已跑通的四卡 Megatron 在线 GSPO 流程。
+
+新版保留 **G8 / global batch32 / micro2 / 3000步 / 每500步保存**，不增加显存预算。原 configs/default.json 和 03/04 入口仍是 v2，避免悄悄改变原实验；新实验请明确用 **05**。完整公式、参数、启动和验收见 [QALCO v3 训练说明](docx/QALCO_v3训练说明.md)。v1/v2 仅作为历史对照，不与 v3 奖励曲线直接比较。
+
+~~~bash
+bash 05_train_qalco_v3.sh \
+  /data/data_process/lzy/qwen3_omni_mega/train/megatron_output/Qwen3-Omni-Flex/v3-20261016-172842/checkpoint-4410-merged \
+  /data/yb/FLEX/datasets/gspo_online_prepared_clean/train.jsonl \
+  /data/yb/FLEX/outputs/gspo_qalco_v3_g8_b32_3000_001
+~~~
+
+先在另一个新目录使用 `--train-iters 2 --save-steps 2` 验收真实 GPU 的采样、分组、更新和保存，然后再开正式目录。短验收不能证明长期稳定或翻译提升。本地测试不使用服务器 GPU，不替代这一步。
+
+---
+
+以下保留 **v2 历史配置说明**，其中公式、默认文件和训练目录不代表 v3；v3 以专用说明和配置文件为准。
 
 当前正式配置：**3000 次优化更新，每 500 步保存 checkpoint**。使用原 SFT 合并 checkpoint 起跑，4 张 A800 80GB；训练框架仍是 **MS-SWIFT 的 Megatron RLHF**，GSPO 采用 sequence-level importance sampling，不是把离线候选当成新策略。
 

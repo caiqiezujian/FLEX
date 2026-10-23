@@ -11,6 +11,7 @@ group advantages; this module returns raw, unnormalised trajectory rewards.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import math
@@ -104,6 +105,7 @@ class OnlineQalcoReward:
         self.log_dir = log_dir if log_dir is not None else os.environ.get("FLEX_REWARD_LOG_DIR")
         self.last_records = []
         self._calls = 0
+        self._pending_group_commit = False
         self._log_lock = threading.Lock()
         LOG.warning(
             "QALCO online thresholds are exploratory: %s quality is a proxy, not accuracy; "
@@ -112,6 +114,8 @@ class OnlineQalcoReward:
             self.settings["quality_provider"], self.settings["latency_metric"])
 
     def __call__(self, completions, flex_task=None, rollout_infos=None, **kwargs):
+        if self.settings["version"] == 3 and self._pending_group_commit:
+            raise RewardError("Previous QALCO v3 batch was not finalized; refusing to overwrite pending scores")
         if not isinstance(completions, (list, tuple)):
             raise RewardError("completions must be a batch")
         size = len(completions)
@@ -135,7 +139,7 @@ class OnlineQalcoReward:
             task = _object(raw_task, "flex_task item")
             validate_task(task)
             trajectory = _trajectory(info, task)
-            if self.settings["version"] == 2 and (type(trajectory.get("schema_version")) is not int
+            if self.settings["version"] >= 2 and (type(trajectory.get("schema_version")) is not int
                                                   or trajectory["schema_version"] != 2):
                 raise RewardError("QALCO v2 requires scheduler schema_version=2; refusing legacy/mixed rollout deployment")
             # ID alone is insufficient: a corrupt manifest may reuse an ID
@@ -144,7 +148,8 @@ class OnlineQalcoReward:
                 key = json.dumps(task, ensure_ascii=False, sort_keys=True, allow_nan=False)
             except (TypeError, ValueError) as exc:
                 raise RewardError("flex_task contains non-JSON metadata") from exc
-            group = groups.setdefault(key, {"task": task, "indices": [], "trajectories": []})
+            group = groups.setdefault(key, {"task": task, "task_hash": hashlib.sha256(key.encode("utf-8")).hexdigest(),
+                                            "indices": [], "trajectories": []})
             group["indices"].append(index)
             group["trajectories"].append(trajectory)
 
@@ -164,6 +169,7 @@ class OnlineQalcoReward:
                     translation = None  # Preserve bad raw responses; never repair.
                 records[index] = {
                     "task_id": group["task"].get("id"),
+                    "task_hash": group["task_hash"],
                     "duration_seconds": group["task"]["duration_seconds"],
                     "reward_version": self.settings["version"],
                     **{name: values[index] for name, values in identities.items()},
@@ -171,10 +177,40 @@ class OnlineQalcoReward:
                     "trajectory": copy.deepcopy(trajectory), "translation": translation, **score,
                 }
         self.last_records = records
-        self._calls += 1
-        self._log_records(records, kwargs.get("trainer_state"))
+        if self.settings["version"] == 3:
+            self._pending_group_commit = True
+        else:
+            self._calls += 1
+            self._log_records(records, kwargs.get("trainer_state"))
         progress(f"reward_end local_candidates={size} elapsed={time.monotonic()-started:.1f}s")
         return [float(record["reward"]) for record in records]
+
+    def commit_group_rewards(self, finalized_records, trainer_state=None):
+        """Commit v3 only after complete, framework-ordered global groups exist.
+
+        Called by the synchronized trainer bridge, never by the local ORM.
+        No model/service evaluation here. Preserve raw trajectories verbatim.
+        """
+        if self.settings["version"] != 3:
+            raise RewardError("Group finalization is only supported for QALCO v3")
+        if not self._pending_group_commit:
+            raise RewardError("No pending QALCO v3 batch; duplicate or out-of-order commit")
+        if not isinstance(finalized_records, list) or len(finalized_records) != len(self.last_records):
+            raise RewardError("Final reward batch must match the provisional local batch")
+        for original, final in zip(self.last_records, finalized_records):
+            if (final.get("task_hash") != original.get("task_hash")
+                    or final.get("trajectory") != original.get("trajectory")
+                    or final.get("candidate_index_in_local_batch") != original.get("candidate_index_in_local_batch")):
+                raise RewardError("Group finalization reordered or modified candidate evidence")
+            if final.get("components", {}).get("group_finalized") is not True:
+                raise RewardError("Refusing to log provisional v3 rewards")
+            value = final.get("reward")
+            if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value):
+                raise RewardError("Nonfinite finalized reward")
+        self.last_records = finalized_records
+        self._calls += 1
+        self._log_records(finalized_records, trainer_state)
+        self._pending_group_commit = False
 
     def _log_records(self, records, trainer_state):
         if not self.log_dir or not records:

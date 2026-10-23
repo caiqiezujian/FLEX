@@ -24,7 +24,10 @@ DEFAULT_RUN = "/data/yb/FLEX/outputs/gspo_comet22_g8_b32_3000_001"
 NATIVE_KEYS = ("loss", "kl", "reward", "reward_std", "frac_reward_zero_std", "grad_norm",
                "clip_ratio/region_mean", "completions/mean_length", "learning_rate",
                "train_speed(s/it)")
-REWARD_KEYS = ("quality", "comet22_score", "latency_seconds", "length_penalty")
+REWARD_KEYS = ("quality", "comet22_score", "latency_seconds", "length_penalty",
+               "quality_deficit_penalty", "quality_gate", "latency_cost_raw", "latency_penalty",
+               "group_brevity_excess", "weighted_brevity_penalty", "repetition_penalty",
+               "weighted_repetition_penalty", "group_length_anchor", "anchor_pool_size")
 FLAG_KEYS = ("protocol_valid", "empty_translation", "quality_pass", "latency_pass",
              "feasible", "severe_repetition")
 PERF_KEYS = ("generation_seconds", "weight_sync_seconds", "rollout_requests_seconds",

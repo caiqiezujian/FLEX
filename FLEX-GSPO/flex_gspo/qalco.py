@@ -39,13 +39,18 @@ def validate_settings(config):
         raise RewardError("QALCO v1 requires reward.provider=qalco")
     allowed = {"provider", "quality_floor", "version", "quality_provider", "comet22", "eof_delay_seconds",
                "latency_budget_seconds", "reference_length_ratio", "latency_weight",
-               "length_weight", "latency_metric", "metricx"}
+               "length_weight", "latency_metric", "metricx", "v3"}
     if set(settings) - allowed:
         raise RewardError("Unsupported QALCO setting; allowed fields: " + ", ".join(sorted(allowed)))
     settings = dict(settings)
     settings.setdefault("version", 1)  # Historical audit configs keep their exact old formula.
-    if type(settings["version"]) is not int or settings["version"] not in (1, 2):
-        raise RewardError("reward.version must be 1 (historical audit) or 2 (new training)")
+    if type(settings["version"]) is not int or settings["version"] not in (1, 2, 3):
+        raise RewardError("reward.version must be 1 (historical audit), 2, or 3 (group-gated experiment)")
+    if "v3" in settings and settings["version"] != 3:
+        raise RewardError("reward.v3 is only valid with reward.version=3")
+    if settings["version"] == 3 and any(name in settings for name in
+            ("reference_length_ratio", "latency_weight", "length_weight")):
+        raise RewardError("QALCO v3 does not use the old reference-length/tier weights; use reward.v3 settings")
     settings.setdefault("quality_provider", "metricx" if settings["version"] == 1 else "comet22")
     expected_provider = "metricx" if settings["version"] == 1 else "comet22"
     if settings["quality_provider"] != expected_provider:
@@ -57,16 +62,20 @@ def validate_settings(config):
     settings.setdefault("latency_metric", "mean_lag")
     if settings["latency_metric"] not in ("mean_lag", "speech_laal"):
         raise RewardError("latency_metric must be mean_lag or speech_laal")
-    if settings["version"] == 2 and settings["latency_metric"] != "mean_lag":
-        raise RewardError("QALCO v2 requires mean_lag; speech_laal is for historical comparison only")
+    if settings["version"] >= 2 and settings["latency_metric"] != "mean_lag":
+        raise RewardError("QALCO v2/v3 requires mean_lag; speech_laal is for historical comparison only")
     settings["quality_floor"] = _number(
-        settings.get("quality_floor", 0.85), "quality_floor", maximum=1, exclusive_minimum=True)
+        settings.get("quality_floor", 0.8 if settings["version"] == 3 else 0.85), "quality_floor", maximum=1, exclusive_minimum=True)
     settings["latency_budget_seconds"] = _number(
         settings.get("latency_budget_seconds", 3.0), "latency_budget_seconds", exclusive_minimum=True)
-    settings["reference_length_ratio"] = _number(
-        settings.get("reference_length_ratio", 1.2), "reference_length_ratio", minimum=1)
-    for name, default in (("latency_weight", 0.2), ("length_weight", 0.1)):
-        settings[name] = _number(settings.get(name, default), name)
+    if settings["version"] != 3:
+        settings["reference_length_ratio"] = _number(
+            settings.get("reference_length_ratio", 1.2), "reference_length_ratio", minimum=1)
+        for name, default in (("latency_weight", 0.2), ("length_weight", 0.1)):
+            settings[name] = _number(settings.get(name, default), name)
+    else:
+        from .gated_reward import validate_v3_settings
+        settings = validate_v3_settings(settings)
     if settings["quality_provider"] == "metricx" or "metricx" in settings:
         from .metricx import validate_metricx_settings
         settings["metricx"] = validate_metricx_settings(settings.get("metricx"))
@@ -196,6 +205,8 @@ def length_penalty(candidate_units, reference_units, ratio):
 
 
 def combine_reward(quality, latency, length_excess, settings):
+    if settings.get("version") == 3:
+        raise RewardError("QALCO v3 must use complete-group finalization, not the historical tier formula")
     quality = _number(quality, "quality", maximum=1)
     latency = _number(latency, "latency")
     length_excess = _number(length_excess, "length_penalty", maximum=1)
@@ -257,7 +268,10 @@ class QalcoScorer:
     def score_group(self, task, trajectories):
         validate_task(task)
         records, pending, hypotheses = [None] * len(trajectories), [], []
-        v2 = self.settings["version"] == 2
+        # v2/v3 share the accepted EOF and protocol contract; v3 only changes
+        # the objective and repetition checks, not the actor observation.
+        v2 = self.settings["version"] >= 2
+        v3 = self.settings["version"] == 3
         eof_cost = self.settings["eof_delay_seconds"] if v2 else 0.0
         reference_units = len(text_units(task["reference_text"]))
         for index, trajectory in enumerate(trajectories):
@@ -295,10 +309,13 @@ class QalcoScorer:
                 records[index] = _invalid("no measurable translation", empty=True)
                 continue
             statistics = latency_statistics(task["duration_seconds"], times, reference_units, eof_cost)
-            excess = length_penalty(len(times), reference_units, self.settings["reference_length_ratio"])
+            excess = 0.0 if v3 else length_penalty(len(times), reference_units, self.settings["reference_length_ratio"])
             guard = {}
             if v2:
-                from .degeneration import degeneration_report
+                if v3:
+                    from .degeneration_v3 import degeneration_report_v3 as degeneration_report
+                else:
+                    from .degeneration import degeneration_report
                 guard = degeneration_report(task["source_text"], task["reference_text"], turns)
                 if guard["severe_repetition"]:
                     records[index] = _invalid("severe cyclic repetition")
@@ -328,7 +345,14 @@ class QalcoScorer:
                 quality = raw if v2 else 1 - raw / 25
                 use_mean_lag = self.settings["latency_metric"] == "mean_lag"
                 latency = statistics["mean_lag_seconds" if use_mean_lag else "laal_seconds"]
-                combined = combine_reward(quality, latency, excess, self.settings)
+                if v3:
+                    from .gated_reward import combine_v3
+                    # This is provisional: the distributed trainer boundary
+                    # will compute C from the actual full GSPO group. Never
+                    # normalize/group candidates in a rank-local ORM callback.
+                    combined = combine_v3(quality, latency, 0.0, guard["repetition_penalty"], self.settings)
+                else:
+                    combined = combine_reward(quality, latency, excess, self.settings)
                 reward = combined.pop("reward")
                 records[index] = {"reward": reward, "components": {
                     "protocol_valid": True, "empty_translation": False,
@@ -343,4 +367,12 @@ class QalcoScorer:
                     "quality_metric": "comet22_reference" if v2 else "metricx24_" + self.settings["metricx"]["mode"],
                     "prefix_support_checked": False,
                 }}
+        if v3:
+            for record in records:
+                components = record["components"]
+                eligible = components["tier"] not in ("invalid", "degenerate")
+                components.update({"reward_version": 3, "eligible": eligible,
+                    "group_finalized": False,
+                    "emitted_units": (components.get("diagnostics") or {}).get("emitted_units", 0),
+                    "repetition_penalty": (components.get("repetition_diagnostics") or {}).get("repetition_penalty", 0.0)})
         return records
