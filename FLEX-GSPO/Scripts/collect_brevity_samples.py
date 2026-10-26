@@ -15,7 +15,12 @@ import re
 import sys
 import time
 
-from collect_training_status import (DEFAULT_RUN, action, arg_value, finite, js,
+if __package__:
+    from ._bootstrap import PROJECT_ROOT
+else:
+    from _bootstrap import PROJECT_ROOT
+
+from Scripts.collect_training_status import (DEFAULT_RUN, action, arg_value, finite, js,
     load_launch, read_tail, reward_groups, source_lookup, stats)
 from flex_gspo.protocol import collect_translation
 from flex_gspo.qalco import text_units

@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock
 
-import audit_reward_candidates as audit
+from Scripts import audit_reward_candidates as audit
 from flex_gspo.rewards import RewardError
 
 

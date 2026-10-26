@@ -1,5 +1,7 @@
 # FLEX-GSPO：QALCO 在线同传强化学习
 
+检查、审计、监控和诊断脚本统一放在 `Scripts/`，完整入口与离线回放输入要求见 [Scripts 使用索引](Scripts/README.md)。下文命令均从项目根目录执行；数据准备、训练入口和 `tests/` 保持原位置。历史记录中的版本、测试结果仍对应当时运行，脚本路径已更新为当前位置。
+
 ## 最新实验入口：QALCO v3
 
 2026-10-23 新增 **05_train_qalco_v3.sh + configs/qalco_v3.json**：质量门控时延、完整同音频 G8 的质量约束长度基准、局部循环复读成本。只使用已有 COMET22 服务，不增加模型服务，不重做数据，不改变已跑通的四卡 Megatron 在线 GSPO 流程。
@@ -41,13 +43,18 @@ bash 05_train_qalco_v3.sh \
 | 文件 | 用途 |
 |---|---|
 | 01_prepare.sh / prepare_data.py | 原始JSONL + WAV目录 → 在线任务清单 |
-| check_comet22_service.py | COMET22连通、返回数组、基本语义排序与反序批量一致性检查 |
-| audit_reward_candidates.py | 利用旧候选检查新评分与复读保护；不生成新轨迹、不伪造EOF |
+| Scripts/check_environment.py | 解释器、依赖、训练能力与模型目录检查 |
+| Scripts/check_comet22_service.py | COMET22连通、返回数组、基本语义排序与反序批量一致性检查 |
+| Scripts/check_metricx_service.py | 可选的历史 MetricX 服务诊断，不参与默认训练奖励 |
+| Scripts/audit_reward_candidates.py | 调用 COMET22 重新评分旧候选；不生成新轨迹、不伪造EOF |
+| Scripts/replay_reward_audit.py | 使用有序、完整逐轮 TXT 和冻结 COMET22 分数离线回放 v3；无 HTTP 请求 |
 | 02_train.sh / train_megatron.py | 通用 Megatron-SWIFT 启动器 |
 | 03_train_3000.sh | G8/B32、micro1、vLLM0.4/16并发，3000步/每500步保存 |
 | 04_train_throughput.sh | 相同目标，micro2、vLLM0.5/32并发，开启阶段计时 |
-| monitor_training.py | 将奖励、EOF、性能和样例日志转成 TensorBoard |
-| analyze_training_run.py | 停止后的离线日志审查，无评分API |
+| Scripts/monitor_training.py | 将奖励、EOF、性能和样例日志转成 TensorBoard |
+| Scripts/collect_training_status.py | 读取训练日志，生成文本状态快照 |
+| Scripts/collect_brevity_samples.py | 导出同音频观测候选及可选非空增量，供长度诊断 |
+| Scripts/analyze_training_run.py | 停止后的离线日志审查，无评分API |
 | configs/default.json | 当前 v2 奖励及服务配置 |
 | docx/QALCO强化学习方案详解.md | 公式、边界与验收说明 |
 
@@ -86,7 +93,7 @@ bash 01_prepare.sh \
 默认完整URL为 http://10.185.1.72:6668/22，请求 srcs/mts/refs；禁用环境代理。用户已确认实际响应是 {"score":[...]}，项目配置 response_key="score"；支持有序数值数组，其他服务的顶层数组键须显式配置。这里的 score 是逐候选数组，不是整体均分；仍拒绝标量均分、嵌套数组、缺失项、NaN、字符串或百分制分数。旧版本还误将 score 键列为禁止项，因此须同时更新客户端代码与配置，不能只改配置。
 
 ~~~bash
-python3 check_comet22_service.py \
+python3 Scripts/check_comet22_service.py \
   --config /data/yb/Code/FLEX/FLEX-GSPO/configs/default.json
 ~~~
 
@@ -105,7 +112,7 @@ python3 check_comet22_service.py \
 以下脚本只读旧日志及数据清单，调用COMET22，不加载Omni、不读取WAV。输出文件必须不存在：
 
 ~~~bash
-python3 audit_reward_candidates.py \
+python3 Scripts/audit_reward_candidates.py \
   --run-dir /data/yb/FLEX/outputs/gspo_throughput_4100_001 \
   --dataset /data/yb/FLEX/datasets/gspo_online_prepared_clean/train.jsonl \
   --output /data/yb/FLEX/outputs/gspo_reward_audit_3000_001.jsonl \
@@ -176,7 +183,7 @@ bash 04_train_throughput.sh \
 另一个终端（训练环境或能读取同目录且装了TensorBoard的环境）：
 
 ~~~bash
-python3 monitor_training.py \
+python3 Scripts/monitor_training.py \
   /data/yb/FLEX/outputs/gspo_comet22_g8_b32_3000_001 \
   --watch \
   --dataset /data/yb/FLEX/datasets/gspo_online_prepared_clean/train.jsonl
@@ -205,7 +212,7 @@ final_wait_fraction可能是“已译完后的正常EOF WAIT”，不等于整�
 ~~~bash
 cd /data/yb/Code/FLEX/FLEX-GSPO
 
-python3 collect_training_status.py \
+python3 Scripts/collect_training_status.py \
   /data/yb/FLEX/outputs/gspo_comet22_g8_b32_3000_001 \
   --dataset /data/yb/FLEX/datasets/gspo_online_prepared_clean/train.jsonl \
   --reward-config /data/yb/Code/FLEX/FLEX-GSPO/configs/default.json \
@@ -220,7 +227,7 @@ python3 collect_training_status.py \
 若要专门审查“少WAIT是否伴随更多找补和更长译文”，导出约160条同音频候选：
 
 ~~~bash
-python3 collect_brevity_samples.py \
+python3 Scripts/collect_brevity_samples.py \
   /data/yb/FLEX/outputs/gspo_comet22_g8_b32_3000_001 \
   --dataset /data/yb/FLEX/datasets/gspo_online_prepared_clean/train.jsonl \
   --max-candidates 160 \
@@ -230,6 +237,8 @@ python3 collect_brevity_samples.py \
 ~~~
 
 保留最近不同音频的全部观测候选，不按质量或长度筛选，不拆组凑数；通常20条音频各8候选约160条。每组原文/参考只写一次，每条候选完整保留最终译文，附长度、原长度惩罚、COMET22、时延、音频WAIT/FLEX/DIRECT次数及独立EOF动作；开启include-increments时还保留所有非空增量。脚本只读已有本轮日志，不重新采样、解码音频或请求评分服务。字数沿用训练text_units口径，相关性仅在同组有效非空候选中描述，不是因果或语义冗余判断；缺prompt_id时按同任务/同训练步整理观测组，不声称重建了GSPO全局分组。若已有同名TXT，改用002。
+
+此导出不强制每组恰好 G8，`--include-increments` 也会省略正常 WAIT 轮，不能直接作为完整逐轮回放输入。`Scripts/replay_reward_audit.py` 需要此前完整逐轮导出包装器生成的 TXT，包含所有音频轮和 EOF、候选身份及完整局部 G8；多个片段必须按原顺序传入。命令与边界见 [Scripts 使用索引](Scripts/README.md)。
 
 固定验证音频对比SFT与checkpoint，抽查事实/数字/否定、漏译、自然性、复读、输出时机。reward上升或loss下降都不能单独证明翻译变好；COMET22若用于训练，也不能再当完全独立的效果证据。
 

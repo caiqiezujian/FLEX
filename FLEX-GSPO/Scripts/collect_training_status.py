@@ -19,6 +19,11 @@ import subprocess
 import sys
 import time
 
+if __package__:
+    from ._bootstrap import PROJECT_ROOT
+else:
+    from _bootstrap import PROJECT_ROOT
+
 
 DEFAULT_RUN = "/data/yb/FLEX/outputs/gspo_comet22_g8_b32_3000_001"
 NATIVE_KEYS = ("loss", "kl", "reward", "reward_std", "frac_reward_zero_std", "grad_norm",

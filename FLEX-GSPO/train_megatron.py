@@ -345,8 +345,8 @@ def main(argv: list[str] | None = None) -> int:
         if settings["version"] not in (2, 3):
             raise ValueError("New training requires QALCO v2/v3 / COMET22 / EOF. v1 is retained for historical audit only.")
         # Fail before GPU initialization; check both transport and basic semantic ordering.
-        subprocess.run([sys.executable, str(ROOT / "check_comet22_service.py"), "--config", a.reward_config], env=env, check=True)
-        subprocess.run([sys.executable, str(ROOT / "check_environment.py"), "--model", a.model,
+        subprocess.run([sys.executable, str(ROOT / "Scripts" / "check_comet22_service.py"), "--config", a.reward_config], env=env, check=True)
+        subprocess.run([sys.executable, str(ROOT / "Scripts" / "check_environment.py"), "--model", a.model,
                         "--require-training", "--required-gpus", "4"], env=env, check=True)
         output = Path(a.output)
         output.mkdir(parents=True, exist_ok=True)

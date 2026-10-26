@@ -13,6 +13,11 @@ import shutil
 import subprocess
 import sys
 
+if __package__:
+    from ._bootstrap import PROJECT_ROOT
+else:
+    from _bootstrap import PROJECT_ROOT
+
 AUDITED_SWIFT_COMMIT = "f15bb91439d756d4a366b51956d72d1f088b7af6"
 PROTOCOL = ("<|WAIT|>", "<|DIRECT|>", "<|FLEX|>")
 CAPABILITIES = {

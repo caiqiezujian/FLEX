@@ -7,6 +7,11 @@ import json
 import logging
 from pathlib import Path
 
+if __package__:
+    from ._bootstrap import PROJECT_ROOT
+else:
+    from _bootstrap import PROJECT_ROOT
+
 from flex_gspo.metricx import ServiceMetricX, ensure_metricx_ready, validate_metricx_settings
 from flex_gspo.rewards import RewardError
 
@@ -44,7 +49,7 @@ def probe(config, mode=None):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default=str(Path(__file__).resolve().parent / "configs" / "default.json"))
+    parser.add_argument("--config", default=str(PROJECT_ROOT / "configs" / "default.json"))
     parser.add_argument("--mode", choices=("qe", "reference", "both"),
                         help="default: use configured mode; both checks the two endpoints separately")
     args = parser.parse_args(argv)

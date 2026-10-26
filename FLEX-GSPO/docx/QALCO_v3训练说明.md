@@ -140,7 +140,7 @@ $$
 cd /data/yb/Code/FLEX/FLEX-GSPO
 source /data/yb/venvs/flex-gspo-online/bin/activate
 python3 -c "import sys; print(sys.executable)"
-python3 check_comet22_service.py --config /data/yb/Code/FLEX/FLEX-GSPO/configs/qalco_v3.json
+python3 Scripts/check_comet22_service.py --config /data/yb/Code/FLEX/FLEX-GSPO/configs/qalco_v3.json
 ~~~
 
 先两步独立验收（含保存），不减小 G8/B32，确保覆盖真实分组：
@@ -180,7 +180,7 @@ bash 05_train_qalco_v3.sh \
 ~~~bash
 cd /data/yb/Code/FLEX/FLEX-GSPO
 source /data/yb/venvs/flex-gspo-online/bin/activate
-python3 monitor_training.py \
+python3 Scripts/monitor_training.py \
   /data/yb/FLEX/outputs/gspo_qalco_v3_g8_b32_3000_001 \
   --watch
 ~~~
@@ -203,7 +203,7 @@ python3 monitor_training.py \
 取最近诊断（纯文本读取，不调用模型或评分服务）：
 
 ~~~bash
-python3 collect_training_status.py \
+python3 Scripts/collect_training_status.py \
   /data/yb/FLEX/outputs/gspo_qalco_v3_g8_b32_3000_001 \
   --reward-config /data/yb/Code/FLEX/FLEX-GSPO/configs/qalco_v3.json \
   --window 10 \
@@ -211,7 +211,9 @@ python3 collect_training_status.py \
   --examples 4
 ~~~
 
-launch JSON 保存完整已校验 reward_settings 和配置哈希，之后不要用新改的配置冒充本次参数。停止后的 analyze_training_run.py 可以检查 v3 奖励算术，但使用的是日志中 C、P；它的每rank分析不独立重建全局长度池，也不认证语义正确性。
+launch JSON 保存完整已校验 reward_settings 和配置哈希，之后不要用新改的配置冒充本次参数。停止后的 `Scripts/analyze_training_run.py` 可以检查 v3 奖励算术，但使用的是日志中 C、P；它的每rank分析不独立重建全局长度池，也不认证语义正确性。
+
+检查、审计和诊断入口已统一放到 `Scripts/`。另有 `Scripts/replay_reward_audit.py`，使用冻结 COMET22 分数和按原顺序提供的完整逐轮 TXT 离线回放 v3，不请求评分服务；完整局部 G8 的输入要求与命令见 [Scripts 使用索引](../Scripts/README.md)。当前 `Scripts/collect_brevity_samples.py --include-increments` 的普通导出会省略正常 WAIT，且不强制 G8，不能直接替代此前完整逐轮导出包装器的输出。
 
 ## 9. 当前没有承诺解决的事
 

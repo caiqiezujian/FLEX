@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-import collect_brevity_samples as brevity
+from Scripts import collect_brevity_samples as brevity
 
 
 class CollectBrevitySamplesTests(unittest.TestCase):

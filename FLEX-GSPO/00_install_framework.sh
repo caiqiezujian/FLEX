@@ -25,4 +25,4 @@ echo 'Installed audited source with --no-deps, preserving the CUDA stack.'
 echo 'Requires compatible Megatron-Core >= 0.16 / TransformerEngine / FlashAttention.'
 echo 'Resolve dependency errors in this isolated environment; do not modify the accepted SFT environment.'
 python3 -m pip check
-python3 "${SCRIPT_DIR}/check_environment.py" --require-training
+python3 "${SCRIPT_DIR}/Scripts/check_environment.py" --require-training

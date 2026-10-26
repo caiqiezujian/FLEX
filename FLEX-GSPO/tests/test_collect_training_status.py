@@ -9,7 +9,7 @@ import tempfile
 import time
 import unittest
 
-import collect_training_status as status
+from Scripts import collect_training_status as status
 
 
 class CollectTrainingStatusTests(unittest.TestCase):

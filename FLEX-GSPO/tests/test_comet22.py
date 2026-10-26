@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import requests
 
-import check_comet22_service as probe_cli
+from Scripts import check_comet22_service as probe_cli
 from flex_gspo.comet22 import ServiceCOMET22, ensure_comet22_ready, validate_comet22_settings
 from flex_gspo.rewards import RewardError
 
@@ -203,7 +203,7 @@ class COMET22ProbeTests(unittest.TestCase):
             config_path = Path(directory) / "config.json"
             config_path.write_text(json.dumps(self.config), encoding="utf-8")
             result = {"quality_regression_passed": False, "batch_order_consistency_passed": True}
-            with patch("check_comet22_service.probe", return_value=result), contextlib.redirect_stdout(io.StringIO()):
+            with patch.object(probe_cli, "probe", return_value=result), contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(probe_cli.main(["--config", str(config_path)]), 2)
                 self.assertEqual(probe_cli.main(["--config", str(config_path), "--transport-only"]), 0)
 

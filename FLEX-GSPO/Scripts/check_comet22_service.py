@@ -11,6 +11,11 @@ import json
 import logging
 from pathlib import Path
 
+if __package__:
+    from ._bootstrap import PROJECT_ROOT
+else:
+    from _bootstrap import PROJECT_ROOT
+
 from flex_gspo.comet22 import ServiceCOMET22, ensure_comet22_ready
 from flex_gspo.rewards import RewardError
 
@@ -93,7 +98,7 @@ def probe(config, cases=None, *, scorer=None, order_tolerance=0.001):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default=str(Path(__file__).resolve().parent / "configs" / "default.json"))
+    parser.add_argument("--config", default=str(PROJECT_ROOT / "configs" / "default.json"))
     parser.add_argument("--cases-jsonl", help="Reviewed cases: id, source_text, reference_text, preferred, dispreferred[]")
     parser.add_argument("--output", help="Save the complete probe report as JSON")
     parser.add_argument("--transport-only", action="store_true",

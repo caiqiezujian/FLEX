@@ -1,7 +1,7 @@
 """Loaded by Megatron-SWIFT --external_plugins, not a replacement trainer.
 
 Supported contract is audited against ms-swift f15bb91439d756d4a366b51956d72d1f088b7af6.
-See check_environment.py before using another installation.
+See Scripts/check_environment.py before using another installation.
 """
 from pathlib import Path
 import sys

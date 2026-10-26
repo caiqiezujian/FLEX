@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import check_metricx_service as probe_cli
+from Scripts import check_metricx_service as probe_cli
 from flex_gspo.rewards import RewardError
 
 
@@ -41,7 +41,7 @@ class ServiceProbeTests(unittest.TestCase):
             path = Path(directory) / "config.json"
             path.write_text(json.dumps(self.config), encoding="utf-8")
             output = io.StringIO()
-            with patch("check_metricx_service.probe", side_effect=RewardError("no reward assigned")), \
+            with patch.object(probe_cli, "probe", side_effect=RewardError("no reward assigned")), \
                     contextlib.redirect_stdout(output):
                 self.assertEqual(probe_cli.main(["--config", str(path)]), 1)
             self.assertEqual(output.getvalue(), "")

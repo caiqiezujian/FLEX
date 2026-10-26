@@ -16,6 +16,11 @@ from pathlib import Path
 import sys
 import time
 
+if __package__:
+    from ._bootstrap import PROJECT_ROOT
+else:
+    from _bootstrap import PROJECT_ROOT
+
 from flex_gspo.monitoring import number, reward_summary, slim_response
 from flex_gspo.qalco import combine_reward, validate_settings
 

@@ -18,6 +18,11 @@ from pathlib import Path
 import re
 import time
 
+if __package__:
+    from ._bootstrap import PROJECT_ROOT
+else:
+    from _bootstrap import PROJECT_ROOT
+
 from flex_gspo.comet22 import ServiceCOMET22
 from flex_gspo.degeneration import degeneration_report
 from flex_gspo.protocol import collect_translation
@@ -238,7 +243,7 @@ def main(argv=None):
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--output", required=True, help="NEW diagnostic JSONL; never a training dataset")
-    parser.add_argument("--config", default=str(Path(__file__).resolve().parent / "configs" / "default.json"))
+    parser.add_argument("--config", default=str(PROJECT_ROOT / "configs" / "default.json"))
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--pids", help="Comma-separated PID suffixes from reward filenames, not host-namespace PIDs")
     parser.add_argument("--compare-metricx", action="store_true", help="Also send texts to configured MetricX service")

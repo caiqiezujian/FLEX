@@ -15,6 +15,11 @@ import re
 import subprocess
 import time
 
+if __package__:
+    from ._bootstrap import PROJECT_ROOT
+else:
+    from _bootstrap import PROJECT_ROOT
+
 from flex_gspo.monitoring import Monitor, SourceLookup
 
 

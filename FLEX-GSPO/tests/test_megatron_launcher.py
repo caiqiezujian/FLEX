@@ -154,6 +154,19 @@ class TestMegatronLauncher(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertFalse(output.exists())
 
+    def test_preflight_uses_relocated_scripts_before_training(self):
+        with tempfile.TemporaryDirectory() as temp, redirect_stdout(StringIO()), \
+                patch.object(launcher, "validate_local_inputs", return_value={}), \
+                patch.object(launcher, "run_identity", return_value={}), \
+                patch.object(launcher, "verify_resume_identity"), \
+                patch.object(launcher.subprocess, "run") as run:
+            run.return_value.returncode = 0
+            self.assertEqual(launcher.main(["/missing/model", "/missing/data", temp]), 0)
+            self.assertEqual(run.call_count, 3)
+            for call, name in zip(run.call_args_list, ("check_comet22_service.py", "check_environment.py")):
+                self.assertEqual(call.args[0][:2], [launcher.sys.executable, str(ROOT / "Scripts" / name)])
+                self.assertTrue(call.kwargs["check"])
+
     def test_throughput_recipe_is_opt_in_and_preserves_objective(self):
         def options(name, target):
             script = (ROOT / name).read_text(encoding="utf-8")

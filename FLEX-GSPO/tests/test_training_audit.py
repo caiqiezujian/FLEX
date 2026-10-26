@@ -7,7 +7,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-import analyze_training_run as audit
+from Scripts import analyze_training_run as audit
 
 
 class TrainingAuditTests(unittest.TestCase):
