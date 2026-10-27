@@ -150,18 +150,25 @@ function setMode(value) {
   ui.micArea.hidden = value !== 'system';
   updateControls();
 }
+function updateTranscriptLanguage() {
+  // A completed transcript keeps its own language until a new session starts
+  // or the user explicitly clears it, even when the next direction changes.
+  const target = session?.targetLang || ui.targetLang.value;
+  ui.targetBadge.textContent = languageNames[target];
+  ui.transcript.lang = target;
+}
 function updateDirection(source) {
   if (busy()) return;
   if (source === 'target') ui.sourceLang.value = ui.targetLang.value === 'zh' ? 'en' : 'zh';
   else ui.targetLang.value = ui.sourceLang.value === 'zh' ? 'en' : 'zh';
-  ui.targetBadge.textContent = languageNames[ui.targetLang.value];
-  ui.transcript.lang = ui.targetLang.value;
+  updateTranscriptLanguage();
 }
 function clearTranscript() {
   if (busy()) return;
   currentTranslation = ''; turns = []; transcriptFragments = 0; lastExport = null; lastMetrics = {};
   totalTurns = 0; translationCharacters = 0; recentRecordCharacters = 0;
   recordsTrimmed = false; windowRollovers = 0; session = null;
+  updateTranscriptLanguage();
   ui.transcript.replaceChildren(); ui.turnList.replaceChildren();
   const hint = document.createElement('p'); hint.className = 'no-turns'; hint.textContent = '暂无记录'; ui.turnList.append(hint);
   ui.transcriptEmpty.hidden = false; ui.translationCount.textContent = '0 个输出片段'; ui.turnCount.textContent = '0 轮';

@@ -31,7 +31,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
 
-from .model import ContextLimit, ModelBackendError, ModelEngine, ModelOptions, ProtocolError, parse_reply
+from .model import ContextLimit, ModelBackendError, ModelEngine, ModelOptions, ProtocolError, SUPPORTED_DIRECTIONS, parse_reply
 from .media import FileQueue, MAX_UPLOAD_BYTES, MediaError, MediaStore, decode_upload
 from .tls import TLSConfigError, prepare_local_tls, validate_tls_files
 from .results import ResultLimit, ResultStore
@@ -47,7 +47,7 @@ class Settings:
     backend: str = 'vllm'
     model: str = ''
     log_dir: Path | None = field(default_factory=lambda: Path('logs'))
-    directions: tuple[str, ...] = ('en-zh', 'zh-en')
+    directions: tuple[str, ...] = SUPPORTED_DIRECTIONS
     chunk_seconds: float = 1.0
     max_chunk_seconds: float = 3.0
     max_pending_seconds: float = 12.0
@@ -92,7 +92,7 @@ class Settings:
                 raise ValueError('inference health thresholds must be finite and positive')
         if self.stalled_inference_seconds <= self.slow_inference_seconds:
             raise ValueError('stalled_inference_seconds must exceed slow_inference_seconds')
-        if not self.directions or any(x not in ('en-zh', 'zh-en') for x in self.directions):
+        if not self.directions or any(x not in SUPPORTED_DIRECTIONS for x in self.directions):
             raise ValueError('directions must contain en-zh and/or zh-en')
         numeric = (self.chunk_seconds, self.max_chunk_seconds, self.max_pending_seconds,
                    self.max_session_seconds, self.idle_timeout_seconds)
@@ -923,7 +923,7 @@ def main():
     parser.add_argument('--token-env', default='FLEX_ACCESS_TOKEN',
                         help='Optional access token environment variable; unset or empty disables authentication')
     parser.add_argument('--allow-origin', action='append', default=[], help='Exact extra allowed Origin; useful behind TLS proxy')
-    parser.add_argument('--directions', nargs='+', choices=['en-zh', 'zh-en'], default=['en-zh', 'zh-en'])
+    parser.add_argument('--directions', nargs='+', choices=SUPPORTED_DIRECTIONS, default=list(SUPPORTED_DIRECTIONS))
     parser.add_argument('--log-dir', type=Path, default=Path('logs'))
     parser.add_argument('--no-log', action='store_true', help='Disable server transcript/event logging')
     parser.add_argument('--chunk-seconds', type=float, default=1.0)

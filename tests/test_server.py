@@ -157,6 +157,41 @@ def test_both_checkpoint_directions_have_isolated_sessions(app_factory, source, 
         assert engine.sessions[0].generated == []
 
 
+def test_web_direction_switch_selects_real_session_prompt(tmp_path, monkeypatch):
+    # Use the actual ModelSession with the mock backend: verify Web routing and
+    # session state together without loading weights or claiming translation quality.
+    engine = server.ModelEngine(backend='mock')
+    sessions = []
+    new_session = engine.new_session
+
+    def record_session(target):
+        session = new_session(target)
+        sessions.append(session)
+        return session
+
+    monkeypatch.setattr(engine, 'new_session', record_session)
+    monkeypatch.setattr(server, 'ModelEngine', lambda *args, **kwargs: engine)
+    app = server.create_app(server.Settings(backend='mock', log_dir=tmp_path / 'logs'))
+    with TestClient(app) as client:
+        # Startup warmup creates its own disposable session before any client.
+        sessions.clear()
+        for source, target, prompt_language in [('en', 'zh', '中文'), ('zh', 'en', 'English')]:
+            with client.websocket_connect('/ws') as ws:
+                ready = connect_ready(ws, source_kind='microphone', source_lang=source, target_lang=target)
+                assert ready['config']['source_lang'] == source
+                assert ready['config']['target_lang'] == target
+                session = sessions[-1]
+                assert session.system_prompt.startswith(
+                    f'你是一个同声传译专家，负责将用户音频中的语音同声翻译为{prompt_language}。')
+                assert session.total_committed_turns == 0
+                assert session.audios == []
+                send_audio(ws, np.zeros(RATE, dtype=np.int16))
+                ws.send_json({'type': 'finish'})
+                assert receive_until(ws, 'done')[-1]['reason'] == 'finished'
+        assert sessions[0] is not sessions[1]
+        assert sessions[0].system_prompt != sessions[1].system_prompt
+
+
 @pytest.mark.parametrize('changes,code', [
     ({'source_lang': 'en', 'target_lang': 'en'}, 'direction'),
     ({'source_lang': 'ja'}, 'direction'),

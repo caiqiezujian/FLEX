@@ -23,7 +23,7 @@ import wave
 
 import numpy as np
 
-from flex_web.model import ModelEngine, ModelOptions, ProtocolError, SAMPLE_RATE, parse_reply
+from flex_web.model import ModelEngine, ModelOptions, ProtocolError, SAMPLE_RATE, SUPPORTED_DIRECTIONS, parse_reply
 
 
 LOG = logging.getLogger('flex.s2tt')
@@ -275,7 +275,7 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--audio', type=Path, required=True, help='Local audio file; never a remote URL')
     p.add_argument('--model', default='', help='Local merged checkpoint and matching tokenizer/processor')
-    p.add_argument('--direction', choices=('en-zh', 'zh-en'), default='en-zh')
+    p.add_argument('--direction', choices=SUPPORTED_DIRECTIONS, default='en-zh')
     p.add_argument('--chunk-seconds', type=float, default=1.0)
     p.add_argument('--pace', choices=('realtime', 'fast'), default='realtime',
                    help='realtime: simulate 1x audio arrival; fast: chunked inference without waiting')

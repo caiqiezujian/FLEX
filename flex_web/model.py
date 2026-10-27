@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import re
 import time
+from types import MappingProxyType
 
 import numpy as np
 
@@ -32,14 +33,23 @@ STOP_TOKENS = ('<|im_end|>', '<|endoftext|>')
 BASE_SPECIALS = ('<|im_start|>', '<|im_end|>', '<|endoftext|>',
                  '<|audio_start|>', '<|audio_pad|>', '<|audio_end|>')
 
-# Intentionally identical to CURRENT SFT preparation, not a new FLEX definition.
-SYSTEM_PROMPT_TEMPLATE = (
-    '你是一个同声传译专家，负责将用户音频中的语音同声翻译为{target_lang}。'
+SUPPORTED_DIRECTIONS = ('en-zh', 'zh-en')
+
+# These strings match the accepted bilingual SFT prompts exactly. In particular,
+# the English-target checkpoint was trained with "English", not the UI label
+# "英语" or "英文". Keep display labels independent from model instructions.
+_STREAMING_RESPONSE_RULES = (
     '用户将按时间顺序逐块发送音频。每收到一块音频后，立即输出响应：'
     '若该块暂无可翻译内容，输出<|WAIT|>；若仅能确认部分译文、语义尚不完整，输出<|FLEX|>并紧跟'
     '确信的译文（只输出有把握的部分，宁少勿错）；若译文语义已完整，输出<|DIRECT|>并紧跟新识别'
     '的译文。所有译文均为增量输出：只输出新增内容，不重复、不修改此前已输出的任何译文。'
 )
+SYSTEM_PROMPTS = MappingProxyType({
+    'zh': ('你是一个同声传译专家，负责将用户音频中的语音同声翻译为中文。'
+           + _STREAMING_RESPONSE_RULES),
+    'en': ('你是一个同声传译专家，负责将用户音频中的语音同声翻译为English。'
+           + _STREAMING_RESPONSE_RULES),
+})
 
 
 class ProtocolError(RuntimeError):
@@ -210,7 +220,7 @@ class ModelEngine:
         self.metadata = {
             'backend': backend,
             'model_name': Path(self.options.model).name if self.options.model else 'DEMO — no model',
-            'directions': ['en-zh', 'zh-en'],
+            'directions': list(SUPPORTED_DIRECTIONS),
             'sample_rate': SAMPLE_RATE,
             'max_model_len': self.options.max_model_len,
             'max_audio_turns': self.options.max_audio_turns,
@@ -397,8 +407,7 @@ class ModelSession:
     def __init__(self, engine, target_lang):
         self.engine = engine
         self.target_lang = target_lang
-        self.system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-            target_lang={'zh': '中文', 'en': '英文'}[target_lang])
+        self.system_prompt = SYSTEM_PROMPTS[target_lang]
         self.audios = []
         self._turns = []
         self.committed_audio_extra_tokens = 0

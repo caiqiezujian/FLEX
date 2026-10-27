@@ -14,6 +14,15 @@ from flex_web.model import (
 )
 
 
+EXPECTED_EN_SYSTEM_PROMPT = (
+    '你是一个同声传译专家，负责将用户音频中的语音同声翻译为English。'
+    '用户将按时间顺序逐块发送音频。每收到一块音频后，立即输出响应：'
+    '若该块暂无可翻译内容，输出<|WAIT|>；若仅能确认部分译文、语义尚不完整，输出<|FLEX|>并紧跟'
+    '确信的译文（只输出有把握的部分，宁少勿错）；若译文语义已完整，输出<|DIRECT|>并紧跟新识别'
+    '的译文。所有译文均为增量输出：只输出新增内容，不重复、不修改此前已输出的任何译文。'
+)
+
+
 class FakeTokenizer:
     def __init__(self, form='special', wrong_ids=False, wrong_layout=False):
         self.specials = {name: i + 100 for i, name in enumerate(BASE_SPECIALS)}
@@ -178,8 +187,8 @@ def test_one_engine_two_directions_and_shutdown(fake_vllm, monkeypatch):
     engine = ModelEngine(options)
     en, zh = engine.new_session('en'), engine.new_session('zh')
     assert len(observed.llms) == 1
-    assert '翻译为英文' in en.system_prompt
-    assert '翻译为中文' in zh.system_prompt
+    assert en.system_prompt == EXPECTED_EN_SYSTEM_PROMPT
+    assert zh.system_prompt == EXPECTED_EN_SYSTEM_PROMPT.replace('English', '中文')
     assert en.history is not zh.history
     opts = observed.llms[0].kwargs
     assert opts['tensor_parallel_size'] == 1
@@ -191,6 +200,26 @@ def test_one_engine_two_directions_and_shutdown(fake_vllm, monkeypatch):
     assert observed.shutdowns == 1
     with pytest.raises(RuntimeError, match='closed'):
         engine.new_session('zh')
+
+
+@pytest.mark.parametrize('target', ['en', 'zh'])
+def test_bilingual_prompt_reaches_vllm_and_survives_context_rollover(fake_vllm, target):
+    options, observed, tokenizer = fake_vllm
+    engine = ModelEngine(replace(options, max_audio_turns=1))
+    session = engine.new_session(target)
+    expected = EXPECTED_EN_SYSTEM_PROMPT if target == 'en' else EXPECTED_EN_SYSTEM_PROMPT.replace('English', '中文')
+    audio = np.zeros(16000, np.float32)
+    try:
+        for _ in range(3):
+            generation = session.generate(audio)
+            sent_prompt = tokenizer.decode(observed.requests[-1]['prompt_token_ids'])
+            assert sent_prompt.startswith('<|im_start|>system\n' + expected + '<|im_end|>\n')
+            assert sent_prompt.count('<|im_start|>system\n') == 1
+            session.commit(audio, generation)
+        assert session.context_metadata['rollovers'] == 2
+    finally:
+        session.close()
+        engine.close()
 
 
 @pytest.mark.parametrize('image_slots', [0, 1])

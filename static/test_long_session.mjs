@@ -77,6 +77,34 @@ function harness() {
     deferAnimationFrames(value) {deferFrames=value;},flushAnimationFrames() {for(const callback of frames.splice(0))callback();}};
 }
 
+test('direction controls keep completed transcript language until the next session', () => {
+  const h = harness();
+  h.evaluate(`appendTurn({tag:'DIRECT',delta:'已输出的中文。',source_start_s:0,source_end_s:1},session);
+    state='done';session.terminal=true;updateDirection('source');`);
+  assert.equal(h.elements.get('targetBadge').textContent,'中文');
+  h.evaluate('ui.swapLang.onclick()');
+  assert.equal(h.elements.get('sourceLang').value,'zh');
+  assert.equal(h.elements.get('targetLang').value,'en');
+  assert.equal(h.elements.get('targetBadge').textContent,'中文');
+  assert.equal(h.elements.get('transcript').lang,'zh');
+  assert.equal(h.evaluate('exportData().target_language'),'zh');
+  assert.equal(h.evaluate('currentTranslation'),'已输出的中文。');
+  h.evaluate('clearTranscript()');
+  assert.equal(h.elements.get('targetBadge').textContent,'英语');
+  assert.equal(h.elements.get('transcript').lang,'en');
+  h.evaluate(`ui.targetLang.value='zh';ui.targetLang.onchange()`);
+  assert.equal(h.elements.get('sourceLang').value,'en');
+  assert.equal(h.elements.get('targetBadge').textContent,'中文');
+});
+
+test('active sessions lock direction controls', () => {
+  const h = harness();
+  h.evaluate('updateControls()');
+  assert.equal(h.elements.get('sourceLang').disabled,true);
+  assert.equal(h.elements.get('targetLang').disabled,true);
+  assert.equal(h.elements.get('swapLang').disabled,true);
+});
+
 test('six hours preserve every transcript fragment while auxiliary research records stay bounded', () => {
   const h = harness();
   h.evaluate(`for(let i=0;i<21600;i++) appendTurn({type:'turn',tag:i%7===0?'WAIT':'DIRECT',delta:i%7===0?'':' 安全增量翻译。',source_start_s:i,source_end_s:i+1,service_s:.1,queue_wait_s:0},session);`);
