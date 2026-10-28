@@ -20,7 +20,6 @@ import uuid
 
 ROOT = Path(__file__).resolve().parent
 AUDITED_SWIFT_COMMIT = "f15bb91439d756d4a366b51956d72d1f088b7af6"
-V4_QUALITY_CASES = ROOT / "configs" / "quality_regressions_v4.jsonl"
 
 
 def parser() -> argparse.ArgumentParser:
@@ -301,8 +300,6 @@ def run_identity(a: argparse.Namespace, manifest: dict) -> dict:
             "dataset_sha256": manifest["sha256"], "dataset_tasks": manifest["tasks"],
             "reward_config_sha256": hash_file(Path(a.reward_config)), "settings": settings,
             "code_sha256": {str(p.relative_to(ROOT)): hash_file(p) for p in source_files}}
-    if load_settings(a)["version"] == 4:
-        identity["quality_regression_cases_sha256"] = hash_file(V4_QUALITY_CASES)
     return identity
 
 
@@ -337,7 +334,7 @@ def main(argv: list[str] | None = None) -> int:
                   file=sys.stderr, flush=True)
         plan = {"audited_swift_commit": AUDITED_SWIFT_COMMIT, "argv": cmd,
                 "reward_settings": settings,
-                "quality_preflight_cases": str(V4_QUALITY_CASES) if settings["version"] == 4 else "built-in basic cases",
+                "quality_validation": {"mode": "manual", "automatic_service_probe": False},
                 "reward_normalization": {
                     "component_normalization": settings["version"] == 4,
                     "upstream_scale_rewards": "none" if settings["version"] == 4 else "group",
@@ -366,11 +363,11 @@ def main(argv: list[str] | None = None) -> int:
         verify_resume_identity(a, plan["run_identity"])
         if settings["version"] not in (2, 3, 4):
             raise ValueError("New training requires QALCO v2/v3/v4 / COMET22 / EOF. v1 is retained for historical audit only.")
-        # Fail before GPU initialization; check both transport and basic semantic ordering.
-        probe_cmd = [sys.executable, str(ROOT / "Scripts" / "check_comet22_service.py"), "--config", a.reward_config]
-        if settings["version"] == 4:
-            probe_cmd.extend(["--cases-jsonl", str(V4_QUALITY_CASES)])
-        subprocess.run(probe_cmd, env=env, check=True)
+        # Quality evaluation is an independent, manually invoked diagnostic.
+        # Do not call scoring services or gate training on synthetic rankings.
+        # Actual rollout scoring still validates responses and propagates errors.
+        print("[launch] Quality validation is manual; no startup scoring probe. "
+              "Training rewards continue to use COMET22.", flush=True)
         subprocess.run([sys.executable, str(ROOT / "Scripts" / "check_environment.py"), "--model", a.model,
                         "--require-training", "--required-gpus", "4"], env=env, check=True)
         output = Path(a.output)

@@ -5,7 +5,7 @@
 | 入口 | 用途与主要输入 | 服务与输出 |
 |---|---|---|
 | [Scripts/check_environment.py](check_environment.py) | 检查解释器、依赖与训练能力；可用 `--model` 检查模型目录，`--cpu-only` 跳过 GPU 检查 | 不安装依赖、不下载或加载模型 |
-| [Scripts/check_comet22_service.py](check_comet22_service.py) | `--config` 指定 COMET22 配置，可用 `--cases-jsonl` 提供人工核查成对样例 | 请求 COMET22，检查响应、语义排序及批量顺序 |
+| [Scripts/check_comet22_service.py](check_comet22_service.py) | 独立手工诊断；`--config` 指定 COMET22 配置，可用 `--cases-jsonl` 提供人工核查成对样例 | 请求 COMET22，检查响应、语义排序及批量顺序；不作为训练启动条件 |
 | [Scripts/check_metricx_service.py](check_metricx_service.py) | `--config` 与可选 `--mode qe/reference/both` | 请求 MetricX，仅供历史或可选诊断 |
 | [Scripts/audit_reward_candidates.py](audit_reward_candidates.py) | `--run-dir`、`--dataset`、`--config`、`--output`，可按 `--pids` 选旧运行 | 请求 COMET22 重新评分；可加 `--compare-metricx`；输出新 JSONL 和摘要 |
 | [Scripts/replay_reward_audit.py](replay_reward_audit.py) | `--input-txt` 按原顺序传入完整逐轮 TXT 片段，`--config` 指定 v3 配置 | 冻结已有 COMET22 分数，无 HTTP；输出到新目录 |
@@ -17,7 +17,9 @@
 | [Scripts/analyze_training_run.py](analyze_training_run.py) | 运行目录、必需的 `--native-log` 和 `--output-dir`，可选 `--reward-config` | 停止后的离线日志审查，不请求评分服务；公式复核受原运行身份约束 |
 | [Scripts/relocate_prepared_data.py](relocate_prepared_data.py) | 旧 prepared `--input-jsonl`、已复制 WAV 的 `--audio-dir`、新 `--output-dir`，可用 `--workers 16` | 核验 WAV 元数据，重建两处音频引用；不复制音频、不请求服务、不覆盖旧清单 |
 
-各入口可用 `python3 Scripts/<脚本名>.py --help` 查看参数。训练、服务检查与监控的完整示例见[项目 README](../README.md)和 [QALCO v3 训练说明](../docx/QALCO_v3训练说明.md)。
+各入口可用 `python3 Scripts/<脚本名>.py --help` 查看参数。训练、手工服务诊断与监控的完整示例见[项目 README](../README.md)、[QALCO v4 训练说明](../docx/QALCO_v4训练说明.md)和 [QALCO v3 历史训练说明](../docx/QALCO_v3训练说明.md)。
+
+`check_comet22_service.py` 和 `configs/quality_regressions_v4.jsonl` 保留为独立手工工具及样例。训练启动器不自动运行该脚本，不以它的结果作为启动条件，也不把该样例文件纳入 `run_identity` 恢复身份；验证由用户自行安排。检查通过不等于 COMET 误判已消除，未通过也不改变现有 COMET22 奖励公式。训练运行时仍校验服务响应；数据、框架和恢复一致性检查继续保留。
 
 `collect_reward_revision.py` 只支持已验证的 G8、每次生成一次更新、标量 QALCO 组归一化配置。按 launch 的 session/run 筛选奖励，按已完成训练步核对全部 rank 与完整组；有缺失或重复的奖励步骤会整步排除并报告。它读取全部已完成步骤，选取整组全 WAIT、部分空译、异常输出、质量接近但长度有差异的组，并以固定哈希顺序补充不同音频。样例为诊断抽样，不是随机验证集；质量缺失保持缺失，省略号和短句计数不直接等同错误。原始音频、模型和训练环境均无需加载。
 

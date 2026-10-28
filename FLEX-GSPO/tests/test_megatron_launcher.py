@@ -214,50 +214,72 @@ class TestMegatronLauncher(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertFalse(output.exists())
 
-    def test_preflight_uses_relocated_scripts_before_training(self):
-        with tempfile.TemporaryDirectory() as temp, redirect_stdout(StringIO()), \
-                patch.object(launcher, "validate_local_inputs", return_value={}), \
-                patch.object(launcher, "run_identity", return_value={}), \
-                patch.object(launcher, "verify_resume_identity"), \
-                patch.object(launcher.subprocess, "run") as run:
-            run.return_value.returncode = 0
-            self.assertEqual(launcher.main(["/missing/model", "/missing/data", temp]), 0)
-            self.assertEqual(run.call_count, 3)
-            for call, name in zip(run.call_args_list, ("check_comet22_service.py", "check_environment.py")):
-                self.assertEqual(call.args[0][:2], [launcher.sys.executable, str(ROOT / "Scripts" / name)])
-                self.assertTrue(call.kwargs["check"])
+    def test_all_supported_versions_launch_without_scoring_preflight(self):
+        for config in ("default.json", "qalco_v3.json", "qalco_v4.json"):
+            with self.subTest(config=config), tempfile.TemporaryDirectory() as temp, \
+                    redirect_stdout(StringIO()) as stdout, \
+                    patch.object(launcher, "validate_local_inputs", return_value={}), \
+                    patch.object(launcher, "run_identity", return_value={}), \
+                    patch.object(launcher, "verify_resume_identity"), \
+                    patch.object(launcher.subprocess, "run") as run, \
+                    patch("flex_gspo.comet22.ServiceCOMET22.score_batch",
+                          side_effect=AssertionError("Startup must not score COMET22 samples")), \
+                    patch("flex_gspo.metricx.ServiceMetricX.score_batch",
+                          side_effect=AssertionError("Startup must not score MetricX samples")):
+                run.return_value.returncode = 0
+                self.assertEqual(launcher.main(["/missing/model", "/missing/data", temp,
+                                                "--reward-config", str(ROOT / "configs" / config)]), 0)
+                self.assertEqual(run.call_count, 2)
+                environment_check, training = run.call_args_list
+                self.assertEqual(environment_check.args[0][:2],
+                                 [launcher.sys.executable, str(ROOT / "Scripts" / "check_environment.py")])
+                self.assertTrue(environment_check.kwargs["check"])
+                self.assertEqual(training.args[0][:3],
+                                 [launcher.sys.executable, "-m", "torch.distributed.run"])
+                self.assertFalse(training.kwargs["check"])
+                plan = json.JSONDecoder().raw_decode(stdout.getvalue())[0]
+                self.assertEqual(plan["quality_validation"],
+                                 {"mode": "manual", "automatic_service_probe": False})
+                self.assertEqual(plan["reward_settings"]["quality_provider"], "comet22")
+                self.assertNotIn("quality_preflight_cases", plan)
+                self.assertEqual(len(list(Path(temp).glob("launch_*.json"))), 1)
 
-    def test_v4_preflight_uses_semantic_cases_and_never_starts_on_failure(self):
+    def test_framework_failure_still_stops_before_training(self):
         with tempfile.TemporaryDirectory() as temp, redirect_stdout(StringIO()), redirect_stderr(StringIO()), \
                 patch.object(launcher, "validate_local_inputs", return_value={}), \
                 patch.object(launcher, "run_identity", return_value={}), \
                 patch.object(launcher, "verify_resume_identity"), \
                 patch.object(launcher.subprocess, "run") as run:
-            run.side_effect = launcher.subprocess.CalledProcessError(2, "quality probe")
+            run.side_effect = launcher.subprocess.CalledProcessError(2, "framework check")
             status = launcher.main(["/missing/model", "/missing/data", temp,
                                     "--reward-config", str(ROOT / "configs" / "qalco_v4.json")])
             self.assertEqual(status, 2)
             self.assertEqual(run.call_count, 1)
             command = run.call_args.args[0]
-            self.assertEqual(command[command.index("--cases-jsonl") + 1], str(launcher.V4_QUALITY_CASES))
+            self.assertEqual(command[:2],
+                             [launcher.sys.executable, str(ROOT / "Scripts" / "check_environment.py")])
             self.assertTrue(run.call_args.kwargs["check"])
             self.assertFalse(list(Path(temp).glob("launch_*.json")))
 
-    def test_v4_resume_identity_binds_quality_regression_case_contents(self):
+    def test_v4_identity_does_not_require_or_hash_manual_quality_cases(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             model = root / "model"
             model.mkdir()
-            cases = root / "cases.jsonl"
-            cases.write_text('{"id":"synthetic-a"}\n', encoding="utf-8")
+            (root / "configs").mkdir()
+            (root / "flex_gspo").mkdir()
+            for name in ("swift_plugin.py", "train_megatron.py"):
+                (root / name).write_text("# identity fixture\n", encoding="utf-8")
+            cases = root / "configs" / "quality_regressions_v4.jsonl"
             args = self.args("--reward-config", str(ROOT / "configs" / "qalco_v4.json"))
             args.model = str(model)
-            with patch.object(launcher, "V4_QUALITY_CASES", cases):
+            with patch.object(launcher, "ROOT", root):
+                # Missing or edited manual diagnostics are not training inputs.
                 first = launcher.run_identity(args, {"sha256": "data", "tasks": 4})
-                self.assertEqual(first["quality_regression_cases_sha256"], launcher.hash_file(cases))
-                cases.write_text('{"id":"synthetic-b"}\n', encoding="utf-8")
+                cases.write_text("manually edited diagnostic cases\n", encoding="utf-8")
                 second = launcher.run_identity(args, {"sha256": "data", "tasks": 4})
-            self.assertNotEqual(first["quality_regression_cases_sha256"], second["quality_regression_cases_sha256"])
+            self.assertEqual(first, second)
+            self.assertNotIn("quality_regression_cases_sha256", first)
 
     def test_throughput_recipe_is_opt_in_and_preserves_objective(self):
         def options(name, target):

@@ -19,9 +19,9 @@ bash 06_train_qalco_v4.sh \
   /data06/yb/Code/FLEX/outputs/gspo_v4_g8_b32_3000_1028_001
 ~~~
 
-先在另一个新目录追加 `--train-iters 2 --save-steps 2` 完成 GPU 采样、更新、保存验收，再运行正式目录。新版 normalized reward 的均值不能当作质量上升曲线；TensorBoard 应同时看原始 `quality/mean`、`latency_seconds/mean`、空译/格式错误比例、组内质量标准差和 `estimated_advantage`，翻译改善仍需固定验证样本。分项缩放不能修复 COMET 未识别的否定范围、漏译或幻觉错误。
+验证由用户自行安排；如需 GPU 采样、更新、保存的两步短验收，可在另一个新目录追加 `--train-iters 2 --save-steps 2`，它不是正式训练的启动条件。新版 normalized reward 的均值不能当作质量上升曲线；TensorBoard 应同时看原始 `quality/mean`、`latency_seconds/mean`、空译/格式错误比例、组内质量标准差和 `estimated_advantage`，翻译改善仍需固定验证样本。分项缩放不能修复 COMET 未识别的否定范围、漏译或幻觉错误。
 
-v4 启动前默认调用 `configs/quality_regressions_v4.jsonl` 的独立合成语义对照，检查 COMET 对否定范围、论元、数字和无依据添加的排序。未通过会在启动 GPU 训练前停止；不会把服务失败当作模型零分、不会静默跳过检查。通过少量对照也不能保证真实数据没有误判；对照文件的 SHA256 纳入恢复训练身份校验。
+v4 启动器不调用 `Scripts/check_comet22_service.py`，不在启动前请求 COMET 做语义或评分预检。该脚本和 `configs/quality_regressions_v4.jsonl` 保留为独立手工诊断，运行时机及结果审查由用户自行安排；检查结果不作为训练启动条件，对照文件也不纳入 `run_identity` 恢复身份。取消预检不表示 COMET 的误判已解决，通过少量对照也不能保证真实数据没有误判。启动时的数据、框架和恢复一致性检查，以及训练运行时的服务响应校验继续保留；COMET22 与现有 v4 奖励公式、参数不变。
 
 ## 历史实验入口：QALCO v3
 
@@ -65,7 +65,7 @@ bash 05_train_qalco_v3.sh \
 |---|---|
 | 01_prepare.sh / prepare_data.py | 原始JSONL + WAV目录 → 在线任务清单 |
 | Scripts/check_environment.py | 解释器、依赖、训练能力与模型目录检查 |
-| Scripts/check_comet22_service.py | COMET22连通、返回数组、基本语义排序与反序批量一致性检查 |
+| Scripts/check_comet22_service.py | 独立手工诊断 COMET22 连通、返回数组、基本语义排序与反序批量一致性，不作为训练启动条件 |
 | Scripts/check_metricx_service.py | 可选的历史 MetricX 服务诊断，不参与默认训练奖励 |
 | Scripts/audit_reward_candidates.py | 调用 COMET22 重新评分旧候选；不生成新轨迹、不伪造EOF |
 | Scripts/replay_reward_audit.py | 使用有序、完整逐轮 TXT 和冻结 COMET22 分数离线回放 v3；无 HTTP 请求 |
@@ -109,16 +109,18 @@ bash 01_prepare.sh \
 
 原始一行仍是 key、lang、en.txt、zh.txt，key对应key.wav。准备阶段保留原音频位置，输出虚拟分块；不制造离线G8轨迹。源文和机器参考仅用于奖励，不进入actor消息。Linux路径区分 Flex 与 FLEX，请确认真实路径。
 
-## 4. 先检查 COMET22
+## 4. 手工诊断 COMET22（独立运行）
 
 默认完整URL为 http://10.185.1.72:6668/22，请求 srcs/mts/refs；禁用环境代理。用户已确认实际响应是 {"score":[...]}，项目配置 response_key="score"；支持有序数值数组，其他服务的顶层数组键须显式配置。这里的 score 是逐候选数组，不是整体均分；仍拒绝标量均分、嵌套数组、缺失项、NaN、字符串或百分制分数。旧版本还误将 score 键列为禁止项，因此须同时更新客户端代码与配置，不能只改配置。
+
+以下为用户自行安排的独立诊断命令，不由训练启动器调用，检查结果不控制训练能否启动。示例沿用本节的 v2 配置；v4 的手工命令见 [QALCO v4 训练说明](docx/QALCO_v4训练说明.md)。
 
 ~~~bash
 python3 Scripts/check_comet22_service.py \
   --config /data/yb/Code/FLEX/FLEX-GSPO/configs/default.json
 ~~~
 
-检查包括正确译文相对否定翻转、明显无关译文的排序。循环复读排名另作诊断，因为新复读保护独立于模型分数。模型身份只是操作者声明；服务没有提供截断信息时，客户端不能证明远端没有截断。检查失败不要用 transport-only 绕过正式训练；该选项只用于定位网络/响应协议问题。
+检查包括正确译文相对否定翻转、明显无关译文的排序。循环复读排名另作诊断，因为新复读保护独立于模型分数。模型身份只是操作者声明；服务没有提供截断信息时，客户端不能证明远端没有截断。`--transport-only` 只改变手工诊断脚本的退出条件，仍会报告语义排序和批量顺序检查结果；它不证明语义问题已解决，也不影响训练启动器。
 
 可用 --cases-jsonl 加载人工核查的真实成对例子，格式：
 
