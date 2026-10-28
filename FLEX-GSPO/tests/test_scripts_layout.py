@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = (
     "analyze_training_run", "audit_reward_candidates", "check_comet22_service",
     "check_environment", "check_metricx_service", "collect_brevity_samples",
-    "collect_training_status", "monitor_training", "replay_reward_audit",
+    "collect_training_status", "monitor_training", "replay_reward_audit", "relocate_prepared_data",
 )
 
 

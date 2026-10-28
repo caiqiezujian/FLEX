@@ -115,6 +115,66 @@ class TestMegatronLauncher(unittest.TestCase):
         self.assertEqual(plan["reward_settings"]["version"], 3)
         self.assertEqual(plan["reward_settings"]["v3"]["brevity_weight"], .08)
 
+    def test_v4_changes_only_reward_scaling_in_accepted_engine(self):
+        shared = ("--global-batch-size", "32", "--micro-batch-size", "2",
+                  "--vllm-memory", "0.5", "--vllm-max-num-seqs", "32")
+        before = launcher.build_command(self.args(*shared, "--reward-config", str(ROOT / "configs" / "qalco_v3.json")))
+        after = launcher.build_command(self.args(*shared, "--reward-config", str(ROOT / "configs" / "qalco_v4.json")))
+        def flags(command):
+            start = command.index("--rlhf_type")
+            return dict(zip(command[start::2], command[start + 1::2]))
+        old_flags, new_flags = flags(before), flags(after)
+        self.assertEqual(old_flags["--scale_rewards"], "group")
+        self.assertEqual(new_flags["--scale_rewards"], "none")
+        self.assertEqual({key for key in old_flags if old_flags[key] != new_flags[key]}, {"--scale_rewards"})
+        self.assertEqual(set(new_flags) - set(old_flags), {"--advantage_estimator", "--kl_in_reward"})
+        self.assertEqual(new_flags["--advantage_estimator"], "grpo")
+        self.assertEqual(new_flags["--kl_in_reward"], "false")
+        for flag, expected in (("--importance_sampling_level", "sequence"), ("--epsilon", "0.0003"),
+                               ("--epsilon_high", "0.0004"), ("--num_iterations", "1"),
+                               ("--beta", "0.01"), ("--lr", "1e-06"),
+                               ("--vllm_mm_processor_cache_gb", "0.0"),
+                               ("--log_completions", "false"), ("--max_turns", "65")):
+            self.assertEqual(after[after.index(flag) + 1], expected)
+
+    def test_v4_wrapper_chain_preserves_capacity_and_smoke_overrides(self):
+        options = []
+        for name, target in (("03_train_3000.sh", "02_train.sh"),
+                             ("04_train_throughput.sh", "03_train_3000.sh"),
+                             ("06_train_qalco_v4.sh", "04_train_throughput.sh")):
+            script = (ROOT / name).read_text(encoding="utf-8")
+            tokens = shlex.split(script[script.index("exec bash "):].replace("\\\n", " "))
+            self.assertEqual(tokens[2], "${SCRIPT_DIR}/" + target)
+            self.assertEqual(tokens[-1], "$@")
+            options.extend(value.replace("${SCRIPT_DIR}", str(ROOT)) for value in tokens[3:-1])
+        parsed = self.args(*options)
+        self.assertEqual((parsed.group_size, parsed.global_batch_size, parsed.micro_batch_size,
+                          parsed.vllm_max_num_seqs, parsed.vllm_memory, parsed.train_iters,
+                          parsed.save_steps, parsed.max_turns), (8, 32, 2, 32, .5, 3000, 500, 65))
+        self.assertEqual(parsed.vllm_mm_processor_cache_gb, 0)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "new-smoke"
+            with redirect_stdout(StringIO()) as stdout:
+                code = launcher.main(["/missing/model", "/missing/train.jsonl", str(output), *options,
+                                      "--train-iters", "2", "--save-steps", "2", "--dry-run"])
+            self.assertEqual(code, 0)
+            self.assertFalse(output.exists())
+            plan = json.JSONDecoder().raw_decode(stdout.getvalue())[0]
+        self.assertEqual(plan["reward_settings"]["version"], 4)
+        self.assertEqual(plan["reward_normalization"]["upstream_scale_rewards"], "none")
+        self.assertTrue(plan["reward_normalization"]["upstream_group_mean_baseline"])
+        self.assertEqual(plan["sampling"]["fresh_prompts_per_generation"], 4)
+        self.assertEqual(plan["argv"][plan["argv"].index("--train_iters") + 1], "2")
+
+    def test_command_rejects_missing_or_invalid_reward_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bad.json"
+            for payload in (None, "{}", '{"reward":{"version":99}}'):
+                if payload is not None:
+                    path.write_text(payload, encoding="utf-8")
+                with self.subTest(payload=payload), self.assertRaises((ValueError, RuntimeError)):
+                    launcher.build_command(self.args("--reward-config", str(path)))
+
     def test_rollout_logging_is_local_not_an_unsupported_swift_flag(self):
         a = self.args("--rollout-log-every", "1", "--global-batch-size", "32")
         cmd = launcher.build_command(a)
@@ -166,6 +226,38 @@ class TestMegatronLauncher(unittest.TestCase):
             for call, name in zip(run.call_args_list, ("check_comet22_service.py", "check_environment.py")):
                 self.assertEqual(call.args[0][:2], [launcher.sys.executable, str(ROOT / "Scripts" / name)])
                 self.assertTrue(call.kwargs["check"])
+
+    def test_v4_preflight_uses_semantic_cases_and_never_starts_on_failure(self):
+        with tempfile.TemporaryDirectory() as temp, redirect_stdout(StringIO()), redirect_stderr(StringIO()), \
+                patch.object(launcher, "validate_local_inputs", return_value={}), \
+                patch.object(launcher, "run_identity", return_value={}), \
+                patch.object(launcher, "verify_resume_identity"), \
+                patch.object(launcher.subprocess, "run") as run:
+            run.side_effect = launcher.subprocess.CalledProcessError(2, "quality probe")
+            status = launcher.main(["/missing/model", "/missing/data", temp,
+                                    "--reward-config", str(ROOT / "configs" / "qalco_v4.json")])
+            self.assertEqual(status, 2)
+            self.assertEqual(run.call_count, 1)
+            command = run.call_args.args[0]
+            self.assertEqual(command[command.index("--cases-jsonl") + 1], str(launcher.V4_QUALITY_CASES))
+            self.assertTrue(run.call_args.kwargs["check"])
+            self.assertFalse(list(Path(temp).glob("launch_*.json")))
+
+    def test_v4_resume_identity_binds_quality_regression_case_contents(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = root / "model"
+            model.mkdir()
+            cases = root / "cases.jsonl"
+            cases.write_text('{"id":"synthetic-a"}\n', encoding="utf-8")
+            args = self.args("--reward-config", str(ROOT / "configs" / "qalco_v4.json"))
+            args.model = str(model)
+            with patch.object(launcher, "V4_QUALITY_CASES", cases):
+                first = launcher.run_identity(args, {"sha256": "data", "tasks": 4})
+                self.assertEqual(first["quality_regression_cases_sha256"], launcher.hash_file(cases))
+                cases.write_text('{"id":"synthetic-b"}\n', encoding="utf-8")
+                second = launcher.run_identity(args, {"sha256": "data", "tasks": 4})
+            self.assertNotEqual(first["quality_regression_cases_sha256"], second["quality_regression_cases_sha256"])
 
     def test_throughput_recipe_is_opt_in_and_preserves_objective(self):
         def options(name, target):

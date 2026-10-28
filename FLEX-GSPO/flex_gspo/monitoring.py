@@ -145,12 +145,22 @@ def _summary(values):
 
 
 def reward_summary(records):
-    """Local callback summaries only; no inferred global G8 groups/advantages."""
+    """Local callback summaries; v4 advantages are logged by the group scorer.
+
+    Never reconstruct groups from a partial local callback. Group diagnostics
+    are candidate-weighted here, and normalized reward means do not measure
+    absolute translation quality. Raw COMET, validity and delay stay separate.
+    """
     result = {"candidates": len(records)}
     scalar_fields = ("quality", "metricx_error", "comet22_score", "latency_seconds", "mean_lag_seconds", "length_penalty",
                      "quality_deficit_penalty", "quality_gate", "latency_cost_raw", "latency_penalty",
                      "group_brevity_excess", "weighted_brevity_penalty", "repetition_penalty",
-                     "weighted_repetition_penalty", "group_length_anchor", "anchor_pool_size")
+                     "weighted_repetition_penalty", "group_length_anchor", "anchor_pool_size",
+                     "normalized_quality", "normalized_latency", "weighted_quality_signal",
+                     "weighted_latency_signal", "quality_group_mean", "quality_group_std",
+                     "latency_group_mean", "latency_group_std", "quality_normalization_scale",
+                     "latency_normalization_scale", "group_eligible_count", "estimated_advantage",
+                     "group_reward_mean", "failure_reward", "utility_raw")
     for key in ("reward", *scalar_fields):
         values = [r.get("reward") if key == "reward" else r.get("components", {}).get(key) for r in records]
         for name, value in _summary([float(v) for v in values if number(v)]).items():
@@ -163,6 +173,19 @@ def reward_summary(records):
             result["diagnostics/" + key + "/" + name] = value
     for flag in ("protocol_valid", "empty_translation", "quality_pass", "latency_pass", "feasible", "severe_repetition", "group_finalized"):
         result[flag + "_fraction"] = sum(r.get("components", {}).get(flag) is True for r in records) / len(records)
+    # Missing historical fields mean unknown, not zero failures. These are
+    # local candidate fractions even when the flag describes a complete group.
+    for flag in ("group_all_invalid", "group_all_quality_fail", "low_quality_positive_advantage"):
+        flags = [r.get("components", {}).get(flag) for r in records]
+        known = [value for value in flags if type(value) is bool]
+        result[flag + "_known_count"] = len(known)
+        if known:
+            result[flag + "_fraction"] = sum(known) / len(known)
+    advantages = [r.get("components", {}).get("estimated_advantage") for r in records]
+    advantages = [float(value) for value in advantages if number(value)]
+    if advantages:
+        result["estimated_advantage/abs_mean"] = sum(abs(value) for value in advantages) / len(advantages)
+        result["estimated_advantage/positive_fraction"] = sum(value > 0 for value in advantages) / len(advantages)
     for tier in ("feasible", "quality_fail", "latency_fail", "invalid", "degenerate"):
         result["tier/" + tier + "_fraction"] = sum(r.get("components", {}).get("tier") == tier for r in records) / len(records)
     actions = Counter()

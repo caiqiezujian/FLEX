@@ -20,6 +20,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parent
 AUDITED_SWIFT_COMMIT = "f15bb91439d756d4a366b51956d72d1f088b7af6"
+V4_QUALITY_CASES = ROOT / "configs" / "quality_regressions_v4.jsonl"
 
 
 def parser() -> argparse.ArgumentParser:
@@ -102,9 +103,20 @@ def validate_options(a: argparse.Namespace) -> None:
         raise ValueError("master-port must be in 1024..65535")
 
 
-def build_command(a: argparse.Namespace) -> list[str]:
+def load_settings(a: argparse.Namespace) -> dict:
+    from flex_gspo.online_reward import load_reward_config
+    from flex_gspo.qalco import validate_settings
+    return validate_settings(load_reward_config(a.reward_config))
+
+
+def build_command(a: argparse.Namespace, *, reward_settings=None) -> list[str]:
     """Flags checked against the audited upstream implementation."""
     validate_options(a)
+    settings = load_settings(a) if reward_settings is None else reward_settings
+    # v4 normalizes quality and gated delay inside complete prompt groups.
+    # Upstream still subtracts the group mean; a second std division would
+    # amplify near-ties again and undo the configured component scale floors.
+    scale_rewards = "none" if settings["version"] == 4 else "group"
     cmd = [sys.executable, "-m", "torch.distributed.run", "--nproc_per_node", "4", "--nnodes", "1",
            "--master_port", str(a.master_port), "--module", "swift.cli._megatron.rlhf"]
     pairs = {
@@ -127,7 +139,7 @@ def build_command(a: argparse.Namespace) -> list[str]:
         "gradient_accumulation_fusion": "false", "attention_backend": "flash",
         "lr": a.lr, "min_lr": a.lr * 0.1, "lr_warmup_fraction": "0.03", "clip_grad": "1",
         "beta": a.kl_beta, "importance_sampling_level": "sequence", "epsilon": "0.0003",
-        "epsilon_high": "0.0004", "loss_type": "grpo", "scale_rewards": "group",
+        "epsilon_high": "0.0004", "loss_type": "grpo", "scale_rewards": scale_rewards,
         "dynamic_sample": "false", "overlong_filter": "false", "truncation_strategy": "delete",
         "max_length": a.max_length, "max_completion_length": a.max_new_tokens,
         "completion_length_limit_scope": "per_round", "max_turns": a.max_turns,
@@ -154,6 +166,8 @@ def build_command(a: argparse.Namespace) -> list[str]:
     # Keep the original full-mode flags exactly; never pass them in selective mode.
     if a.recompute_granularity == "full":
         pairs.update({"recompute_method": "uniform", "recompute_num_layers": "1"})
+    if settings["version"] == 4:
+        pairs.update({"advantage_estimator": "grpo", "kl_in_reward": "false"})
     if a.resume_from:
         pairs["mcore_adapter"] = a.resume_from
     for key, value in pairs.items():
@@ -282,11 +296,14 @@ def run_identity(a: argparse.Namespace, manifest: dict) -> dict:
     # Include train_iters: changing the LR decay horizon mid-run is not exact resume.
     settings = {k: v for k, v in vars(a).items() if k not in ignored}
     source_files = [ROOT / "swift_plugin.py", ROOT / "train_megatron.py", *sorted((ROOT / "flex_gspo").glob("*.py"))]
-    return {"schema": 1, "framework_commit": AUDITED_SWIFT_COMMIT, "model_path": str(model),
+    identity = {"schema": 1, "framework_commit": AUDITED_SWIFT_COMMIT, "model_path": str(model),
             "model_metadata_sha256": model_metadata, "weight_file_metadata": weights,
             "dataset_sha256": manifest["sha256"], "dataset_tasks": manifest["tasks"],
             "reward_config_sha256": hash_file(Path(a.reward_config)), "settings": settings,
             "code_sha256": {str(p.relative_to(ROOT)): hash_file(p) for p in source_files}}
+    if load_settings(a)["version"] == 4:
+        identity["quality_regression_cases_sha256"] = hash_file(V4_QUALITY_CASES)
+    return identity
 
 
 def verify_resume_identity(a: argparse.Namespace, identity: dict) -> None:
@@ -311,10 +328,8 @@ def verify_resume_identity(a: argparse.Namespace, identity: dict) -> None:
 def main(argv: list[str] | None = None) -> int:
     a = parser().parse_args(argv)
     try:
-        cmd, env = build_command(a), build_environment(a)
-        from flex_gspo.online_reward import load_reward_config
-        from flex_gspo.qalco import validate_settings
-        settings = validate_settings(load_reward_config(a.reward_config))
+        settings = load_settings(a)
+        cmd, env = build_command(a, reward_settings=settings), build_environment(a)
         if a.vllm_mm_processor_cache_gb > 0:
             print("[launch] WARNING: Multimodal caches are enabled explicitly. This removes the default "
                   "bypass for the observed vLLM 0.19.1 cache-clear hang; verify an upstream fix and a "
@@ -322,6 +337,13 @@ def main(argv: list[str] | None = None) -> int:
                   file=sys.stderr, flush=True)
         plan = {"audited_swift_commit": AUDITED_SWIFT_COMMIT, "argv": cmd,
                 "reward_settings": settings,
+                "quality_preflight_cases": str(V4_QUALITY_CASES) if settings["version"] == 4 else "built-in basic cases",
+                "reward_normalization": {
+                    "component_normalization": settings["version"] == 4,
+                    "upstream_scale_rewards": "none" if settings["version"] == 4 else "group",
+                    "upstream_group_mean_baseline": True,
+                    "note": "v4: component scaling then group mean centering only; no second std division. "
+                            "Normalized reward means are not translation-quality trends."},
                 "environment": {k: env[k] for k in ("CUDA_VISIBLE_DEVICES", "ENABLE_AUDIO_OUTPUT", "FLEX_REWARD_CONFIG",
                                                      "FLEX_REWARD_LOG_DIR", "FLEX_ROLLOUT_LOG_EVERY", "PYTHONPATH")},
                 "rollout_sync": "FLEX plugin: completion predicate uses actual vLLM TP group; Megatron data groups unchanged",
@@ -342,10 +364,13 @@ def main(argv: list[str] | None = None) -> int:
         manifest = validate_local_inputs(a)
         plan["run_identity"] = run_identity(a, manifest)
         verify_resume_identity(a, plan["run_identity"])
-        if settings["version"] not in (2, 3):
-            raise ValueError("New training requires QALCO v2/v3 / COMET22 / EOF. v1 is retained for historical audit only.")
+        if settings["version"] not in (2, 3, 4):
+            raise ValueError("New training requires QALCO v2/v3/v4 / COMET22 / EOF. v1 is retained for historical audit only.")
         # Fail before GPU initialization; check both transport and basic semantic ordering.
-        subprocess.run([sys.executable, str(ROOT / "Scripts" / "check_comet22_service.py"), "--config", a.reward_config], env=env, check=True)
+        probe_cmd = [sys.executable, str(ROOT / "Scripts" / "check_comet22_service.py"), "--config", a.reward_config]
+        if settings["version"] == 4:
+            probe_cmd.extend(["--cases-jsonl", str(V4_QUALITY_CASES)])
+        subprocess.run(probe_cmd, env=env, check=True)
         subprocess.run([sys.executable, str(ROOT / "Scripts" / "check_environment.py"), "--model", a.model,
                         "--require-training", "--required-gpus", "4"], env=env, check=True)
         output = Path(a.output)

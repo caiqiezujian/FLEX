@@ -5,3 +5,6 @@ outputs/
 data/
 .pytest_cache/
 *.log
+# Synthetic, reviewed service regression cases required by the v4 launcher.
+# The repository-wide *.jsonl data exclusion remains in force elsewhere.
+!configs/quality_regressions_v4.jsonl

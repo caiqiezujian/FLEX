@@ -1,4 +1,4 @@
-"""Finalize QALCO v3 on complete, ordered GSPO groups before advantages.
+"""Finalize QALCO v3/v4 on complete, ordered GSPO groups before advantages.
 
 The ordinary ORM performs local COMET scoring first. This bridge exchanges only
 scalar metadata, never audio, translations, reference text or model tensors.
@@ -6,7 +6,7 @@ World-rank order is deliberately identical to the audited trainer's reward
 ``gather`` followed by ``view(-1, num_generations)``. Repeated task IDs must NOT
 merge separate prompt draws.
 
-There are two unconditional world collectives per successful v3 scoring call:
+There are two unconditional world collectives per successful group scoring call:
 metadata/error envelopes, then finalize/commit status. A local scoring or file
 write failure therefore cannot leave healthy peers entering advantage gathers.
 Broken process groups, killed workers and network failures remain torchrun/NCCL
@@ -28,17 +28,27 @@ import re
 from .rewards import RewardError
 
 
-PATCH_ID = "flex-global-gated-reward-v3"
+PATCH_ID = "flex-global-gated-reward-v3-v4"
 _SCORING_ACTIVE = ContextVar("flex_complete_group_scoring", default=False)
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _ITEM_INPUTS = {"eligible", "quality", "latency", "units", "repetition", "reward"}
 _INVALID_SAFE_FIELDS = {"group_brevity_excess", "weighted_brevity_penalty", "length_penalty",
                         "weighted_repetition_penalty", "anchor_pool_size", "group_length_anchor",
                         "group_length_slack", "anchor_quality_threshold"}
+# New v4 diagnostics may describe a group or the optimizer signal, but must
+# never manufacture semantic scores, latency measurements or policy validity.
+_V4_INVALID_SAFE_FIELDS = _INVALID_SAFE_FIELDS | {
+    "normalized_quality", "normalized_latency", "weighted_quality_signal", "weighted_latency_signal",
+    "utility_raw", "reward_version", "group_eligible_count", "group_all_invalid", "group_all_quality_fail",
+    "quality_group_mean", "quality_group_std", "latency_group_mean", "latency_group_std",
+    "quality_normalization_scale", "latency_normalization_scale", "failure_reward",
+    "advantage_scale", "normalization_population", "group_reward_mean", "estimated_advantage",
+    "low_quality_positive_advantage",
+}
 
 
 def is_group_scoring_active():
-    """The v3 ORM must refuse provisional rewards outside this bridge."""
+    """Group-aware ORMs refuse provisional rewards outside this bridge."""
     return _SCORING_ACTIVE.get() is True
 
 
@@ -146,31 +156,35 @@ def _runtime_contract(trainer):
     funcs = getattr(trainer, "reward_funcs", None)
     names = getattr(trainer, "reward_func_names", None)
     if not isinstance(funcs, (list, tuple)) or len(funcs) != 1:
-        raise RewardError("QALCO v3 requires exactly one registered reward function")
+        raise RewardError("QALCO v3/v4 requires exactly one registered reward function")
     if list(names or ()) not in (["QalcoOnlineORM"], ["qalco_online"]):
-        raise RewardError("QALCO v3 requires the sole qalco_online reward")
+        raise RewardError("QALCO v3/v4 requires the sole qalco_online reward")
     delegate = getattr(funcs[0], "scorer", None)
     settings = getattr(delegate, "settings", None)
-    if not isinstance(settings, dict) or settings.get("version") != 3 or settings.get("provider") != "qalco":
-        raise RewardError("QALCO v3 global bridge received a different reward configuration")
+    if not isinstance(settings, dict) or settings.get("version") not in (3, 4) or settings.get("provider") != "qalco":
+        raise RewardError("QALCO v3/v4 global bridge received a different reward configuration")
     if not callable(getattr(delegate, "commit_group_rewards", None)):
-        raise RewardError("QALCO v3 reward adapter lacks deferred commit_group_rewards")
+        raise RewardError("QALCO v3/v4 reward adapter lacks deferred commit_group_rewards")
     weights = getattr(trainer, "reward_weights", None)
     if hasattr(weights, "detach"):
         weights = weights.detach().cpu().tolist()
     elif hasattr(weights, "tolist"):
         weights = weights.tolist()
     if not isinstance(weights, (list, tuple)) or len(weights) != 1 or _finite(weights[0], "weight") != 1:
-        raise RewardError("QALCO v3 requires reward_weights=[1]")
+        raise RewardError("QALCO v3/v4 requires reward_weights=[1]")
     if getattr(trainer, "dynamic_sample", None) is not False:
-        raise RewardError("QALCO v3 global bridge requires dynamic_sample=false")
+        raise RewardError("QALCO v3/v4 global bridge requires dynamic_sample=false")
     if getattr(trainer, "use_gym_env", False):
-        raise RewardError("QALCO v3 global bridge does not support appended gym rewards")
-    if getattr(trainer, "scale_rewards", None) != "group":
-        raise RewardError("QALCO v3 requires upstream group advantage normalization")
+        raise RewardError("QALCO v3/v4 global bridge does not support appended gym rewards")
+    expected_scale = "none" if settings["version"] == 4 else "group"
+    if getattr(trainer, "scale_rewards", None) != expected_scale:
+        raise RewardError(f"QALCO v{settings['version']} requires scale_rewards={expected_scale}")
+    if settings["version"] == 4:
+        if getattr(trainer, "advantage_estimator", "grpo") != "grpo" or getattr(trainer, "kl_in_reward", False):
+            raise RewardError("QALCO v4 requires grpo group centering and kl_in_reward=false; KL stays in the loss")
     models = getattr(trainer, "unwrapped_models", None)
     if models and not models[0].training:
-        raise RewardError("QALCO v3 group bridge is source-audited for training only, not evaluation")
+        raise RewardError("QALCO v3/v4 group bridge is source-audited for training only, not evaluation")
     return delegate, settings
 
 
@@ -236,7 +250,8 @@ def finalize_global_metadata(envelopes, settings, finalizer):
             if not isinstance(value, dict):
                 raise RewardError("Global group finalizer returned a non-object")
             reward = _finite(value.get("reward"), "final reward")
-            if not entry["item"]["eligible"] and reward != entry["item"]["reward"]:
+            if (settings.get("version") != 4 and not entry["item"]["eligible"]
+                    and reward != entry["item"]["reward"]):
                 raise RewardError("Global group finalizer changed an ineligible candidate reward")
             finalized.append({"reward": reward,
                               "fields": {key: val for key, val in value.items() if key not in _ITEM_INPUTS},
@@ -251,7 +266,7 @@ def finalize_global_metadata(envelopes, settings, finalizer):
 def run_group_reward_scoring(trainer, samples, original_score, distributed, *, finalizer=None):
     """Production scoring boundary, dependency-injected for CPU collectives tests."""
     if not distributed.is_initialized():
-        raise RewardError("QALCO v3 requires an initialized distributed process group")
+        raise RewardError("QALCO v3/v4 requires an initialized distributed process group")
     rank, size = distributed.get_rank(), distributed.get_world_size()
     original_tensor = delegate = settings = None
     local_records = []
@@ -263,7 +278,7 @@ def run_group_reward_scoring(trainer, samples, original_score, distributed, *, f
                     "group_size": _positive_int(trainer.num_generations, "num_generations"),
                     "generation_batch_size": _positive_int(trainer.generation_batch_size, "generation_batch_size")}
         if getattr(trainer, "process_index", None) != rank or getattr(trainer, "world_size", None) != size:
-            raise RewardError("QALCO v3 world rank does not match upstream reward gather ownership")
+            raise RewardError("QALCO v3/v4 world rank does not match upstream reward gather ownership")
         # Avoid accidentally reusing a previous callback's records after an ORM
         # failure or an upstream change which stops invoking the registered ORM.
         delegate.last_records = []
@@ -273,7 +288,7 @@ def run_group_reward_scoring(trainer, samples, original_score, distributed, *, f
         finally:
             _SCORING_ACTIVE.reset(token)
         if tuple(original_tensor.shape) != (len(samples), 1):
-            raise RewardError("QALCO v3 upstream score tensor must have shape [local_candidates, 1]")
+            raise RewardError("QALCO v3/v4 upstream score tensor must have shape [local_candidates, 1]")
         local_records = delegate.last_records
         metadata = _local_metadata(samples, local_records)
         envelope.update(contract=contract, items=metadata)
@@ -288,13 +303,16 @@ def run_group_reward_scoring(trainer, samples, original_score, distributed, *, f
     status = {"rank": rank, "error": None}
     local_exception = None
     try:
-        if finalizer is None:
-            from .gated_reward import finalize_group
-            finalizer = finalize_group
         # Even the locally failing rank follows the same finalization-status
         # collective. Settings may be absent after a local config failure.
         if settings is None:
-            raise RewardError("QALCO v3 local configuration/scoring failed before metadata finalization")
+            raise RewardError("QALCO v3/v4 local configuration/scoring failed before metadata finalization")
+        if finalizer is None:
+            if settings["version"] == 4:
+                from .normalized_reward import finalize_group
+            else:
+                from .gated_reward import finalize_group
+            finalizer = finalize_group
         finalized, counts = finalize_global_metadata(gathered, settings, finalizer)
         start = sum(counts[:rank])
         selected = finalized[start:start + counts[rank]]
@@ -307,8 +325,9 @@ def run_group_reward_scoring(trainer, samples, original_score, distributed, *, f
             if record["components"]["eligible"]:
                 record["components"].update(value["fields"])
             else:
+                allowed = _V4_INVALID_SAFE_FIELDS if settings["version"] == 4 else _INVALID_SAFE_FIELDS
                 record["components"].update({key: val for key, val in value["fields"].items()
-                                             if key in _INVALID_SAFE_FIELDS})
+                                             if key in allowed})
             # Preserve invalid policy errors/tier and None quality. They cannot
             # acquire fabricated semantic/latency components during reshaping.
             record["components"].update(value["group"])
@@ -335,7 +354,7 @@ def validate_group_reward_source(source):
     cls = next((node for node in tree.body if isinstance(node, ast.ClassDef)
                 and node.name == "MegatronGRPOTrainer"), None)
     if cls is None:
-        raise RewardError("SWIFT has no MegatronGRPOTrainer for QALCO v3")
+        raise RewardError("SWIFT has no MegatronGRPOTrainer for QALCO v3/v4")
     methods = {node.name: node for node in cls.body if isinstance(node, ast.FunctionDef)}
     required = {"_score_completions", "_generate_and_score_completions", "_compute_advantages"}
     if not required.issubset(methods):
@@ -377,8 +396,31 @@ def validate_group_reward_source(source):
             "collectives_per_score": 2, "transport": "scalar metadata only; no text/audio/tensors"}
 
 
+def validate_v4_advantage_source(source):
+    """Check the exact center-only path used after v4 component scaling.
+
+    This deliberately refuses an unknown helper; it does not patch upstream
+    advantage computation, optimizer steps, or the sequence importance ratio.
+    """
+    tree = ast.parse(source)
+    fn = next((node for node in tree.body if isinstance(node, ast.FunctionDef)
+               and node.name == "compute_advantages"), None)
+    if fn is None:
+        raise RewardError("SWIFT v4 compute_advantages helper is missing")
+    text = ast.unparse(fn)
+    expected = ("grouped = rewards.view(-1, K)",
+                "group_mean = grouped.mean(dim=1).repeat_interleave(K)",
+                "advantages = rewards - group_mean",
+                "if std is not None and scale_rewards != 'none':",
+                "advantages = advantages / (std + 0.0001)")
+    if any(value not in text for value in expected):
+        raise RewardError("SWIFT v4 center-only advantage contract changed")
+    return {"scale_rewards": "none", "baseline": "full group mean",
+            "second_std_normalization": False, "source_contract_checked": True}
+
+
 def install_group_reward_patch(module=None, distributed=None, *, source=None, finalizer=None):
-    """Install only in v3 processes after trainer imports finish.
+    """Install only in v3/v4 processes after trainer imports finish.
 
     The scheduler's config guard must not install this bridge in independent
     v1/v2 runs. Once installed, switching a FLEX trainer to v2 in this process

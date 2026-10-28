@@ -2,7 +2,28 @@
 
 检查、审计、监控和诊断脚本统一放在 `Scripts/`，完整入口与离线回放输入要求见 [Scripts 使用索引](Scripts/README.md)。下文命令均从项目根目录执行；数据准备、训练入口和 `tests/` 保持原位置。历史记录中的版本、测试结果仍对应当时运行，脚本路径已更新为当前位置。
 
-## 最新实验入口：QALCO v3
+迁移到新磁盘后从 SFT 开始新实验，见 [data06 迁移与 v3 训练步骤](docx/data06迁移与v3训练.md)。已有 prepared 清单使用 `Scripts/relocate_prepared_data.py` 同步实际音频路径、编码引用和文件元数据，无须全局替换源码。
+
+## 最新实验入口：QALCO v4
+
+2026-10-28 新增独立入口 **06_train_qalco_v4.sh + configs/qalco_v4.json**。在完整同音频 G8 内分别缩放质量与门控后的时延，给标准差设置下限；训练框架只再减去组均值，不做第二次标准差归一化。空译、格式错误、严重循环进入明确失败分支，失败分数相对于本组可评分候选设置，减少固定 −4 对组均值的拉低。具体公式、局限和验收见 [QALCO v4 训练说明](docx/QALCO_v4训练说明.md)。
+
+继续使用已有 **COMET22**，无需部署新模型或重新切音频。保留 **G8 / batch32 / micro2 / 3000步 / 每500步保存**，以及已跑通的四卡同步、EOF、offload 和缓存设置；不扩大显存预算。v2/v3 配置保持独立，启动 v4 请使用新输出目录，从原 SFT 合并模型起跑。
+
+~~~bash
+cd /data06/yb/Code/FLEX/FLEX-GSPO
+source /data06/yb/venvs/flex-gspo-online/bin/activate
+bash 06_train_qalco_v4.sh \
+  /data06/yb/Code/FLEX/models/checkpoint-4410-merged \
+  /data06/yb/Code/FLEX/datasets/gspo_online_prepared_v3_1027/train.jsonl \
+  /data06/yb/Code/FLEX/outputs/gspo_v4_g8_b32_3000_1028_001
+~~~
+
+先在另一个新目录追加 `--train-iters 2 --save-steps 2` 完成 GPU 采样、更新、保存验收，再运行正式目录。新版 normalized reward 的均值不能当作质量上升曲线；TensorBoard 应同时看原始 `quality/mean`、`latency_seconds/mean`、空译/格式错误比例、组内质量标准差和 `estimated_advantage`，翻译改善仍需固定验证样本。分项缩放不能修复 COMET 未识别的否定范围、漏译或幻觉错误。
+
+v4 启动前默认调用 `configs/quality_regressions_v4.jsonl` 的独立合成语义对照，检查 COMET 对否定范围、论元、数字和无依据添加的排序。未通过会在启动 GPU 训练前停止；不会把服务失败当作模型零分、不会静默跳过检查。通过少量对照也不能保证真实数据没有误判；对照文件的 SHA256 纳入恢复训练身份校验。
+
+## 历史实验入口：QALCO v3
 
 2026-10-23 新增 **05_train_qalco_v3.sh + configs/qalco_v3.json**：质量门控时延、完整同音频 G8 的质量约束长度基准、局部循环复读成本。只使用已有 COMET22 服务，不增加模型服务，不重做数据，不改变已跑通的四卡 Megatron 在线 GSPO 流程。
 

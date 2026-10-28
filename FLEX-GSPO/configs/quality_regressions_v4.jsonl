@@ -1,0 +1,4 @@
+{"id":"scope_of_negation","source_text":"This is not the vaccine that the clinic ordered.","reference_text":"这不是诊所订购的那种疫苗。","preferred":"诊所订购的并不是这种疫苗。","dispreferred":["这不是疫苗，而是诊所订购的。"]}
+{"id":"argument_direction","source_text":"The supplier paid the hospital, not the other way around.","reference_text":"是供应商向医院付款，而不是医院向供应商付款。","preferred":"付款方是供应商，收款方是医院，不能反过来。","dispreferred":["医院向供应商付款，而非供应商向医院付款。"]}
+{"id":"preserve_condition_and_quantity","source_text":"If the test succeeds, only twelve devices will be shipped on Tuesday.","reference_text":"如果测试成功，星期二只会发出十二台设备。","preferred":"测试通过的话，周二仅发货十二台设备。","dispreferred":["测试通过的话，周二仅发货二十台设备。","周二仅发货十二台设备，测试已经通过。"]}
+{"id":"unsupported_claim","source_text":"The library opens at ten and closes at six.","reference_text":"图书馆十点开门，六点关门。","preferred":"图书馆开放时间为十点到六点。","dispreferred":["图书馆十点开放，六点关闭，入馆需要支付五十元。"]}

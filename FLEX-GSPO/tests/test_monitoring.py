@@ -36,6 +36,53 @@ def record(call=1, reward=.5, step=0):
 
 
 class MonitorTests(unittest.TestCase):
+    def test_v4_records_preserve_raw_quality_and_logged_group_advantage(self):
+        good, invalid = record(), record(reward=-.5)
+        good["components"].update(normalized_quality=.4, normalized_latency=-.2,
+            quality_group_std=.004, latency_group_std=.08, quality_normalization_scale=.03,
+            latency_normalization_scale=.1, group_eligible_count=7, group_all_invalid=False,
+            group_all_quality_fail=False, estimated_advantage=.6, failure_reward=-.5,
+            utility_raw=.85, weighted_quality_signal=.4, weighted_latency_signal=-.05,
+            low_quality_positive_advantage=False)
+        invalid["components"].update(quality=None, normalized_quality=None, normalized_latency=None,
+            quality_group_std=.004, latency_group_std=.08, group_eligible_count=7,
+            group_all_invalid=False, group_all_quality_fail=False, estimated_advantage=-.4,
+            failure_reward=-.5, utility_raw=None, low_quality_positive_advantage=False)
+        summary = reward_summary([good, invalid])
+        self.assertEqual(summary["quality/mean"], .9)
+        self.assertEqual(summary["quality/scored_count"], 1)
+        self.assertEqual(summary["normalized_quality/mean"], .4)
+        self.assertEqual(summary["normalized_quality/scored_count"], 1)
+        self.assertAlmostEqual(summary["estimated_advantage/mean"], .1)
+        self.assertEqual(summary["estimated_advantage/abs_mean"], .5)
+        self.assertEqual(summary["estimated_advantage/positive_fraction"], .5)
+        self.assertEqual(summary["quality_group_std/mean"], .004)
+        self.assertEqual(summary["group_all_invalid_known_count"], 2)
+        self.assertEqual(summary["group_all_invalid_fraction"], 0)
+        legacy = reward_summary([record()])
+        self.assertEqual(legacy["group_all_invalid_known_count"], 0)
+        self.assertNotIn("group_all_invalid_fraction", legacy)
+        self.assertNotIn("estimated_advantage/mean", legacy)
+
+    def test_v4_metrics_reach_tensorboard_without_recomputing_partial_groups(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "rewards").mkdir()
+            path = root / "rewards" / "rewards-rank0-pid2.jsonl"
+            row = record()
+            row["components"].update(estimated_advantage=.8, quality_group_std=.006,
+                                     group_all_invalid=False, normalized_quality=.5)
+            path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            monitor = Monitor(root, writer_factory=Writer)
+            try:
+                monitor.poll()
+                scalars = {event[1]: event[2] for event in monitor.writers[path.stem].events if event[0] == "scalar"}
+                self.assertEqual(scalars["qalco_by_global_step/estimated_advantage/mean"], .8)
+                self.assertEqual(scalars["qalco_by_global_step/quality_group_std/mean"], .006)
+                self.assertEqual(scalars["qalco_by_global_step/normalized_quality/mean"], .5)
+            finally:
+                monitor.close()
+
     def test_eof_wait_is_separate_from_audio_policy_actions(self):
         row = record()
         row["components"].update(comet22_score=.91, severe_repetition=True, tier="degenerate")

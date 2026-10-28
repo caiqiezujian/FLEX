@@ -1,0 +1,41 @@
+{
+  "reward": {
+    "provider": "qalco",
+    "version": 4,
+    "quality_provider": "comet22",
+    "quality_floor": 0.80,
+    "eof_delay_seconds": 0.5,
+    "latency_metric": "mean_lag",
+    "latency_budget_seconds": 3.0,
+    "v4": {
+      "quality_weight": 1.0,
+      "latency_weight": 0.25,
+      "quality_std_floor": 0.03,
+      "latency_std_floor": 0.10,
+      "normalized_component_clip": 2.0,
+      "quality_gate_low": 0.80,
+      "quality_gate_high": 0.85,
+      "latency_cost_cap": 2.0,
+      "latency_linear_weight": 0.05,
+      "latency_over_budget_weight": 0.20,
+      "brevity_weight": 0.08,
+      "repetition_weight": 0.20,
+      "anchor_quality_tolerance": 0.03,
+      "anchor_min_candidates": 3,
+      "anchor_quantile": 0.25,
+      "brevity_slack_units": 2.0,
+      "brevity_slack_ratio": 0.05,
+      "brevity_denominator_floor": 20.0,
+      "failure_margin": 0.25
+    },
+    "comet22": {
+      "backend": "service",
+      "service_url": "http://10.185.1.72:6668/22",
+      "service_id": "comet22-internal-6668",
+      "model_id": "Unbabel/wmt22-comet-da",
+      "response_key": "score",
+      "timeout_seconds": 300,
+      "max_attempts": 2
+    }
+  }
+}

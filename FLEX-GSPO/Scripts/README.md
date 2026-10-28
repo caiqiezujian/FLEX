@@ -11,10 +11,19 @@
 | [Scripts/replay_reward_audit.py](replay_reward_audit.py) | `--input-txt` 按原顺序传入完整逐轮 TXT 片段，`--config` 指定 v3 配置 | 冻结已有 COMET22 分数，无 HTTP；输出到新目录 |
 | [Scripts/monitor_training.py](monitor_training.py) | 运行目录、可选 `--watch` 和 `--dataset` | 读取已有日志，生成 TensorBoard 事件与监控摘要；不请求评分服务 |
 | [Scripts/collect_training_status.py](collect_training_status.py) | 运行目录、可选 `--dataset`、`--reward-config` 和 `--output` | 生成文本快照；标准库读取，不请求评分服务；可选 `--gpu-ids` 查询占用 |
+| [Scripts/summarize_training_history.py](summarize_training_history.py) | 运行目录、`--native-log`、可选 `--launch-file` 和 `--block-size 50`；`--native-only` 只汇总训练日志 | 扫描全部已完成步骤；核对运行身份和完整 G8，输出逐步 CSV、分段摘要与奖励分项；标准库读取，不请求评分服务 |
+| [Scripts/collect_reward_revision.py](collect_reward_revision.py) | 运行目录、明确指定的 `--native-log`、`--launch-file`、`--dataset`；默认 `--groups 20 --block-size 50` | 新版奖励设计前采证：全程 G8/空译/EOF/分项方差统计，分层导出最多 160 个候选及全部原始轮次；不改训练、不请求服务 |
 | [Scripts/collect_brevity_samples.py](collect_brevity_samples.py) | 运行目录、`--dataset`、`--output`，可选 `--include-increments` | 导出观测候选和非空增量；不请求评分服务，不保证完整 G8 或全部 WAIT 轮 |
 | [Scripts/analyze_training_run.py](analyze_training_run.py) | 运行目录、必需的 `--native-log` 和 `--output-dir`，可选 `--reward-config` | 停止后的离线日志审查，不请求评分服务；公式复核受原运行身份约束 |
+| [Scripts/relocate_prepared_data.py](relocate_prepared_data.py) | 旧 prepared `--input-jsonl`、已复制 WAV 的 `--audio-dir`、新 `--output-dir`，可用 `--workers 16` | 核验 WAV 元数据，重建两处音频引用；不复制音频、不请求服务、不覆盖旧清单 |
 
 各入口可用 `python3 Scripts/<脚本名>.py --help` 查看参数。训练、服务检查与监控的完整示例见[项目 README](../README.md)和 [QALCO v3 训练说明](../docx/QALCO_v3训练说明.md)。
+
+`collect_reward_revision.py` 只支持已验证的 G8、每次生成一次更新、标量 QALCO 组归一化配置。按 launch 的 session/run 筛选奖励，按已完成训练步核对全部 rank 与完整组；有缺失或重复的奖励步骤会整步排除并报告。它读取全部已完成步骤，选取整组全 WAIT、部分空译、异常输出、质量接近但长度有差异的组，并以固定哈希顺序补充不同音频。样例为诊断抽样，不是随机验证集；质量缺失保持缺失，省略号和短句计数不直接等同错误。原始音频、模型和训练环境均无需加载。
+
+默认输出到运行目录下新的 `diagnostics/reward_revision_<时间>/`。先审查 `summary.txt`，再查看 `review_part_*.txt`（每份最多 5 个完整 G8）；`selected_groups.jsonl` 保存原始候选与对应任务，供后续离线奖励对照。另有逐步 `all_steps.csv`、全部组的 `group_statistics.jsonl`、空译任务统计 `empty_tasks.jsonl`，以及启动配置和日志快照来源 `provenance.json`。不会覆盖已有报告。
+
+迁移后的清单生成、Docker 路径、环境检查和完整训练命令，见 [data06 迁移与 v3 训练](../docx/data06迁移与v3训练.md)。
 
 ## 离线奖励回放
 
