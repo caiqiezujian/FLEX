@@ -142,6 +142,15 @@ svg {
 .turn-details[open] > summary span:first-child:before { transform: rotate(180deg); }
 .turn-details summary::-webkit-details-marker { display: none; }
 .turn-list { max-height: 210px; overflow: auto; padding: 0 14px 10px; }
+.turn-follow { text-align: right; padding: 0 14px; }
+.speech-panel { padding: 7px 14px; border-bottom: 1px solid #e8ece9; background: #fafbf9; }
+.speech-controls { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.speech-controls .check-label, .speech-volume { display: flex; align-items: center; gap: 6px; }
+.speech-volume { color: #5c6d62; font-size: 13px; }
+.speech-volume input { width: 65px; accent-color: #3e7753; }
+.speech-status { color: #42654c; font-size: 13px; margin-top: 4px; }
+.speech-status.warning { color: #9e4c15; }
+.speech-panel small { display: block; color: #69776d; font-size: 12px; line-height: 1.5; }
 .no-turns { margin: 4px 0 8px; }
 .turn-row { padding: 8px 0; border-top: 1px solid #e8eee3; display: grid; grid-template-columns: 1fr auto; gap: 6px; }
 .turn-row-header { display: flex; align-items: center; gap: 8px; font-variant-numeric: tabular-nums; flex-wrap: wrap; }

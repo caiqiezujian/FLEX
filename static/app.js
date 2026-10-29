@@ -1,6 +1,7 @@
 import { makeAudioPacket } from './pcm-core.js';
 import { FilePlaybackClock } from './file-playback.js';
 import { requestSystemAudio } from './system-audio.js';
+import { TranslationSpeech } from './translation-speech.js';
 
 const $ = id => document.getElementById(id);
 const ui = Object.fromEntries([
@@ -9,7 +10,8 @@ const ui = Object.fromEntries([
   'fileMode','micMode','fileArea','micArea','mediaStage','media','audioArtwork','dropZone','fileType','fileName','fileDetails',
   'chooseFile','chooseSubtitle','subtitleName','removeSubtitle','fileInput','subtitleInput','micTitle','micDescription','micMeter','includeMicrophone',
   'captureDot','sourceClock','clockDescription','targetBadge','exportTxt','exportJson','sessionStatus','latestTag','transcriptViewport',
-  'transcriptEmpty','transcript','translationCount','followButton','turnCount','turnList','startButton','pauseButton','finishButton',
+  'transcriptEmpty','transcript','translationCount','followButton','turnCount','turnList','turnDetails','turnFollowButton','startButton','pauseButton','finishButton',
+  'ttsEnabled','ttsVolume','ttsStatus','ttsPreview','ttsStop','ttsHint',
   'receivedMetric','pendingMetric','serviceMetric','processedMetric','footerHint'
 ].map(id => [id, $(id)]));
 
@@ -31,6 +33,45 @@ let totalTurns = 0, translationCharacters = 0, recentRecordCharacters = 0, recor
 let windowRollovers = 0, exportInProgress = false;
 let pageHidden = false, configRefreshFailed = false;
 let configRequest = null;
+let followTurns = true, turnUserScrollUntil = 0, speech = null;
+
+function speechPlayer() {
+  if (!speech) speech = new TranslationSpeech({onState:info => {
+    ui.ttsStatus.textContent = info.message;
+    ui.ttsStatus.classList.toggle('warning',info.state === 'error');
+    ui.ttsStop.disabled = !info.enabled;
+    if (info.state === 'error') ui.ttsEnabled.checked = false;
+  }});
+  return speech;
+}
+function updateSpeechControls() {
+  const target = busy() ? session?.targetLang : ui.targetLang.value;
+  const available = config?.tts?.enabled && config.tts.languages?.includes(target);
+  ui.ttsEnabled.disabled = !available;
+  ui.ttsPreview.disabled = !available || busy();
+  ui.ttsHint.textContent = !available ? (config?.tts?.message || '该方向尚未配置参考音色')
+    : mode === 'system' ? '播报时请共享其他标签页；整机声音会回采播报，系统将关闭播报。收录讲话时请戴耳机。'
+    : '合并相邻译文，依次朗读；原声可通过播放器音量调整。';
+}
+function startSpeech(s) {
+  const player = speechPlayer();
+  player.setVolume(ui.ttsVolume.value);
+  return player.start({language:s.targetLang,token:s.authToken,
+    maximum:config?.tts?.max_text_chars || 200,timeoutSeconds:config?.tts?.timeout_seconds || 180});
+}
+function speechCaptureAllowed(s) {
+  if (s?.sourceKind !== 'system') return true;
+  // Whole-system capture includes this page's TTS even with headphones.
+  return s.capture?.displayStream?.getVideoTracks?.()[0]?.getSettings?.().displaySurface === 'browser';
+}
+function stopSpeechForCapture(s) {
+  if (!speechCaptureAllowed(s)) {
+    ui.ttsEnabled.checked = false;
+    speech?.stop('此共享来源可能回采播报，已关闭播报。请选择其他标签页的音频。');
+    return true;
+  }
+  return false;
+}
 
 function busy() { return BUSY_STATES.has(state); }
 function current(s) { return session === s; }
@@ -92,6 +133,7 @@ function statusLabel(text, kind = '') {
   ui.sessionStatus.replaceChildren(Object.assign(document.createElement('i'), {}), document.createTextNode(text));
 }
 function updateControls() {
+  updateSpeechControls();
   const active = busy();
   const health = config?.engine_health;
   ui.startButton.disabled = active || !engineAccepting() || capacityFull() || (mode === 'file' && !selectedFile);
@@ -162,9 +204,11 @@ function updateDirection(source) {
   if (source === 'target') ui.sourceLang.value = ui.targetLang.value === 'zh' ? 'en' : 'zh';
   else ui.targetLang.value = ui.sourceLang.value === 'zh' ? 'en' : 'zh';
   updateTranscriptLanguage();
+  updateSpeechControls();
 }
 function clearTranscript() {
   if (busy()) return;
+  speech?.stop();
   currentTranslation = ''; turns = []; transcriptFragments = 0; lastExport = null; lastMetrics = {};
   totalTurns = 0; translationCharacters = 0; recentRecordCharacters = 0;
   recordsTrimmed = false; windowRollovers = 0; session = null;
@@ -174,6 +218,7 @@ function clearTranscript() {
   ui.transcriptEmpty.hidden = false; ui.translationCount.textContent = '0 个输出片段'; ui.turnCount.textContent = '0 轮';
   ui.latestTag.className = 'tag tag-neutral'; ui.latestTag.textContent = '—';
   followOutput = true; ui.followButton.hidden = true;
+  followTurns = true; turnUserScrollUntil = 0; ui.turnFollowButton.hidden = true;
   renderMetrics({received_audio_s:0,processed_audio_s:0,pending_audio_s:0});
   ui.serviceMetric.replaceChildren(document.createTextNode('—'), Object.assign(document.createElement('small'), {textContent:' s'}));
   setState('idle');
@@ -201,9 +246,16 @@ function updateRecordCounts() {
   ui.turnCount.textContent = `${totalTurns} 轮${recordsTrimmed ? ` · 最近 ${turns.length} 轮` : ''}${windowRollovers ? ` · 窗口滚动 ${windowRollovers} 次` : ''}`;
 }
 function appendResearchRow(row) {
+  const before = ui.turnList.scrollHeight;
   if (ui.turnList.querySelector('.no-turns')) ui.turnList.replaceChildren();
   ui.turnList.append(row);
   while (ui.turnList.children.length > MAX_RECENT_TURNS) ui.turnList.firstElementChild.remove();
+  if (followTurns) requestAnimationFrame(() => {if (followTurns) scrollTurnsToLatest();});
+  else if (ui.turnList.scrollHeight < before) ui.turnList.scrollTop = Math.max(0,ui.turnList.scrollTop - (before-ui.turnList.scrollHeight));
+}
+function scrollTurnsToLatest() {
+  turnUserScrollUntil = 0;
+  ui.turnList.scrollTop = ui.turnList.scrollHeight;
 }
 function appendContextWindow(data) {
   renderMetrics(data);
@@ -238,6 +290,8 @@ function appendTurn(data, s) {
     span.title = `${data.tag} · 输入 ${time(data.source_start_s + s.mediaOffset)} – ${time(data.source_end_s + s.mediaOffset)} · 推理 ${Number(data.service_s).toFixed(2)} s`;
     ui.transcript.append(span); currentTranslation += data.delta;
     ui.transcriptEmpty.hidden = true; transcriptFragments++;
+    if (speech?.run?.enabled && s.sourceKind === 'system') stopSpeechForCapture(s);
+    speech?.append(data.delta);
     if (followOutput) requestAnimationFrame(() => { if (current(s) && followOutput) ui.transcriptViewport.scrollTop = ui.transcriptViewport.scrollHeight; });
   }
   const row = document.createElement('div'); row.className = `turn-row ${data.tag.toLowerCase()}`;
@@ -532,6 +586,7 @@ function openSocket(s) {
           if ((Number.isSafeInteger(event.turn_count) && event.turn_count !== totalTurns) || (Number.isSafeInteger(event.translation_chars) && event.translation_chars !== translationCharacters)) showError('服务器结束计数与本页面接收的输出不一致，请通过 JSON 导出检查完整服务端记录。','结束记录检查');
           else if (event.final_wait) showError('最后一轮为 WAIT。已处理所有接收的音频，但系统没有强制补译；请检查是否有未译完的尾句。','尾句检查');
           lastExport = exportData(s);
+          speech?.finish();
           void cleanupCapture(s).finally(() => {if(current(s)){setState('done');updateControls();}});
           if (ws.readyState === WebSocket.OPEN) ws.close(1000,'session finished');
         }
@@ -548,6 +603,7 @@ function openSocket(s) {
 async function failSession(s, message, title = '会话已停止', notifyServer = true) {
   if (!current(s) || s.terminal) return;
   s.terminal = true; s.failure = String(message); s.endedAt = new Date().toISOString(); clearTimeout(s.startupTimer);
+  speech?.stop('会话已停止，待播音频已清空。');
   showError(message,title);
   if (notifyServer && s.ws?.readyState === WebSocket.OPEN) s.ws.send(JSON.stringify({type:'cancel'}));
   await cleanupCapture(s);
@@ -579,9 +635,11 @@ async function startSession() {
       // can remain open long enough for activation to expire before it resolves.
       s.audioPreparation = ensureAudioContext();s.audioPreparation.catch(() => {});
     }
+    if (ui.ttsEnabled.checked && config.tts?.enabled) void startSpeech(s);
     if (previous) await cleanupCapture(previous);
     if (!current(s) || s.terminal) return;
     await prepareCapture(s); if (!current(s) || s.terminal) return;
+    if (ui.ttsEnabled.checked && s.sourceKind === 'system') stopSpeechForCapture(s);
     await openSocket(s); if (!current(s) || s.terminal) return;
     s.startedAt = performance.now();
     if (s.sourceKind === 'system') await gate(s,'active');
@@ -599,10 +657,11 @@ async function startSession() {
     await failSession(s,message);
   }
 }
-async function finishSession() {
+async function finishSession({naturalEnd = false} = {}) {
   const s = session;
   if (!s || s.terminal || !['connecting','live','paused'].includes(state)) return;
   if (state === 'connecting') {await failSession(s,'连接准备已取消。','已取消');return;}
+  if (!naturalEnd) speech?.stop('已结束同传，待播音频已清空。');
   setState('draining');
   if (s.sourceKind === 'file') {clearInterval(s.progressTimer);ui.media.pause();}
   try {
@@ -745,7 +804,7 @@ ui.media.addEventListener('waiting',() => {
     sendFileProgress(s,true);
   }
 });
-ui.media.addEventListener('ended',() => {if(session?.sourceKind === 'file' && ['live','paused'].includes(state))void finishSession();});
+ui.media.addEventListener('ended',() => {if(session?.sourceKind === 'file' && ['live','paused'].includes(state))void finishSession({naturalEnd:true});});
 ui.media.addEventListener('seeking',() => {if(session?.sourceKind === 'file' && (['live','paused'].includes(state) || (state === 'connecting' && Math.abs(ui.media.currentTime-session.mediaOffset) > 1/16000)))void failSession(session,'播放位置发生改变，当前因果上下文已终止。请在新位置重新开始同传，历史译文不会被修改。','跳转后需要新会话');});
 ui.media.addEventListener('ratechange',() => {if(session?.sourceKind === 'file' && ['live','paused'].includes(state) && ui.media.playbackRate !== 1)void failSession(session,'同传会话只支持 1× 实时播放。变速会破坏时序比较，本次会话已停止。','播放速率已改变');});
 ui.startButton.onclick = () => {void startSession();};
@@ -758,11 +817,50 @@ ui.clearButton.onclick = clearTranscript;
 ui.exportTxt.onclick = () => download('txt');ui.exportJson.onclick = () => download('json');
 ui.transcriptViewport.addEventListener('scroll',() => {const box = ui.transcriptViewport;followOutput = box.scrollHeight-box.scrollTop-box.clientHeight < 55;ui.followButton.hidden = followOutput;});
 ui.followButton.onclick = () => {followOutput = true;ui.transcriptViewport.scrollTop = ui.transcriptViewport.scrollHeight;ui.followButton.hidden = true;};
+ui.turnList.addEventListener('scroll',() => {
+  const box = ui.turnList;
+  // Expansion and pruning old rows also emit scroll events. Only a user's
+  // wheel/touch/keyboard/scrollbar gesture is allowed to disable follow mode.
+  if (!ui.turnDetails.open || performance.now() > turnUserScrollUntil) return;
+  followTurns = box.scrollHeight-box.scrollTop-box.clientHeight < 40;
+  ui.turnFollowButton.hidden = followTurns;
+});
+for (const name of ['wheel','touchmove','keydown','pointerdown']) ui.turnList.addEventListener(name,event => {
+  if (name === 'keydown' && !['ArrowUp','ArrowDown','PageUp','PageDown','Home','End',' '].includes(event.key)) return;
+  if (name === 'pointerdown' && event.clientX < ui.turnList.getBoundingClientRect().right-18) return;
+  turnUserScrollUntil = performance.now()+1500;
+  if ((name === 'wheel' && event.deltaY<0) || name === 'touchmove'
+      || (name === 'keydown' && ['ArrowUp','PageUp','Home'].includes(event.key))) {
+    followTurns = false;ui.turnFollowButton.hidden = false;
+  }
+}, {passive:true});
+ui.turnFollowButton.onclick = () => {followTurns = true;turnUserScrollUntil=0;scrollTurnsToLatest();ui.turnFollowButton.hidden = true;};
+ui.turnDetails.addEventListener('toggle',() => {if (ui.turnDetails.open && followTurns) scrollTurnsToLatest();});
+ui.ttsEnabled.onchange = () => {
+  if (!ui.ttsEnabled.checked) {speech?.stop();return;}
+  if (busy() && session) {
+    if (session.sourceKind === 'system' && session.capture && stopSpeechForCapture(session)) return;
+    void startSpeech(session);
+  } else ui.ttsStatus.textContent = '下次开始同传时朗读新增译文';
+};
+ui.ttsVolume.oninput = () => speech?.setVolume(ui.ttsVolume.value);
+ui.ttsStop.onclick = () => {ui.ttsEnabled.checked = false;speech?.stop('已停止播报，待播音频已清空。');};
+ui.ttsPreview.onclick = async () => {
+  if (busy()) return;
+  const player = speechPlayer();
+  const pending = startSpeech({targetLang:ui.targetLang.value,authToken:ui.authToken.value.trim()});
+  const run = player.run;
+  await pending;
+  if (speech !== player || busy() || player.run !== run || !run?.enabled) return;
+  player.append(ui.targetLang.value === 'en' ? 'Hello, this is the interpretation voice preview.' : '你好，这是同声传译的音色试听。');
+  player.finish();
+};
 document.addEventListener('click',event => {if(!ui.settings.contains(event.target))ui.settings.open = false;});
 window.addEventListener('beforeunload',event => {
   if (busy()) {event.preventDefault();event.returnValue = '';}
 });
 window.addEventListener('pagehide',() => {
+  speech?.stop();
   pageHidden = true; clearTimeout(pollTimer); pollTimer = null;
   configRequest?.abort();
   if(session && !session.terminal){session.terminal = true;clearInterval(session.progressTimer);session.uploadRequest?.abort();session.cancelPlaybackLoad?.();releaseUploadedFile(session);session.captureAbort?.abort();session.unsubscribeCapture?.();session.capture?.stop();if(session.ws?.readyState === WebSocket.OPEN){session.ws.send(JSON.stringify({type:'cancel'}));session.ws.close();}}

@@ -36,6 +36,7 @@ from .media import FileQueue, MAX_UPLOAD_BYTES, MediaError, MediaStore, decode_u
 from .tls import TLSConfigError, prepare_local_tls, validate_tls_files
 from .results import ResultLimit, ResultStore
 from .scheduler import InferenceScheduler, SchedulerCancelled, SchedulerUnavailable
+from .tts import TTSOptions, TTSService, TTSError
 
 RATE = 16000
 STATIC = Path(__file__).resolve().parent.parent / 'static'
@@ -69,12 +70,14 @@ class Settings:
     max_result_bytes: int = 256 * 1024 * 1024
     result_retention_hours: float = 24.0
     ffmpeg: str | None = None
+    tts: TTSOptions = field(default_factory=TTSOptions)
 
     @property
     def batch_size(self):
         return self.max_sessions if self.max_batch_size is None else self.max_batch_size
 
     def validate(self):
+        self.tts.validate()
         if self.backend not in ('mock', 'vllm'):
             raise ValueError('backend must be mock or vllm')
         if self.backend == 'vllm' and not self.model:
@@ -299,6 +302,7 @@ class PlaybackResponse(StreamingResponse):
 def create_app(settings=None):
     settings = settings or Settings()
     settings.validate()
+    tts = TTSService(settings.tts)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -320,6 +324,7 @@ def create_app(settings=None):
         options = replace(options, max_batch_size=settings.batch_size)
         app.state.model_options = options
         try:
+            await tts.start()
             make = functools.partial(ModelEngine, options, backend=settings.backend)
             app.state.engine = await asyncio.get_running_loop().run_in_executor(app.state.executor, make)
             await asyncio.get_running_loop().run_in_executor(
@@ -353,8 +358,10 @@ def create_app(settings=None):
                 app.state.media_executor.shutdown(wait=True, cancel_futures=True)
                 app.state.media.close()
                 app.state.results.close()
+                await tts.close()
 
     app = FastAPI(title='FLEX Live', lifespan=lifespan, docs_url=None, redoc_url=None)
+    app.state.tts = tts
 
     def capacity():
         count = len(app.state.active_sessions)
@@ -384,6 +391,7 @@ def create_app(settings=None):
                     max_pending_seconds=settings.max_pending_seconds,
                     max_session_seconds=settings.max_session_seconds, auth_required=bool(settings.token),
                     file_mode='uploaded', input_sources=('file', 'system'),
+                    tts=tts.public_config(),
                     max_upload_bytes=settings.max_upload_bytes,
                     result_retention_hours=settings.result_retention_hours,
                     context_policy=app.state.model_options.context_policy,
@@ -401,6 +409,27 @@ def create_app(settings=None):
         expected = f'Bearer {settings.token}'
         if settings.token and not hmac.compare_digest(supplied.encode('utf-8'), expected.encode('utf-8')):
             raise HTTPException(401, detail=dict(code='unauthorized', message='Invalid access token.'))
+
+    @app.post('/api/tts/synthesize')
+    async def synthesize_speech(request: Request):
+        require_media_access(request)
+        body = bytearray()
+        async for part in request.stream():
+            body.extend(part)
+            if len(body) > 8192:
+                raise HTTPException(413, detail=dict(code='tts_request_size', message='TTS 请求过大。'))
+        try:
+            data = json.loads(body)
+        except (ValueError, UnicodeError):
+            raise HTTPException(400, detail=dict(code='tts_request', message='需要 JSON 请求。'))
+        if not isinstance(data, dict) or set(data) - {'text', 'language'}:
+            raise HTTPException(400, detail=dict(code='tts_request', message='仅接受 text 和 language 字段。'))
+        try:
+            raw, rate, duration = await tts.synthesize(data.get('text'), data.get('language'))
+        except TTSError as exc:
+            raise HTTPException(exc.status, detail=dict(code=exc.code, message=str(exc))) from exc
+        return Response(raw, media_type='audio/wav', headers={
+            'X-Audio-Sample-Rate': str(rate), 'X-Audio-Duration': f'{duration:.6f}'})
 
     @app.post('/api/media')
     async def upload_media(request: Request):
@@ -957,6 +986,14 @@ def main():
     parser.add_argument('--temp-dir', type=Path, default=None, help='Temporary media/results directory; choose a disk with space for long files')
     parser.add_argument('--max-result-mb', type=int, default=256, help='Temporary result budget per session in MiB; does not silently truncate exports')
     parser.add_argument('--result-retention-hours', type=float, default=24)
+    parser.add_argument('--tts-url', default='', help='Optional TTS base URL, e.g. http://7.242.105.6:9100')
+    parser.add_argument('--tts-assets-dir', type=Path, help='Reference WAV directory readable by THIS Web server')
+    parser.add_argument('--tts-voices-config', type=Path, help='Optional JSON with en/zh {audio,text}; paths relative to assets-dir or JSON directory')
+    parser.add_argument('--tts-timeout-seconds', type=float, default=180)
+    parser.add_argument('--tts-max-text-chars', type=int, default=200)
+    parser.add_argument('--tts-max-concurrent', type=int, default=2)
+    parser.add_argument('--tts-x-vector-only', choices=['true', 'false'], default=None,
+                        help='Omit to preserve TTS server default; optionally override its voice-conditioning mode')
     args = parser.parse_args()
     if args.https_host and (args.ssl_certfile or args.ssl_keyfile):
         parser.error('Use either --https-host or --ssl-certfile + --ssl-keyfile, not both')
@@ -990,7 +1027,11 @@ def main():
                         max_upload_bytes=args.max_upload_mb * 1024 * 1024,
                         upload_timeout_seconds=args.upload_timeout_seconds, decode_timeout_seconds=args.decode_timeout_seconds,
                         temp_dir=args.temp_dir, max_result_bytes=args.max_result_mb * 1024 * 1024,
-                        result_retention_hours=args.result_retention_hours)
+                        result_retention_hours=args.result_retention_hours,
+                        tts=TTSOptions(url=args.tts_url, assets_dir=args.tts_assets_dir,
+                                       voices_config=args.tts_voices_config, timeout_seconds=args.tts_timeout_seconds,
+                                       max_text_chars=args.tts_max_text_chars, max_concurrent=args.tts_max_concurrent,
+                                       x_vector_only=None if args.tts_x_vector_only is None else args.tts_x_vector_only == 'true'))
     # Validate deployment/TLS before loading the GPU model. Default HTTP is unchanged.
     settings.validate()
     tls_options = {}

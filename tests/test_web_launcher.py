@@ -28,7 +28,7 @@ def test_https_options_survive_bash_launcher(bash, tmp_path, extra):
         'print(json.dumps({"args": sys.argv[1:], "cuda": os.getenv("CUDA_VISIBLE_DEVICES"),\n'
         ' "worker": os.getenv("VLLM_WORKER_MULTIPROC_METHOD")}))\n', encoding='utf-8')
     environment = os.environ.copy()
-    environment.update(CUDA_VISIBLE_DEVICES='6', PYTHONIOENCODING='utf-8',
+    environment.update(CUDA_VISIBLE_DEVICES='6', PYTHONIOENCODING='utf-8', PYTHON=Path(sys.executable).as_posix(),
                        PATH=str(Path(sys.executable).parent) + os.pathsep + environment.get('PATH', ''))
     model = str(project / 'model with spaces')
     result = subprocess.run([bash, (project / 'start_server.sh').as_posix(), model, *extra],

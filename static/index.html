@@ -53,9 +53,13 @@
       <article class="panel translation-panel">
         <div class="panel-heading"><div class="panel-title"><h2>实时译文</h2><span id="targetBadge" class="language-badge">中文</span></div><div class="export-actions"><button id="exportTxt" class="text-button" disabled title="下载服务端完整译文；会话中导出当前快照">TXT ↓</button><button id="exportJson" class="text-button" disabled title="下载服务端完整逐轮记录；结果临时保存，建议结束后及时导出">JSON ↓</button></div></div>
         <div class="translation-status"><span id="sessionStatus" class="state-label"><i></i>等待开始</span><span id="latestTag" class="tag tag-neutral">—</span></div>
+        <div class="speech-panel" aria-label="译文播报">
+          <div class="speech-controls"><label class="check-label"><input id="ttsEnabled" type="checkbox" disabled><span>朗读译文</span></label><label class="speech-volume">音量<input id="ttsVolume" type="range" min="0" max="1" step="0.05" value="0.9" aria-label="译文播报音量"></label><button id="ttsPreview" class="text-button" disabled>试听音色</button><button id="ttsStop" class="text-button" disabled>停止播报</button></div>
+          <div id="ttsStatus" class="speech-status" role="status">播报已关闭</div><small id="ttsHint">服务端尚未配置译文播报。</small>
+        </div>
         <div id="transcriptViewport" class="transcript-viewport" tabindex="0" aria-label="增量译文区域"><div id="transcriptEmpty" class="transcript-empty"><h3>暂无译文</h3></div><div id="transcript" class="transcript" lang="zh" aria-live="polite" aria-relevant="additions text"></div></div>
         <div class="transcript-bottom"><span id="translationCount">0 个输出片段</span><button id="followButton" class="text-button" hidden>跟随最新 ↓</button></div>
-        <details id="turnDetails" class="turn-details"><summary><span>逐轮记录</span><span id="turnCount">0 轮</span></summary><div id="turnList" class="turn-list"><p class="no-turns">暂无记录</p></div></details>
+        <details id="turnDetails" class="turn-details"><summary><span>逐轮记录</span><span id="turnCount">0 轮</span></summary><div class="turn-follow"><button id="turnFollowButton" class="text-button" hidden>回到最新记录 ↓</button></div><div id="turnList" class="turn-list" tabindex="0" aria-label="WAIT FLEX DIRECT 逐轮记录"><p class="no-turns">暂无记录</p></div></details>
       </article>
     </section>
 

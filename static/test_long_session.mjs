@@ -105,6 +105,33 @@ test('active sessions lock direction controls', () => {
   assert.equal(h.elements.get('swapLang').disabled,true);
 });
 
+test('policy records follow newest output, respect manual scroll and resume on demand', () => {
+  const h=harness(), box=h.elements.get('turnList');
+  h.evaluate('ui.turnDetails.open=true');
+  h.evaluate("for(let i=0;i<50;i++)appendTurn({tag:'WAIT',delta:'',source_start_s:i,source_end_s:i+1},session);");
+  assert.equal(box.scrollTop,box.scrollHeight);
+  h.deferAnimationFrames(true);
+  h.evaluate("appendTurn({tag:'WAIT',delta:'',source_start_s:50,source_end_s:51},session);");
+  box.listeners.get('wheel')({deltaY:-100});box.scrollTop=20;box.listeners.get('scroll')();h.flushAnimationFrames();
+  assert.equal(box.scrollTop,20);assert.equal(h.elements.get('turnFollowButton').hidden,false);
+  h.evaluate('ui.turnFollowButton.onclick()');assert.equal(box.scrollTop,box.scrollHeight);
+  h.evaluate('ui.turnDetails.open=true');h.elements.get('turnDetails').listeners.get('toggle')();
+  assert.equal(box.scrollTop,box.scrollHeight);
+});
+
+test('TTS receives only new FLEX/DIRECT deltas and whole-system capture cannot play its own audio',()=>{
+  const h=harness();
+  h.evaluate(`globalThis.spoken=[];speech={append:text=>spoken.push(text),stop:()=>spoken.push('STOP')};
+    appendTurn({tag:'WAIT',delta:'',source_start_s:0,source_end_s:1},session);
+    appendTurn({tag:'FLEX',delta:'大学教授可以',source_start_s:1,source_end_s:2},session);
+    appendTurn({tag:'DIRECT',delta:'为学生创作内容。',source_start_s:2,source_end_s:3},session);`);
+  assert.deepEqual(JSON.parse(h.evaluate('JSON.stringify(spoken)')),['大学教授可以','为学生创作内容。']);
+  h.evaluate("session.sourceKind='system';session.capture={displayStream:{getVideoTracks:()=>[{getSettings:()=>({displaySurface:'monitor'})}]}};stopSpeechForCapture(session)");
+  assert.equal(h.elements.get('ttsEnabled').checked,false);assert.equal(h.evaluate('spoken.at(-1)'),'STOP');
+  h.evaluate("session.capture.displayStream.getVideoTracks=()=>[{getSettings:()=>({displaySurface:'browser'})}]");
+  assert.equal(h.evaluate('speechCaptureAllowed(session)'),true);
+});
+
 test('six hours preserve every transcript fragment while auxiliary research records stay bounded', () => {
   const h = harness();
   h.evaluate(`for(let i=0;i<21600;i++) appendTurn({type:'turn',tag:i%7===0?'WAIT':'DIRECT',delta:i%7===0?'':' 安全增量翻译。',source_start_s:i,source_end_s:i+1,service_s:.1,queue_wait_s:0},session);`);

@@ -40,6 +40,8 @@ jobs:
         run: node static/test_long_session.mjs
       - name: Test system-audio permissions and lifecycle
         run: node static/test_system_audio.mjs
+      - name: Test ordered translation speech and cancellation
+        run: node static/test_translation_speech.mjs
       - name: Check command-line entry point
         run: |
           python run.py --help
