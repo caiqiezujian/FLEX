@@ -77,7 +77,9 @@ export class TranslationSpeech {
     if (!run?.enabled || run.ended || !delta) return;
     if (run.textAt === null) run.textAt = this.clock();
     run.text += delta;
-    this.flush(run, false);
+    // A committed translation delta is ready to speak: do not wait for a
+    // sentence terminator or a text-buffer timer before the first request.
+    this.flush(run, true);
   }
 
   finish() {
@@ -92,7 +94,11 @@ export class TranslationSpeech {
     run.text = result.rest;
     run.textAt = run.text ? created : null;
     for (const text of result.pieces) {
-      if (speakable(text)) run.pending.push({text, created});
+      // Only join text that is already waiting for a request slot. Never hold
+      // an idle request to collect more text, or modify an in-flight segment.
+      const tail = run.pending[run.pending.length - 1];
+      if (tail && [...tail.text].length + [...text].length <= run.maximum) tail.text += text;
+      else if (speakable(text)) run.pending.push({text, created});
     }
     if (run.pending.length + run.ready.length + (run.fetching ? 1 : 0) > this.maxQueue) {
       this.fail(run, '播报积压过多，已停止播报；字幕保留。可重新开启，从新译文继续。');return;
@@ -106,7 +112,6 @@ export class TranslationSpeech {
     if (waiting.some(item => this.clock() - item.created > this.maxLagMs)) {
       this.fail(run, '播报落后超过 30 秒，已停止播报；字幕继续。可重新开启，从新译文继续。');return;
     }
-    if (run.text && this.clock() - run.textAt >= 2000) this.flush(run, true);
     if (this.run !== run || !run.enabled) return;
     this.report(run);
     if (!run.ended || run.text || waiting.length || run.playing) {

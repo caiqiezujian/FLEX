@@ -51,7 +51,7 @@ function updateSpeechControls() {
   ui.ttsPreview.disabled = !available || busy();
   ui.ttsHint.textContent = !available ? (config?.tts?.message || '该方向尚未配置参考音色')
     : mode === 'system' ? '播报时请共享其他标签页；整机声音会回采播报，系统将关闭播报。收录讲话时请戴耳机。'
-    : '合并相邻译文，依次朗读；原声可通过播放器音量调整。';
+    : '译文到达即请求播报，按顺序播放；原声可通过播放器音量调整。';
 }
 function startSpeech(s) {
   const player = speechPlayer();

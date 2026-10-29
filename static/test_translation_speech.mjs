@@ -29,20 +29,39 @@ test('speech chunks preserve exact text without short fragment duplication', () 
   assert.equal(splitSpeech('University professor Dr. Smith can speak.').pieces[0], 'University professor Dr. Smith can speak.');
 });
 
-test('adjacent short deltas are buffered and EOF flushes once',async()=>{
+test('short unpunctuated deltas request immediately and EOF never repeats text',async()=>{
   const f=fixture();await f.player.start({language:'zh'});
-  f.player.append('大学教授可以');f.player.append('为学生创作内容');
-  await drain();assert.equal(f.calls.length,0);
-  f.tick(2100);await drain();assert.equal(f.calls[0].text,'大学教授可以为学生创作内容');
+  f.player.append('大学教授可以');
+  assert.equal(f.calls.length,1);assert.equal(f.calls[0].text,'大学教授可以');
+  f.player.append('为学生创作内容');
+  await drain();assert.equal(f.calls.length,2);assert.equal(f.calls[1].text,'为学生创作内容');
   f.player.append('，这是最后一段');f.player.finish();await drain();
-  assert.deepEqual(f.calls.map(c=>c.text),['大学教授可以为学生创作内容','，这是最后一段']);
-  f.player.finish();await drain();assert.equal(f.calls.length,2);
+  assert.deepEqual(f.calls.map(c=>c.text),['大学教授可以','为学生创作内容','，这是最后一段']);
+  f.player.finish();await drain();assert.equal(f.calls.length,3);
   assert.equal(f.nodes.length,1);f.nodes[0].onended();await drain();assert.equal(f.nodes.length,2);
+  f.nodes[1].onended();await drain();assert.equal(f.nodes.length,3);
+  f.nodes[2].onended();assert.equal(f.states.at(-1).state,'done');
+});
+
+test('text arriving during synthesis coalesces only unsent segments without delaying an idle request',async()=>{
+  const resolves=[];
+  const f=fixture({fetcher:(url,opts)=>{f.calls.push(JSON.parse(opts.body));return new Promise(resolve=>resolves.push(resolve));}});
+  await f.player.start({language:'zh'});
+  f.player.append('现在');assert.equal(f.calls.length,1);
+  f.tick(1000);f.player.append('大学教授可以');
+  f.tick(1000);f.player.append('为学生创作内容');f.player.append('，');
+  assert.equal(f.calls[0].text,'现在');
+  assert.deepEqual(f.player.run.pending,[{text:'大学教授可以为学生创作内容，',created:1000}]);
+  resolves[0]({ok:true,arrayBuffer:async()=>new ArrayBuffer(2)});await drain();
+  assert.equal(f.calls.length,2);assert.equal(f.calls[1].text,'大学教授可以为学生创作内容，');
+  resolves[1]({ok:true,arrayBuffer:async()=>new ArrayBuffer(2)});await drain();
+  f.player.finish();assert.equal(f.calls.length,2);
+  f.nodes[0].onended();await drain();
   f.nodes[1].onended();assert.equal(f.states.at(-1).state,'done');
 });
 
 test('prefetch is bounded and playback is strictly ordered without overlapping sources',async()=>{
-  const f=fixture();await f.player.start({language:'en'});
+  const f=fixture();await f.player.start({language:'en',maximum:40});
   for(let i=0;i<6;i++) f.player.append(`This is sentence number ${i}. `);
   await drain();assert.equal(f.nodes.length,1);assert.equal(f.calls.length,3);
   assert.equal(f.player.run.ready.length,2);assert.equal(f.player.run.pending.length,3);
@@ -70,7 +89,7 @@ test('bounded lag cancels hung synthesis and queue overflow reports an explicit 
   const f=fixture({fetcher:()=>new Promise(()=>{})});await f.player.start({language:'en'});
   f.player.append('A whole sentence for a slow voice service.');await drain();
   f.tick(31000);assert.equal(f.player.run,null);assert.match(f.states.at(-1).message,/落后/);
-  const g=fixture({maxQueue:2,fetcher:()=>new Promise(()=>{})});await g.player.start({language:'zh'});
+  const g=fixture({maxQueue:2,fetcher:()=>new Promise(()=>{})});await g.player.start({language:'zh',maximum:40});
   for(let i=0;i<5;i++)g.player.append('这是一条不断增加的较长译文。');
   assert.equal(g.player.run,null);assert.match(g.states.at(-1).message,/积压/);
 });
@@ -95,4 +114,28 @@ test('immediate translation waits for the user-gesture AudioContext resume to fi
   await drain();assert.equal(f.calls.length,0);
   unlock();await starting;await drain();assert.equal(f.calls.length,1);
   assert.equal(f.nodes.length,1);f.player.stop();
+});
+
+test('waiting fragments preserve spaces, unicode limits and original queue age',async()=>{
+  const f=fixture({fetcher:()=>new Promise(()=>{})});await f.player.start({language:'en',maximum:40});
+  f.player.append('First');f.tick(1000);
+  for(const text of ['Good',' ','morning','，','界😀'.repeat(20)]) f.player.append(text);
+  const pending=f.player.run.pending;
+  assert.equal(pending.map(p=>p.text).join(''),'Good morning，'+'界😀'.repeat(20));
+  assert(pending.every(p=>[...p.text].length<=40));
+  assert.equal(f.player.run.fetching.text,'First');
+  assert.equal(pending[0].created,1000);
+  f.tick(1000);f.player.append('end');
+  assert.equal(pending[0].created,1000);f.player.stop();
+});
+
+test('a full ready queue merges later fragments without waiting for new text',async()=>{
+  const f=fixture();await f.player.start({language:'en'});
+  for(const text of ['First.','Second.','Third.']) {f.player.append(text);await drain();}
+  assert.equal(f.player.run.ready.length,2);assert.equal(f.calls.length,3);
+  for(const text of ['Good',' ','morning']) f.player.append(text);
+  assert.equal(f.calls.length,3);
+  assert.equal(f.player.run.pending[0].text,'Good morning');
+  f.nodes[0].onended();await drain();
+  assert.equal(f.calls.length,4);assert.equal(f.calls[3].text,'Good morning');f.player.stop();
 });
