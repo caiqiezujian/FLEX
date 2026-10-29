@@ -33,14 +33,16 @@ let totalTurns = 0, translationCharacters = 0, recentRecordCharacters = 0, recor
 let windowRollovers = 0, exportInProgress = false;
 let pageHidden = false, configRefreshFailed = false;
 let configRequest = null;
-let followTurns = true, turnUserScrollUntil = 0, speech = null;
+let followTurns = true, turnUserScrollUntil = 0, speech = null, previewActive = false;
 
 function speechPlayer() {
   if (!speech) speech = new TranslationSpeech({onState:info => {
     ui.ttsStatus.textContent = info.message;
-    ui.ttsStatus.classList.toggle('warning',info.state === 'error');
+    ui.ttsStatus.classList.toggle('warning',info.state === 'error' || Boolean(info.lagging));
     ui.ttsStop.disabled = !info.enabled;
-    if (info.state === 'error') ui.ttsEnabled.checked = false;
+    previewActive = Boolean(info.preview && info.enabled && info.state !== 'done');
+    if (info.state === 'error' && !info.preview) ui.ttsEnabled.checked = false;
+    updateSpeechControls();
   }});
   return speech;
 }
@@ -48,17 +50,20 @@ function updateSpeechControls() {
   const target = busy() ? session?.targetLang : ui.targetLang.value;
   const available = config?.tts?.enabled && config.tts.languages?.includes(target);
   ui.ttsEnabled.disabled = !available;
-  ui.ttsPreview.disabled = !available || busy();
+  ui.ttsPreview.disabled = !available || busy() || previewActive;
   ui.ttsHint.textContent = !available ? (config?.tts?.message || '该方向尚未配置参考音色')
     : mode === 'system' ? '播报时请共享其他标签页；整机声音会回采播报，系统将关闭播报。收录讲话时请戴耳机。'
     : '译文到达即请求播报，按顺序播放；原声可通过播放器音量调整。';
 }
-function startSpeech(s) {
+function startSpeech(s, {preview = false} = {}) {
   const player = speechPlayer();
   player.setVolume(ui.ttsVolume.value);
   return player.start({language:s.targetLang,token:s.authToken,
-    maximum:config?.tts?.max_text_chars || 200,timeoutSeconds:config?.tts?.timeout_seconds || 180});
+    maximum:config?.tts?.max_text_chars || 200,timeoutSeconds:config?.tts?.timeout_seconds || 180,
+    maxConcurrent:config?.tts?.max_concurrent || 2,preview});
 }
+// Bounded, text-free timing records for diagnosing this page's actual pipeline.
+window.flexTtsDiagnostics = () => speech?.getDiagnostics() || [];
 function speechCaptureAllowed(s) {
   if (s?.sourceKind !== 'system') return true;
   // Whole-system capture includes this page's TTS even with headphones.
@@ -291,7 +296,7 @@ function appendTurn(data, s) {
     ui.transcript.append(span); currentTranslation += data.delta;
     ui.transcriptEmpty.hidden = true; transcriptFragments++;
     if (speech?.run?.enabled && s.sourceKind === 'system') stopSpeechForCapture(s);
-    speech?.append(data.delta);
+    speech?.append(data.delta, {turn:totalTurns,sourceEndSeconds:data.source_end_s});
     if (followOutput) requestAnimationFrame(() => { if (current(s) && followOutput) ui.transcriptViewport.scrollTop = ui.transcriptViewport.scrollHeight; });
   }
   const row = document.createElement('div'); row.className = `turn-row ${data.tag.toLowerCase()}`;
@@ -845,14 +850,13 @@ ui.ttsEnabled.onchange = () => {
 };
 ui.ttsVolume.oninput = () => speech?.setVolume(ui.ttsVolume.value);
 ui.ttsStop.onclick = () => {ui.ttsEnabled.checked = false;speech?.stop('已停止播报，待播音频已清空。');};
-ui.ttsPreview.onclick = async () => {
-  if (busy()) return;
+ui.ttsPreview.onclick = () => {
+  if (busy() || previewActive) return;
   const player = speechPlayer();
-  const pending = startSpeech({targetLang:ui.targetLang.value,authToken:ui.authToken.value.trim()});
+  void startSpeech({targetLang:ui.targetLang.value,authToken:ui.authToken.value.trim()},{preview:true});
   const run = player.run;
-  await pending;
-  if (speech !== player || busy() || player.run !== run || !run?.enabled) return;
-  player.append(ui.targetLang.value === 'en' ? 'Hello, this is the interpretation voice preview.' : '你好，这是同声传译的音色试听。');
+  if (!run?.enabled) return;
+  player.append(run.language === 'en' ? 'Hello, this is the interpretation voice preview.' : '你好，这是同声传译的音色试听。');
   player.finish();
 };
 document.addEventListener('click',event => {if(!ui.settings.contains(event.target))ui.settings.open = false;});

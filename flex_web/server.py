@@ -412,24 +412,76 @@ def create_app(settings=None):
 
     @app.post('/api/tts/synthesize')
     async def synthesize_speech(request: Request):
-        require_media_access(request)
-        body = bytearray()
-        async for part in request.stream():
-            body.extend(part)
-            if len(body) > 8192:
-                raise HTTPException(413, detail=dict(code='tts_request_size', message='TTS 请求过大。'))
+        started = time.perf_counter()
+        diagnostics = dict(request_id=uuid.uuid4().hex)
+        synthesis = disconnect = None
+        outcome = 'error'
+
+        def timing_headers():
+            headers = {'X-TTS-Request-ID': diagnostics['request_id'],
+                       'X-TTS-Service-Seconds': f'{time.perf_counter() - started:.6f}'}
+            for field, name in (('upstream_headers_seconds', 'X-TTS-Upstream-Headers-Seconds'),
+                                ('upstream_body_seconds', 'X-TTS-Upstream-Body-Seconds'),
+                                ('decode_seconds', 'X-TTS-Decode-Seconds')):
+                if field in diagnostics:
+                    headers[name] = f'{diagnostics[field]:.6f}'
+            return headers
+
+        async def wait_disconnect():
+            # Only read disconnect events after the complete request body was read.
+            while True:
+                if (await request.receive())['type'] == 'http.disconnect':
+                    return
+
         try:
-            data = json.loads(body)
-        except (ValueError, UnicodeError):
-            raise HTTPException(400, detail=dict(code='tts_request', message='需要 JSON 请求。'))
-        if not isinstance(data, dict) or set(data) - {'text', 'language'}:
-            raise HTTPException(400, detail=dict(code='tts_request', message='仅接受 text 和 language 字段。'))
-        try:
-            raw, rate, duration = await tts.synthesize(data.get('text'), data.get('language'))
+            require_media_access(request)
+            body = bytearray()
+            async for part in request.stream():
+                body.extend(part)
+                if len(body) > 8192:
+                    raise HTTPException(413, detail=dict(code='tts_request_size', message='TTS 请求过大。'))
+            try:
+                data = json.loads(body)
+            except (ValueError, UnicodeError):
+                raise HTTPException(400, detail=dict(code='tts_request', message='需要 JSON 请求。'))
+            if not isinstance(data, dict) or set(data) - {'text', 'language'}:
+                raise HTTPException(400, detail=dict(code='tts_request', message='仅接受 text 和 language 字段。'))
+            synthesis = asyncio.create_task(tts.synthesize(
+                data.get('text'), data.get('language'), diagnostics=diagnostics))
+            disconnect = asyncio.create_task(wait_disconnect())
+            await asyncio.wait((synthesis, disconnect), return_when=asyncio.FIRST_COMPLETED)
+            if not synthesis.done():
+                disconnect.result()
+                synthesis.cancel()
+                await asyncio.gather(synthesis, return_exceptions=True)
+                outcome = 'disconnected'
+                # Cancels this Web HTTP call; remote GPU cancellation is upstream-owned.
+                return Response(status_code=499, headers=timing_headers())
+            raw, rate, duration = synthesis.result()
+            outcome = 'ok'
+            return Response(raw, media_type='audio/wav', headers={
+                **timing_headers(), 'X-Audio-Sample-Rate': str(rate),
+                'X-Audio-Duration': f'{duration:.6f}'})
         except TTSError as exc:
-            raise HTTPException(exc.status, detail=dict(code=exc.code, message=str(exc))) from exc
-        return Response(raw, media_type='audio/wav', headers={
-            'X-Audio-Sample-Rate': str(rate), 'X-Audio-Duration': f'{duration:.6f}'})
+            outcome = exc.code
+            raise HTTPException(exc.status, detail=dict(code=exc.code, message=str(exc)),
+                                headers=timing_headers()) from exc
+        except HTTPException as exc:
+            outcome = f'http_{exc.status_code}'
+            exc.headers = {**(exc.headers or {}), **timing_headers()}
+            raise
+        except asyncio.CancelledError:
+            outcome = 'cancelled'
+            raise
+        finally:
+            pending = [task for task in (synthesis, disconnect) if task is not None]
+            for task in pending:
+                if not task.done():
+                    task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            LOG.info('TTS HTTP request=%s outcome=%s service_s=%.6f active=%s',
+                     diagnostics['request_id'], outcome, time.perf_counter() - started, tts.active)
 
     @app.post('/api/media')
     async def upload_media(request: Request):

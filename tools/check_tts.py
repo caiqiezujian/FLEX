@@ -8,6 +8,7 @@ import json
 import logging
 from pathlib import Path
 import sys
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from flex_web.tts import TTSOptions, TTSService, TTSError
@@ -15,17 +16,22 @@ from flex_web.tts import TTSOptions, TTSService, TTSError
 
 async def check(args):
     service = TTSService(TTSOptions(url=args.url, assets_dir=args.assets_dir,
-                                    voices_config=args.voices_config, timeout_seconds=args.timeout))
+                                    voices_config=args.voices_config, timeout_seconds=args.timeout,
+                                    x_vector_only=None if args.x_vector_only is None else args.x_vector_only == 'true'))
     text = args.text or ('Hello, this is the interpretation voice preview.' if args.language == 'en'
                          else '你好，这是同声传译的音色试听。')
     try:
         await service.start()
-        audio, rate, duration = await service.synthesize(text, args.language)
+        diagnostics = {}
+        started = time.perf_counter()
+        audio, rate, duration = await service.synthesize(text, args.language, diagnostics=diagnostics)
+        elapsed = time.perf_counter() - started
         args.output.parent.mkdir(parents=True, exist_ok=True)
         with args.output.open('xb') as out:
             out.write(audio)
         print(json.dumps(dict(ok=True, language=args.language, sample_rate=rate,
-                              duration_seconds=duration, output=str(args.output.resolve())), ensure_ascii=False))
+                              duration_seconds=duration, elapsed_seconds=elapsed,
+                              diagnostics=diagnostics, output=str(args.output.resolve())), ensure_ascii=False))
     finally:
         await service.close()
 
@@ -38,6 +44,8 @@ def main():
     parser.add_argument('--language', choices=['zh', 'en'], default='zh')
     parser.add_argument('--text', default='')
     parser.add_argument('--timeout', type=float, default=180)
+    parser.add_argument('--x-vector-only', choices=['true', 'false'], default=None,
+                        help='Optional override; omitted preserves the upstream service default')
     parser.add_argument('--output', type=Path, required=True, help='New WAV file; existing files are never overwritten')
     args = parser.parse_args()
     if args.output.exists():

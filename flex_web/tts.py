@@ -10,6 +10,7 @@ import json
 import logging
 import math
 from pathlib import Path
+import time
 from urllib.parse import urlsplit
 import uuid
 import wave
@@ -101,6 +102,7 @@ class TTSService:
     def public_config(self):
         return dict(enabled=bool(self.voices), languages=sorted(self.voices),
                     max_text_chars=self.options.max_text_chars,
+                    max_concurrent=self.options.max_concurrent,
                     timeout_seconds=self.options.timeout_seconds,
                     message=self.error or ('' if self.voices else '服务端尚未配置译文播报。'))
 
@@ -116,31 +118,43 @@ class TTSService:
         if self.client:
             await self.client.aclose()
 
-    async def synthesize(self, text, language):
-        if not self.voices or not self.client:
-            raise TTSError('tts_unavailable', self.error or '服务端未启用 TTS。', 503)
-        if not isinstance(language, str) or language not in self.voices:
-            raise TTSError('tts_language', '未配置该目标语言的参考音色。', 400)
-        if (not isinstance(text, str) or not text.strip() or len(text) > self.options.max_text_chars
-                or not any(c.isalnum() for c in text) or '<|' in text or '|>' in text):
-            raise TTSError('tts_text', '请提交限长的译文正文，不含策略标签或纯标点。', 400)
-        # No unbounded server-side waiting room. The browser owns its ordered queue.
-        if self.active >= self.options.max_concurrent:
-            raise TTSError('tts_busy', '语音服务忙，请稍后重新开启播报；文字同传继续。', 503)
-        self.active += 1
-        request_id = uuid.uuid4().hex
-        payload = dict(self.voices[language], text=text, language=language, request_id=request_id)
-        if self.options.x_vector_only is not None:
-            payload['x_vector_only'] = self.options.x_vector_only
+    async def synthesize(self, text, language, *, diagnostics=None):
+        # The optional mapping keeps the existing (WAV, rate, duration) API intact.
+        diagnostics = diagnostics if diagnostics is not None else {}
+        request_id = diagnostics.setdefault('request_id', uuid.uuid4().hex)
+        started = time.perf_counter()
+        admitted = False
+        outcome = 'error'
         try:
+            if not self.voices or not self.client:
+                raise TTSError('tts_unavailable', self.error or '服务端未启用 TTS。', 503)
+            if not isinstance(language, str) or language not in self.voices:
+                raise TTSError('tts_language', '未配置该目标语言的参考音色。', 400)
+            if (not isinstance(text, str) or not text.strip() or len(text) > self.options.max_text_chars
+                    or not any(c.isalnum() for c in text) or '<|' in text or '|>' in text):
+                raise TTSError('tts_text', '请提交限长的译文正文，不含策略标签或纯标点。', 400)
+            # No unbounded server-side waiting room. The browser owns its ordered queue.
+            if self.active >= self.options.max_concurrent:
+                raise TTSError('tts_busy', '语音服务忙，请稍后重新开启播报；文字同传继续。', 503)
+            self.active += 1
+            admitted = True
+            payload = dict(self.voices[language], text=text, language=language, request_id=request_id)
+            if self.options.x_vector_only is not None:
+                payload['x_vector_only'] = self.options.x_vector_only
+
             async def request_audio():
                 url = self.options.url.rstrip('/') + '/api/tts/clone'
+                submitted = time.perf_counter()
                 async with self.client.stream('POST', url, json=payload) as response:
+                    diagnostics['upstream_headers_seconds'] = time.perf_counter() - submitted
+                    diagnostics['upstream_status'] = response.status_code
                     body = bytearray()
                     async for part in response.aiter_bytes():
                         body.extend(part)
                         if len(body) > MAX_RESPONSE_BYTES:
                             raise TTSError('tts_response_size', 'TTS 响应过大，已停止本次播报。')
+                    diagnostics['upstream_body_seconds'] = time.perf_counter() - submitted
+                    decoding = time.perf_counter()
                     try:
                         data = json.loads(body)
                     except (ValueError, UnicodeError) as exc:
@@ -150,16 +164,35 @@ class TTSService:
                         code = error.get('code', 'UNKNOWN') if isinstance(error, dict) else 'UNKNOWN'
                         LOG.warning('TTS request=%s HTTP=%s code=%s', request_id, response.status_code, code)
                         raise TTSError('tts_upstream', f'TTS 服务返回 HTTP {response.status_code}（{str(code)[:80]}）。')
-                    return decode_audio(data)
+                    audio = decode_audio(data)
+                    diagnostics['decode_seconds'] = time.perf_counter() - decoding
+                    return audio
             # Total timeout also covers trickling responses, unlike read timeout alone.
-            return await asyncio.wait_for(request_audio(), timeout=self.options.timeout_seconds)
+            audio = await asyncio.wait_for(request_audio(), timeout=self.options.timeout_seconds)
+            outcome = 'ok'
+            return audio
+        except TTSError as exc:
+            outcome = exc.code
+            raise
+        except asyncio.CancelledError:
+            outcome = 'cancelled'
+            raise
         except (asyncio.TimeoutError, httpx.TimeoutException) as exc:
+            outcome = 'tts_timeout'
             raise TTSError('tts_timeout', '语音合成超时；文字同传继续。', 504) from exc
         except httpx.HTTPError as exc:
+            outcome = 'tts_connection'
             LOG.warning('TTS request=%s transport failed: %s', request_id, type(exc).__name__)
             raise TTSError('tts_connection', '无法连接 TTS 服务，请检查 Web 服务器到 TTS 的网络。') from exc
         finally:
-            self.active -= 1
+            if admitted:
+                self.active -= 1
+            diagnostics['elapsed_seconds'] = time.perf_counter() - started
+            LOG.info('TTS request=%s outcome=%s elapsed_s=%.6f upstream_headers_s=%s '
+                     'upstream_body_s=%s decode_s=%s upstream_status=%s active=%s',
+                     request_id, outcome, diagnostics['elapsed_seconds'],
+                     diagnostics.get('upstream_headers_seconds'), diagnostics.get('upstream_body_seconds'),
+                     diagnostics.get('decode_seconds'), diagnostics.get('upstream_status'), self.active)
 
 
 def decode_audio(data):
