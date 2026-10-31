@@ -5,6 +5,7 @@ not a new trainer; Megatron and the native Omni feature/packing paths remain.
 """
 from pathlib import Path
 from copy import deepcopy
+import os
 import sys
 
 PROJECT = str(Path(__file__).resolve().parent)
@@ -12,6 +13,11 @@ if PROJECT not in sys.path:
     sys.path.insert(0, PROJECT)
 
 from duplex_audio import PREFIX, SAMPLE_RATE, materialize_chunk_refs
+
+if os.environ.get("FLEX_SFT_ATTENTION_COMPAT") == "1":
+    from duplex_attention_compat import install_attention_compat, install_swift_loader_compat
+    install_attention_compat()
+    install_swift_loader_compat()
 
 try:
     from swift.template.register import TEMPLATE_MAPPING, register_template

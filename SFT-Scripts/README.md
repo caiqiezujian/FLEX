@@ -64,6 +64,36 @@ bash train_duplex_sft_virtual.sh \
 
 确认流程时先用少量数据完成一次真实训练和保存，再运行全量。检查脚本不加载模型权重，也不能证明 GPU 训练、实际模板编码和 checkpoint 导出已验收。
 
+### 宿主机暂时不能升级驱动：可选注意力兼容模式
+
+针对A800、驱动535.129.03、torch 2.8.0+cu128、flash-attn 2.8.1环境中出现的 `flash_attn_gpu.varlen_fwd: device kernel image is invalid`，提供 `--compat-old-driver` 可选模式。正常机器不加该参数，继续原来的训练配置。不安装或降级依赖、不修改site-packages，不改变模型参数名称、协议token、数据读取或译文监督。该模式绕开已定位的FlashAttention路径，不能保证旧驱动支持其他所有CUDA扩展。
+
+先在发生错误的SFT容器中，用一张空闲卡执行小规模检查；不读取30B权重或训练数据，不联网下载：
+
+```bash
+python3 -u check_sft_attention.py --gpu-id 0
+```
+
+检查分别执行小型Omni音频注意力、视觉注意力和Transformer Engine非融合注意力的BF16前后向，并检查后一个音频片段不影响前一个片段。出现 `ALL PASSED` 后，在原来的 `bash train_duplex_sft_virtual.sh MCORE_MODEL TRAIN_JSONL OUTPUT_DIR --gpu-ids ...` 命令末尾追加 `--compat-old-driver`，先用少量样本验证真实四卡训练和保存，再开始全量。检查失败则保留完整报错；不要跳过失败阶段声称已验证。
+
+模式具体设置：
+
+| 项目 | 默认模式 | 兼容模式 |
+|---|---|---|
+| Omni HF音频/视觉 | 现有原生选择 | SDPA，强制PyTorch MATH后端 |
+| Megatron主干注意力 | flash | unfused |
+| packing / padding_free | 原有packing开启 | 两项均关闭 |
+| micro / global batch | 4 / 16 | 1 / 16 |
+| TE环境 | 保留原行为 | NVTE_FLASH_ATTN=0、NVTE_FUSED_ATTN=0、NVTE_UNFUSED_ATTN=1、NVTE_MASKED_SOFTMAX_FUSION=0 |
+
+`--compat-old-driver`会拒绝额外覆盖attention/packing/transformer_impl参数，避免两套配置相互冲突。其余原生参数仍可追加；开始验证时不要上调micro batch。取消packing后，同一个global batch数值对应原始样本而非打包样本，epoch对应总步数及吞吐会变化，不能按原packing版本的每步数据量直接比较。普通注意力可能更慢且更耗显存；micro=1也不是不发生OOM的保证。
+
+`duplex_attention_compat.py`修正了两个版本相关行为：SWIFT 3.12.1选择Megatron unfused时会丢弃HF `attn_impl`选项，因此仅对Qwen3-Omni的HF加载入口强制SDPA；Transformers 4.57.1音频分支的普通SDPA没有实际使用传入的累积长度来隔离音频，因而按 `cu_seqlens` 逐段调用原生注意力，再顺序拼接。保留原投影、缩放、掩码和梯度，不允许音频片段互相串看。视觉分支使用原生的分段SDPA。不是把所有音频合并成同一个注意力窗口。
+
+本地验证包括真实小型HF 4.57.1注意力的CPU前后向、逐段等价性、未来片段扰动隔离/跨段梯度为零，以及两种shell模式和冲突参数校验；未在目标535驱动上运行真实四卡SFT。线性层、归一化、MoE、通信和保存仍走原框架，需由服务器的后续短训练验证。
+
+实现依据：[SWIFT 3.12.1 HF加载入口](https://github.com/modelscope/ms-swift/blob/v3.12.1/swift/megatron/model/mm_gpt/utils.py)、[Transformers 4.57.1 Omni注意力](https://github.com/huggingface/transformers/blob/v4.57.1/src/transformers/models/qwen3_omni_moe/modeling_qwen3_omni_moe.py)、[PyTorch 2.8 SDPA后端选择](https://docs.pytorch.org/docs/2.8/generated/torch.nn.attention.sdpa_kernel.html)。
+
 ## 保存适配器，按需合并模型
 
 当前训练脚本显式设置 `--save_safetensors true --merge_lora false`。在ms-swift 3.12.1中，这会在保存点导出PEFT格式的适配器权重，而不是每次生成 `checkpoint-N-merged` 完整模型。保持 `--modules_to_save word_embeddings output_layer`：两层也在训练，必须一起保存，因此适配器可能仍达到GB级，并不只含LoRA小矩阵。保存间隔仍为3000步，优化参数、数据和模型加载方式不变。
