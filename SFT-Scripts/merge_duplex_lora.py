@@ -7,7 +7,9 @@ is needed. Preserves inputs and publishes the final directory only after checks.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from datetime import datetime, timezone
+import faulthandler
 import importlib.metadata
 import json
 import os
@@ -22,6 +24,33 @@ PROTOCOL = ["<|WAIT|>", "<|DIRECT|>", "<|FLEX|>"]
 VOCAB_KEYS = ("thinker.model.embed_tokens.weight", "thinker.lm_head.weight")
 
 
+@contextmanager
+def diagnostic_stage(name, stack_after_seconds=60):
+    """Log a local stage and dump its stack if slow; never abort or skip checks.
+
+    Stages must not be nested: faulthandler has one process-wide timer.
+    This diagnoses this Python process, not the separate SWIFT export process.
+    """
+    started = time.monotonic()
+    print(f"[merge] BEGIN: {name} (stack dump every {stack_after_seconds}s if still running)", flush=True)
+    armed = False
+    try:
+        try:
+            faulthandler.dump_traceback_later(stack_after_seconds, repeat=True, file=sys.stderr, exit=False)
+            armed = True
+        except (OSError, ValueError, RuntimeError) as exc:
+            print(f"[merge] NOTE: stack watchdog unavailable: {exc}", flush=True)
+        yield
+    except BaseException:
+        print(f"[merge] FAILED: {name} elapsed={time.monotonic() - started:.1f}s", flush=True)
+        raise
+    else:
+        print(f"[merge] DONE: {name} elapsed={time.monotonic() - started:.1f}s", flush=True)
+    finally:
+        if armed:
+            faulthandler.cancel_dump_traceback_later()
+
+
 def read_json(path):
     with Path(path).open(encoding="utf-8-sig") as handle:
         return json.load(handle)
@@ -29,6 +58,11 @@ def read_json(path):
 
 def weight_inventory(directory, prefix):
     """Read safetensors shapes and check sharded indexes without loading weights."""
+    with diagnostic_stage(f"Read {prefix} safetensors headers: {directory}"):
+        return _weight_inventory(directory, prefix)
+
+
+def _weight_inventory(directory, prefix):
     from safetensors import safe_open
 
     directory = Path(directory)
@@ -47,7 +81,9 @@ def weight_inventory(directory, prefix):
     else:
         raise ValueError(f"No {prefix}.safetensors or its shard index in {directory}")
     inventory = {}
-    for path in files:
+    for number, path in enumerate(files, 1):
+        started = time.monotonic()
+        print(f"[merge] Header {number}/{len(files)}: {path}", flush=True)
         if not path.is_file():
             raise FileNotFoundError(f"Missing safetensors shard: {path}")
         with safe_open(str(path), framework="pt", device="cpu") as handle:
@@ -57,6 +93,7 @@ def weight_inventory(directory, prefix):
                 inventory[key] = {"file": str(path), "shape": list(handle.get_slice(key).get_shape())}
                 if weight_map is not None and weight_map.get(key) != path.name:
                     raise ValueError(f"Tensor/index disagreement: {key}")
+        print(f"[merge] Header {number}/{len(files)} complete elapsed={time.monotonic() - started:.1f}s", flush=True)
     if weight_map is not None and set(weight_map) != set(inventory):
         raise ValueError(f"Index references missing tensors: {index_path}")
     if not inventory:
@@ -91,28 +128,32 @@ def protocol_ids(tokenizer):
 
 
 def preflight(base, adapter, tokens_file):
-    from transformers import AutoTokenizer
+    with diagnostic_stage("Import transformers.AutoTokenizer (may initialize PyTorch)"):
+        from transformers import AutoTokenizer
 
-    config = read_json(base / "config.json")
-    if config.get("model_type") != "qwen3_omni_moe":
-        raise ValueError("--base must be the original Hugging Face Qwen3-Omni model directory, not MCore")
-    if config.get("quantization_config") or config.get("thinker_config", {}).get("quantization_config"):
-        raise ValueError("Use the original unquantized HF base for this merge")
-    tokens = tokens_file.read_text(encoding="utf-8-sig").split()
-    if tokens != PROTOCOL:
-        raise ValueError(f"Special-token file must contain these tokens in order: {PROTOCOL}")
-    adapter_config = read_json(adapter / "adapter_config.json")
-    if str(adapter_config.get("peft_type", "")).upper() != "LORA":
-        raise ValueError("Expected a PEFT LoRA adapter_config.json, not a merged/MCore checkpoint")
-    training_args = read_json(adapter / "args.json")
-    trained_tokens = training_args.get("new_special_tokens")
-    if trained_tokens != tokens:
-        raise ValueError("Checkpoint args.json new_special_tokens does not match the protocol token list. "
-                         "Check the actual training token order; do not guess or edit it just to bypass this check.")
+    with diagnostic_stage("Read local model config, adapter config and training args"):
+        config = read_json(base / "config.json")
+        if config.get("model_type") != "qwen3_omni_moe":
+            raise ValueError("--base must be the original Hugging Face Qwen3-Omni model directory, not MCore")
+        if config.get("quantization_config") or config.get("thinker_config", {}).get("quantization_config"):
+            raise ValueError("Use the original unquantized HF base for this merge")
+        tokens = tokens_file.read_text(encoding="utf-8-sig").split()
+        if tokens != PROTOCOL:
+            raise ValueError(f"Special-token file must contain these tokens in order: {PROTOCOL}")
+        adapter_config = read_json(adapter / "adapter_config.json")
+        if str(adapter_config.get("peft_type", "")).upper() != "LORA":
+            raise ValueError("Expected a PEFT LoRA adapter_config.json, not a merged/MCore checkpoint")
+        training_args = read_json(adapter / "args.json")
+        trained_tokens = training_args.get("new_special_tokens")
+        if trained_tokens != tokens:
+            raise ValueError("Checkpoint args.json new_special_tokens does not match the protocol token list. "
+                             "Check the actual training token order; do not guess or edit it just to bypass this check.")
     # Explicitly rebuild the same token additions from the original base.
-    tokenizer = AutoTokenizer.from_pretrained(str(base), local_files_only=True, trust_remote_code=False)
-    tokenizer.add_special_tokens({"additional_special_tokens": tokens})
-    ids = protocol_ids(tokenizer)
+    with diagnostic_stage(f"Load local tokenizer: {base}"):
+        tokenizer = AutoTokenizer.from_pretrained(str(base), local_files_only=True, trust_remote_code=False)
+    with diagnostic_stage("Add and validate WAIT / DIRECT / FLEX tokens"):
+        tokenizer.add_special_tokens({"additional_special_tokens": tokens})
+        ids = protocol_ids(tokenizer)
     base_weights = weight_inventory(base, "model")
     adapter_weights = weight_inventory(adapter, "adapter_model")
     if not any("lora_A" in key for key in adapter_weights) or not any("lora_B" in key for key in adapter_weights):
@@ -141,14 +182,17 @@ def preflight(base, adapter, tokens_file):
 
 
 def verify_export(output, expected):
-    import torch
-    from safetensors import safe_open
-    from transformers import AutoProcessor, AutoTokenizer
+    with diagnostic_stage("Import export verification dependencies"):
+        import torch
+        from safetensors import safe_open
+        from transformers import AutoProcessor, AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(str(output), local_files_only=True, trust_remote_code=False)
+    with diagnostic_stage(f"Load exported tokenizer: {output}"):
+        tokenizer = AutoTokenizer.from_pretrained(str(output), local_files_only=True, trust_remote_code=False)
     if protocol_ids(tokenizer) != expected["protocol_token_ids"] or len(tokenizer) != expected["tokenizer_length"]:
         raise ValueError("Exported tokenizer differs from the expected training protocol tokenizer")
-    processor = AutoProcessor.from_pretrained(str(output), local_files_only=True, trust_remote_code=False)
+    with diagnostic_stage(f"Load exported processor: {output}"):
+        processor = AutoProcessor.from_pretrained(str(output), local_files_only=True, trust_remote_code=False)
     if protocol_ids(processor.tokenizer) != expected["protocol_token_ids"]:
         raise ValueError("Exported processor tokenizer protocol mismatch")
     config = read_json(output / "config.json")
@@ -170,13 +214,14 @@ def verify_export(output, expected):
     checked = []
     for target, saved in expected["saved_modules"].items():
         exported = inventory[target]
-        with safe_open(saved["file"], framework="pt", device="cpu") as src, \
-                safe_open(exported["file"], framework="pt", device="cpu") as dst:
-            for token_id in expected["protocol_token_ids"].values():
-                actual = dst.get_slice(target)[token_id:token_id + 1]
-                reference = src.get_slice(saved["key"])[token_id:token_id + 1].to(actual.dtype)
-                if not torch.isfinite(actual).all() or not torch.equal(reference, actual):
-                    raise ValueError(f"Saved protocol row was not preserved: {target}, token_id={token_id}")
+        with diagnostic_stage(f"Compare trained protocol rows: {target}"):
+            with safe_open(saved["file"], framework="pt", device="cpu") as src, \
+                    safe_open(exported["file"], framework="pt", device="cpu") as dst:
+                for token_id in expected["protocol_token_ids"].values():
+                    actual = dst.get_slice(target)[token_id:token_id + 1]
+                    reference = src.get_slice(saved["key"])[token_id:token_id + 1].to(actual.dtype)
+                    if not torch.isfinite(actual).all() or not torch.equal(reference, actual):
+                        raise ValueError(f"Saved protocol row was not preserved: {target}, token_id={token_id}")
         checked.append(target)
     return {"protocol_token_ids": expected["protocol_token_ids"], "tokenizer_length": len(tokenizer),
             "vocab_size": expected["expected_vocab_size"], "tensor_count": len(inventory),

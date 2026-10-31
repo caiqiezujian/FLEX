@@ -96,6 +96,10 @@ bash merge_duplex_lora.sh \
 
 只想先检查输入而不加载完整模型，可在上述命令末尾追加 `--check-only`。合并成功后，原先离线推理/Web服务的模型路径可以指向这个新导出目录，推理时仍需提供与SFT一致的system prompt。
 
+合并输入检查现在分别打印框架导入、配置读取、本地tokenizer加载、协议token校验，以及每个safetensors分片文件头的开始/完成和耗时。在这些诊断阶段停留超过60秒，会自动向终端打印当前Python堆栈，每60秒重复一次；`Timeout`仅是诊断提示，不会终止任务或跳过检查，也不代表已经确认死锁。诊断使用Python自带的faulthandler，不需要py-spy或Docker SYS_PTRACE权限；不覆盖独立SWIFT导出子进程的内部调用栈。
+
+若一直停在输入检查，先停止这次合并进程，再使用相同命令追加 `--check-only` 复现，保留最后一个 `BEGIN` 阶段与自动堆栈供定位。检查模式不加载完整模型、不生成合并权重；确认通过后再去掉该参数正式合并。仅看到pynvml的FutureWarning不能说明它是阻塞原因，不应仅为消除该警告升级训练环境。
+
 ## 全量检查已有训练JSONL
 
 `audit_duplex_dataset.py` 用于统计已经生成的虚拟音频训练JSONL有多少行通过、有多少行失败。它不会重新生成数据、修改区间、过滤原JSONL或删除原音频；无需模型、SWIFT或GPU。请在音频路径实际可访问的训练容器中运行，检查的是准备后的训练JSONL，而不是含srcs/chooses/timestamps的原始JSONL。

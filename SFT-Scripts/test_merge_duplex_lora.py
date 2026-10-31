@@ -1,6 +1,7 @@
 """CPU-only export validation tests; no real Qwen weights or GPU merge."""
 import json
 from pathlib import Path
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -148,3 +149,39 @@ def test_command_does_not_restore_old_plugin_or_use_mcore_export(tmp_path):
     assert cmd[cmd.index("--template") + 1] == "qwen3_omni"
     assert "--to_hf" not in cmd and "--mcore_model" not in cmd
     assert cmd[cmd.index("--new_special_tokens") + 1] == str(args.special_tokens)
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_diagnostic_stage_cancels_watchdog_and_propagates_errors(monkeypatch, capsys, fails):
+    events = []
+    monkeypatch.setattr(merge.faulthandler, "dump_traceback_later", lambda *a, **kw: events.append(kw))
+    monkeypatch.setattr(merge.faulthandler, "cancel_dump_traceback_later", lambda: events.append("cancel"))
+    try:
+        with merge.diagnostic_stage("test stage"):
+            if fails:
+                raise ValueError("real validation failure")
+    except ValueError as exc:
+        assert fails and str(exc) == "real validation failure"
+    else:
+        assert not fails
+    assert events[0]["repeat"] is True and events[0]["exit"] is False
+    assert events[-1] == "cancel"
+    log = capsys.readouterr().out
+    assert "BEGIN: test stage" in log
+    assert ("FAILED: test stage" if fails else "DONE: test stage") in log
+
+
+def test_slow_stage_dumps_stack_without_terminating_subprocess():
+    code = """
+import time
+import merge_duplex_lora as merge
+with merge.diagnostic_stage('synthetic slow import', stack_after_seconds=0.05):
+    time.sleep(0.2)
+print('continued normally', flush=True)
+"""
+    result = subprocess.run([sys.executable, "-u", "-c", code], cwd=Path(merge.__file__).parent,
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert "Timeout" in result.stderr and 'File "<string>"' in result.stderr
+    assert "DONE: synthetic slow import" in result.stdout
+    assert "continued normally" in result.stdout
