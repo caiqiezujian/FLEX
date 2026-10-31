@@ -55,6 +55,7 @@ cd FLEX
 
 - [真实模型启动](#1-先用真实模型启动) / [无 GPU 演示](#2-无-gpu-的功能演示)
 - [Megatron 在线 GSPO：任务准备、训练与恢复](FLEX-GSPO/README.md)
+- [SFT：虚拟音频分块、LoRA 训练及完整权重导出](SFT-Scripts/README.md)
 - [强化学习方法、奖励公式与完整示例](FLEX-GSPO/docx/QALCO强化学习方案详解.md)
 - [先做单音频流式 S2TT，不启动网页](docs/S2TT.md)
 - [客户端/服务端协议](docs/PROTOCOL.md)
