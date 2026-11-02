@@ -1,6 +1,8 @@
 """CPU tests: protocol and vLLM request wiring, without loading model weights."""
 
+import ast
 from dataclasses import replace
+from pathlib import Path
 import re
 import sys
 import types
@@ -10,16 +12,20 @@ import pytest
 
 from flex_web.model import (
     AUDIO_PLACEHOLDER, BASE_SPECIALS, ContextLimit, ModelEngine, ModelOptions,
-    PROTOCOL_IDS, PROTOCOL_TAGS, ProtocolError, load_tokenizer_checked, parse_reply,
+    PROTOCOL_IDS, PROTOCOL_TAGS, SYSTEM_PROMPTS, ProtocolError, load_tokenizer_checked, parse_reply,
 )
 
 
 EXPECTED_EN_SYSTEM_PROMPT = (
-    '你是一个同声传译专家，负责将用户音频中的语音同声翻译为English。'
-    '用户将按时间顺序逐块发送音频。每收到一块音频后，立即输出响应：'
-    '若该块暂无可翻译内容，输出<|WAIT|>；若仅能确认部分译文、语义尚不完整，输出<|FLEX|>并紧跟'
-    '确信的译文（只输出有把握的部分，宁少勿错）；若译文语义已完整，输出<|DIRECT|>并紧跟新识别'
-    '的译文。所有译文均为增量输出：只输出新增内容，不重复、不修改此前已输出的任何译文。'
+    '将用户按顺序发送的音频同声翻译为English。'
+    '结合已听音频和历史译文，每轮只输出以下一种：'
+    '暂无可靠新增译文时，仅输出<|WAIT|>；'
+    '可直接自然续接时，输出<|DIRECT|>加新增译文；'
+    '需暂缓部分内容或调整表达结构时，输出<|FLEX|>加可靠的新增译文。'
+    '译文只追加，不重复、不回改、不猜测后文；条件允许时补齐此前暂缓且尚未译出的内容。'
+    'DIRECT与FLEX按策略区分，不按句子是否完整区分。'
+    '按语义使用标点，不随音频块机械加句号，不用省略号占位。'
+    '除WAIT外，译文不能为空；不输出解释。'
 )
 
 
@@ -179,6 +185,21 @@ def test_tokenizer_mismatch_not_patched(fake_transformers, tokenizer, declared):
     with pytest.raises(RuntimeError):
         load_tokenizer_checked('local', declared)
     assert tokenizer.specials == original
+
+
+@pytest.mark.parametrize('target,trained_language', [('en', 'English'), ('zh', '中文')])
+def test_inference_prompt_matches_sft_preparation(target, trained_language):
+    source = Path(__file__).resolve().parents[1] / 'SFT-Scripts' / 'prepare_duplex_data.py'
+    tree = ast.parse(source.read_text(encoding='utf-8'))
+    templates = [
+        ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(name, ast.Name) and name.id == 'PROTOCOL_SYSTEM_PROMPT_TEMPLATE'
+                for name in node.targets)
+    ]
+    assert len(templates) == 1, 'Review the SFT prompt source and inference alignment'
+    assert SYSTEM_PROMPTS[target] == templates[0].format(target_lang=trained_language)
 
 
 def test_one_engine_two_directions_and_shutdown(fake_vllm, monkeypatch):

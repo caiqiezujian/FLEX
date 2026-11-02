@@ -38,20 +38,23 @@ BASE_SPECIALS = ('<|im_start|>', '<|im_end|>', '<|endoftext|>',
 
 SUPPORTED_DIRECTIONS = ('en-zh', 'zh-en')
 
-# These strings match the accepted bilingual SFT prompts exactly. In particular,
-# the English-target checkpoint was trained with "English", not the UI label
-# "英语" or "英文". Keep display labels independent from model instructions.
-_STREAMING_RESPONSE_RULES = (
-    '用户将按时间顺序逐块发送音频。每收到一块音频后，立即输出响应：'
-    '若该块暂无可翻译内容，输出<|WAIT|>；若仅能确认部分译文、语义尚不完整，输出<|FLEX|>并紧跟'
-    '确信的译文（只输出有把握的部分，宁少勿错）；若译文语义已完整，输出<|DIRECT|>并紧跟新识别'
-    '的译文。所有译文均为增量输出：只输出新增内容，不重复、不修改此前已输出的任何译文。'
+# Match the current SFT preparation template; a regression test checks exact
+# equality without importing the training stack into Web or the portable CLI.
+# Keep the trained language values ("中文" / "English") separate from UI labels.
+PROTOCOL_SYSTEM_PROMPT_TEMPLATE = (
+    '将用户按顺序发送的音频同声翻译为{target_lang}。'
+    '结合已听音频和历史译文，每轮只输出以下一种：'
+    '暂无可靠新增译文时，仅输出<|WAIT|>；'
+    '可直接自然续接时，输出<|DIRECT|>加新增译文；'
+    '需暂缓部分内容或调整表达结构时，输出<|FLEX|>加可靠的新增译文。'
+    '译文只追加，不重复、不回改、不猜测后文；条件允许时补齐此前暂缓且尚未译出的内容。'
+    'DIRECT与FLEX按策略区分，不按句子是否完整区分。'
+    '按语义使用标点，不随音频块机械加句号，不用省略号占位。'
+    '除WAIT外，译文不能为空；不输出解释。'
 )
 SYSTEM_PROMPTS = MappingProxyType({
-    'zh': ('你是一个同声传译专家，负责将用户音频中的语音同声翻译为中文。'
-           + _STREAMING_RESPONSE_RULES),
-    'en': ('你是一个同声传译专家，负责将用户音频中的语音同声翻译为English。'
-           + _STREAMING_RESPONSE_RULES),
+    'zh': PROTOCOL_SYSTEM_PROMPT_TEMPLATE.format(target_lang='中文'),
+    'en': PROTOCOL_SYSTEM_PROMPT_TEMPLATE.format(target_lang='English'),
 })
 
 

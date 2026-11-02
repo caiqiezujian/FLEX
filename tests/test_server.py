@@ -182,7 +182,8 @@ def test_web_direction_switch_selects_real_session_prompt(tmp_path, monkeypatch)
                 assert ready['config']['target_lang'] == target
                 session = sessions[-1]
                 assert session.system_prompt.startswith(
-                    f'你是一个同声传译专家，负责将用户音频中的语音同声翻译为{prompt_language}。')
+                    f'将用户按顺序发送的音频同声翻译为{prompt_language}。')
+                assert 'DIRECT与FLEX按策略区分，不按句子是否完整区分。' in session.system_prompt
                 assert session.total_committed_turns == 0
                 assert session.audios == []
                 send_audio(ws, np.zeros(RATE, dtype=np.int16))
