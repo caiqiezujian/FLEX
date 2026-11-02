@@ -12,6 +12,12 @@ GSPO 当前共享提示词与 `SFT-Scripts/prepare_duplex_data.py` 的最新短�
 
 `01_prepare.sh --input-format segments` 直接读取 `audio + srcs + chooses`：英文片段按顺序以空格连接，中文片段按顺序直接连接，音频引用原路径，不要求改回 `en/zh/lang/key`。新格式无需 `--audio-dir`；旧格式仍可通过 `--input-format legacy --audio-dir /实际音频目录` 使用。`rejects`、`voice_end` 不作为这版在线 GSPO 的监督字段。准备阶段仅生成时间分块计划，训练阶段由当前模型在线采样 G8，无需预先制造离线轨迹。
 
+## 旧格式数据独立入口
+
+`01_prepare_legacy.sh` / `prepare_legacy_data.py` 继承 GitHub `main` 的旧 `lang/key/en.txt/zh.txt + key.wav` 入口，明确选择旧字段规则，并共用当前处理核心与**最新 SFT 短提示词**。原始 JSONL、音频目录和输出目录通过参数显式提供；进度、去重、错误过滤和虚拟分块均保留。现有新格式入口继续使用。完整命令、历史来源和输出说明见 [旧格式数据准备与最新提示词](docx/旧格式数据准备与最新提示词.md)。
+
+环境准备、数据处理、训练和监控的完整 1～9 步已按原始数据分开：[旧格式完整指南](docx/GSPO_v4_旧格式数据_完整运行指南.md)、[新格式完整指南](docx/GSPO_v4_新格式数据_完整运行指南.md)。两份统一使用 /data/yb/Code/FLEX 与 /data/yb/vens，包含联网/离线安装、datasets Json/List 检查和两个 TensorBoard 终端；已在训练的环境直接复用。
+
 ## 最新实验入口：QALCO v4
 
 2026-10-28 新增独立入口 **06_train_qalco_v4.sh + configs/qalco_v4.json**。在完整同音频 G8 内分别缩放质量与门控后的时延，给标准差设置下限；训练框架只再减去组均值，不做第二次标准差归一化。空译、格式错误、严重循环进入明确失败分支，失败分数相对于本组可评分候选设置，减少固定 −4 对组均值的拉低。具体公式、局限和验收见 [QALCO v4 训练说明](docx/QALCO_v4训练说明.md)。

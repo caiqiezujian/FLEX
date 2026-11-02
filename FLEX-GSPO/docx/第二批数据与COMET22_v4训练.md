@@ -1,5 +1,7 @@
 # 第二批数据与 COMET22 v4 训练
 
+当前服务器已使用 /data/yb/Code/FLEX 和 /data/yb/vens。完整的环境、准备、训练与 TensorBoard 1～9 步请使用 [新格式数据完整运行指南](GSPO_v4_新格式数据_完整运行指南.md)；本文后面的 data06 路径保留为历史示例，不作为当前复制执行命令。
+
 更新日期：2026-11-02。本次适配第二批原始数据，并将 GSPO system prompt 与 `SFT-Scripts/prepare_duplex_data.py` 的最新短模板对齐。训练继续使用现有 **COMET22 QALCO v4 / MS-SWIFT Megatron 在线 GSPO**。
 
 本次不改奖励公式、评分服务、四卡容量或采样参数：质量权重为 `1.0`，时延权重为 `0.25`，保留原连续质量门控、分项归一化、质量约束长度成本及重复/失败处理。无需新增运行依赖，也不需要部署新的质量模型。公式详见历史 [QALCO v4 训练说明](QALCO_v4训练说明.md)；该历史文档中的旧模型和旧 prepared 路径不能直接替代本文的新提示词流程。
