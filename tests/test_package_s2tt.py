@@ -18,7 +18,7 @@ from tools import package_s2tt
 
 ROOT = Path(__file__).resolve().parents[1]
 FILES = {
-    'infer_audio.py', 'flex_model.py', 'run_infer.sh',
+    'infer_audio.py', 'flex_model.py', 'flex_audio_tokens.py', 'run_infer.sh',
     'README.md', 'requirements-infer.txt',
 }
 SAMPLE_RATE = 16000
@@ -29,21 +29,24 @@ SAMPLE_COUNT = 54000  # 3.375 seconds: three full chunks and a short tail.
 def extracted_bundle(tmp_path):
     directory = tmp_path / 'built source'
     archive_path = tmp_path / 'bundle.zip'
-    assert package_s2tt.build(ROOT, directory, archive_path) == 5
+    assert package_s2tt.build(ROOT, directory, archive_path) == 6
     extracted = tmp_path / 'extracted copy'
     with zipfile.ZipFile(archive_path) as archive:
         archive.extractall(extracted)
     return extracted / 'FLEX-S2TT'
 
 
-def test_bundle_has_exactly_five_files_and_only_one_import_rewrite():
+def test_bundle_has_exactly_six_files_and_only_local_import_rewrites():
     files = package_s2tt.bundle_files(ROOT)
     assert set(files) == FILES
     original = (ROOT / 'infer_audio.py').read_text(encoding='utf-8')
     expected = original.replace('from flex_web.model import ', 'from flex_model import ', 1)
     assert files['infer_audio.py'].decode('utf-8') == expected
     assert files['flex_model.py'].decode('utf-8') == (
-        ROOT / 'flex_web/model.py').read_text(encoding='utf-8')
+        ROOT / 'flex_web/model.py').read_text(encoding='utf-8').replace(
+            'from .audio_tokens import ', 'from flex_audio_tokens import ', 1)
+    assert files['flex_audio_tokens.py'].decode('utf-8') == (
+        ROOT / 'flex_web/audio_tokens.py').read_text(encoding='utf-8')
     assert files['run_infer.sh'].decode('utf-8') == (
         ROOT / 'run_infer.sh').read_text(encoding='utf-8')
     assert files['README.md'].decode('utf-8') == (
@@ -135,6 +138,20 @@ def test_unexpected_model_import_refuses_packaging_before_writes(tmp_path, count
     assert not (tmp_path / 'result.zip').exists()
 
 
+@pytest.mark.parametrize('count', [0, 2])
+def test_unexpected_helper_import_refuses_packaging_before_writes(tmp_path, count):
+    source = tmp_path / 'bad source'
+    (source / 'flex_web').mkdir(parents=True)
+    (source / 'infer_audio.py').write_text(
+        'from flex_web.model import ModelEngine\n', encoding='utf-8')
+    (source / 'flex_web/model.py').write_text(
+        'from .audio_tokens import AudioTokenCounter\n' * count, encoding='utf-8')
+    with pytest.raises(RuntimeError, match='exactly one audio-token helper import'):
+        package_s2tt.build(source, tmp_path / 'result', tmp_path / 'result.zip')
+    assert not (tmp_path / 'result').exists()
+    assert not (tmp_path / 'result.zip').exists()
+
+
 def _write_test_wav(path):
     samples = ((np.arange(SAMPLE_COUNT, dtype=np.int64) * 37) % 30001 - 15000).astype('<i2')
     with wave.open(str(path), 'wb') as handle:
@@ -157,7 +174,9 @@ import numpy as np
 bundle = Path(sys.argv.pop(1)).resolve()
 sys.path.insert(0, str(bundle))
 import flex_model
+import flex_audio_tokens
 assert Path(flex_model.__file__).resolve().parent == bundle
+assert Path(flex_audio_tokens.__file__).resolve().parent == bundle
 assert 'flex_web' not in sys.modules
 expected = ((np.arange(54000, dtype=np.int64) * 37) % 30001 - 15000).astype(np.int16)
 expected = expected.astype(np.float32) / 32768.0

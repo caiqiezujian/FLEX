@@ -317,6 +317,37 @@ def test_eof_tail_has_exact_source_coverage_and_safe_padding(app_factory, tmp_pa
     assert len([event for event in saved if event['type'] == 'turn']) == 2
 
 
+def test_model_timings_reach_websocket_export_and_journal(app_factory, monkeypatch, tmp_path):
+    timings = dict(audio_count_s=0.001, request_prepare_s=0.002,
+                   engine_generate_s=0.03, response_decode_s=0.001,
+                   audio_count_cache_hit=True, audio_count_mode='length_cache')
+    original_generate = DeterministicSession.generate
+
+    def generate(self, audio):
+        result = original_generate(self, audio)
+        result.timings = dict(timings)
+        return result
+
+    monkeypatch.setattr(DeterministicSession, 'generate', generate)
+    app, engine = app_factory(engine_options=dict(replies=['<|DIRECT|>hello']))
+    with TestClient(app) as client:
+        with client.websocket_connect('/ws') as ws:
+            ready = connect_ready(ws)
+            send_audio(ws, np.zeros(RATE, dtype=np.int16))
+            ws.send_json({'type': 'finish'})
+            events = receive_until(ws, 'done')
+        turn = next(event for event in events if event['type'] == 'turn')
+        assert turn['timings'] == timings
+        assert turn['output_tokens'] == 1
+        assert turn['delta'] == 'hello' and len(engine.sessions[0].committed) == 1
+        exported = client.get('/api/sessions/' + ready['session_id'] + '/export').json()
+        assert exported['turns'][0]['timings'] == timings
+        assert exported['translation'] == 'hello'
+    saved = [json.loads(line) for line in (tmp_path / 'logs' / f"{ready['session_id']}.jsonl")
+             .read_text(encoding='utf-8').splitlines()]
+    assert next(event for event in saved if event['type'] == 'turn')['timings'] == timings
+
+
 def test_wait_flex_and_direct_preserve_append_only_deltas(app_factory):
     app, engine = app_factory()
     with TestClient(app) as client, client.websocket_connect('/ws') as ws:

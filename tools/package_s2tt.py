@@ -1,7 +1,7 @@
 """Build an independent, file-only FLEX-S2TT folder and ZIP from tested sources.
 
-No Web files, checkpoints, recordings or outputs are included. The only code
-rewrite changes the CLI's shared-model import to the bundled flex_model module.
+No Web files, checkpoints, recordings or outputs are included. Import rewrites
+connect the CLI, shared model, and audio-token helper within the portable folder.
 """
 import argparse
 from pathlib import Path
@@ -13,9 +13,14 @@ def bundle_files(root):
     original = 'from flex_web.model import '
     if entry.count(original) != 1:
         raise RuntimeError('Expected exactly one shared model import; review the packager')
+    model = (root / 'flex_web/model.py').read_text(encoding='utf-8')
+    helper_import = 'from .audio_tokens import '
+    if model.count(helper_import) != 1:
+        raise RuntimeError('Expected exactly one audio-token helper import; review the packager')
     files = {
         'infer_audio.py': entry.replace(original, 'from flex_model import ', 1),
-        'flex_model.py': (root / 'flex_web/model.py').read_text(encoding='utf-8'),
+        'flex_model.py': model.replace(helper_import, 'from flex_audio_tokens import ', 1),
+        'flex_audio_tokens.py': (root / 'flex_web/audio_tokens.py').read_text(encoding='utf-8'),
         'run_infer.sh': (root / 'run_infer.sh').read_text(encoding='utf-8'),
         'README.md': (root / 'docs/S2TT-QUICKSTART.md').read_text(encoding='utf-8'),
         'requirements-infer.txt': (root / 'requirements-infer.txt').read_text(encoding='utf-8'),

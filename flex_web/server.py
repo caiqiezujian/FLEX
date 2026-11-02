@@ -847,7 +847,9 @@ def create_app(settings=None):
                                model_audio_seconds=len(model_audio) / RATE,
                                service_s=scheduled.service_s, queue_wait_s=max(0, submitted - arrived),
                                scheduler_wait_s=scheduled.queue_wait_s, batch_size=scheduled.batch_size,
-                               prompt_tokens=result.prompt_tokens, **stats())
+                               prompt_tokens=result.prompt_tokens,
+                               output_tokens=len(getattr(result, 'token_ids', ())),
+                               timings=dict(getattr(result, 'timings', {})), **stats())
                     turn += 1
             except Exception as exc:
                 # The receiver's cancellation/disconnect reason is authoritative
@@ -1028,6 +1030,10 @@ def main():
     parser.add_argument('--dtype', choices=['bfloat16', 'float16', 'auto'], default='bfloat16')
     parser.add_argument('--protocol-form', choices=['auto', 'special', 'text'], default='auto')
     parser.add_argument('--mm-processor-cache-gb', type=float, default=2.0)
+    parser.add_argument('--audio-token-cache-size', type=int, default=64,
+                        help='Bounded exact audio-token count memo; 0 disables it (default 64)')
+    parser.add_argument('--cuda-graphs', action='store_true',
+                        help='Opt in to vLLM compilation/CUDA graphs; default keeps eager execution')
     parser.add_argument('--no-prefix-caching', action='store_true')
     parser.add_argument('--image-slots', type=int, choices=[0, 1], default=1,
                         help='Qwen3-Omni initialization compatibility: 1 retains vision initialization; input remains audio-only')
@@ -1060,11 +1066,15 @@ def main():
     token = os.environ.get(args.token_env, '')
     if not 0 < args.gpu_memory_utilization < 1 or min(args.max_model_len, args.max_audio_turns, args.max_tokens) <= 0:
         parser.error('Invalid GPU/context configuration')
+    if not 0 <= args.audio_token_cache_size <= 1024:
+        parser.error('--audio-token-cache-size must be between 0 and 1024')
     options = ModelOptions(model=args.model, dtype=args.dtype, max_model_len=args.max_model_len,
                            max_audio_turns=args.max_audio_turns, max_tokens=args.max_tokens,
                            gpu_memory_utilization=args.gpu_memory_utilization,
                            protocol_form=args.protocol_form, max_chunk_seconds=args.max_chunk_seconds,
                            mm_processor_cache_gb=args.mm_processor_cache_gb,
+                           audio_token_cache_size=args.audio_token_cache_size,
+                           enforce_eager=not args.cuda_graphs,
                            context_policy=args.context_policy, history_window_seconds=args.history_window_seconds,
                            history_retain_seconds=args.history_retain_seconds,
                            prefix_caching=not args.no_prefix_caching, image_slots=args.image_slots)

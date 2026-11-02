@@ -270,6 +270,22 @@ def test_fast_mode_never_sleeps_and_has_no_realtime_lag(tmp_path):
                if event['type'] == 'turn')
 
 
+def test_generation_timings_are_exported_without_changing_translation(tmp_path):
+    timings = dict(audio_count_s=0.001, request_prepare_s=0.002,
+                   engine_generate_s=0.04, response_decode_s=0.003,
+                   audio_count_cache_hit=True, audio_count_mode='length_cache')
+    result = Generation('<|DIRECT|>hello', [1], 42, 'stop', timings=timings)
+    case = run_fixture(tmp_path, [result], seconds=1, pace='fast', service=0.05)
+    case.run()
+    turn = next(event for event in case.output.events if event['type'] == 'turn')
+    assert turn['timings'] == timings
+    assert turn['timings'] is not timings
+    assert turn['output_tokens'] == 1
+    assert turn['service_s'] == pytest.approx(0.05)
+    assert case.output.text == case.stdout.getvalue() == 'hello'
+    assert case.session.committed[0][1] is result
+
+
 def test_wait_commits_history_but_text_only_appends_exact_deltas(tmp_path):
     replies = ['<|FLEX|>He is the first', '<|WAIT|>', '<|DIRECT|> to admit it.\n']
     case = run_fixture(tmp_path, replies, pace='fast')
@@ -386,6 +402,7 @@ def audio_arg(tmp_path):
     ['--max-audio-seconds', 'inf'], ['--max-model-len', '160'], ['--max-audio-turns', '0'],
     ['--max-tokens', '0'], ['--gpu-memory-utilization', '1'],
     ['--gpu-memory-utilization', 'nan'], ['--mm-processor-cache-gb', '-1'],
+    ['--audio-token-cache-size', '-1'], ['--audio-token-cache-size', '1025'],
     ['--direction', 'en-ja'], ['--protocol-form', 'invented'],
     ['--image-slots', '-1'], ['--image-slots', '2'],
 ])
@@ -413,6 +430,8 @@ def test_parse_args_safe_defaults_and_explicit_real_local_checkpoint(audio_arg, 
     assert first.chunk_seconds == 1.0
     assert first.pace == 'realtime'
     assert first.image_slots == cli.model_options(first).image_slots == 1
+    assert not first.cuda_graphs and cli.model_options(first).enforce_eager
+    assert cli.model_options(first).audio_token_cache_size == 64
     assert first.output_dir != second.output_dir
     assert not first.output_dir.exists()
     checkpoint = tmp_path / 'checkpoint'
@@ -423,6 +442,15 @@ def test_parse_args_safe_defaults_and_explicit_real_local_checkpoint(audio_arg, 
     assert options.model == str(checkpoint)
     assert options.protocol_form == 'text'
     assert not options.prefix_caching
+
+
+def test_optional_cuda_graphs_and_count_cache_controls(audio_arg):
+    options = cli.model_options(cli.parse_args(audio_arg + [
+        '--cuda-graphs', '--audio-token-cache-size', '0']))
+    assert not options.enforce_eager
+    assert options.audio_token_cache_size == 0
+    assert options.history_window_seconds == 120
+    assert options.history_retain_seconds == 60
 
 
 def test_image_workaround_can_be_disabled_for_fixed_vllm(audio_arg):

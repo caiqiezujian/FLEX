@@ -26,7 +26,7 @@ python infer_audio.py --help
 CUDA_VISIBLE_DEVICES=6 bash run_infer.sh /absolute/path/to/checkpoint-merged /absolute/path/to/english.wav --direction en-zh
 ```
 
-启动脚本默认 1 秒分块、fast、special；尾随参数可以覆盖默认值。它不切换当前目录，所以相对路径保持原含义。无需运行 Web 服务。独立五文件包见 [快速使用说明](S2TT-QUICKSTART.md)，可用 `python tools/package_s2tt.py` 构建；包内将共享模型模块命名为 `flex_model.py`，不依赖原仓库。
+启动脚本默认 1 秒分块、fast、special；尾随参数可以覆盖默认值。它不切换当前目录，所以相对路径保持原含义。无需运行 Web 服务。独立六文件包见 [快速使用说明](S2TT-QUICKSTART.md)，可用 `python tools/package_s2tt.py` 构建；包内将共享模型模块命名为 `flex_model.py`，并包含 `flex_audio_tokens.py`，不依赖原仓库。
 
 在仓库根目录执行：
 
@@ -106,7 +106,11 @@ outputs/en-zh-first/
 | `--context-policy` | `rolling` | 自动滚动；`stop` 保留旧触顶停止行为 |
 | `--history-window-seconds` / `--history-retain-seconds` | 120 / 60 | 窗口音频上限 / 滚动后的保留目标（秒） |
 | `--max-tokens` | 160 | 每轮生成上限；截断不能当作成功 |
+| `--audio-token-cache-size` | 64 | 有界准确计数缓存；0 关闭；处理链不匹配时自动使用原准确计数 |
+| `--cuda-graphs` | 未启用 | 允许编译/CUDA Graph；默认 eager，需目标机器实测 |
 | `--gpu-memory-utilization` | 0.90 | vLLM 显存配置 |
+
+每轮 `events.jsonl` 增加 `output_tokens` 和 `timings`，记录音频计数、输入准备、引擎调用和结果解码墙钟时间，以及计数路径/缓存命中。`request_prepare_s` 包含 `audio_count_s`，不要重复相加；引擎调用不等于纯 GPU 时间或 TTFT。模型响应 token 数包含 WAIT/FLEX/DIRECT 标签，不含已移除的结束 token。音频稳定 ID 和有界计数缓存共用 Web 模型层；仅在核对的 vLLM 0.11.1 / Transformers 4.57.1 原生处理链启用按采样长度复用计数。完整字段与适用边界见 [推理开销与可选加速](../README.md#推理开销与可选加速)。
 
 默认按完整音频+原始响应轮次滚动，system 保留；token/轮数可在音频达到 120 秒前先触发，必要时保留少于 60 秒。只在新响应验证并成功提交后应用裁剪，不按 WAIT/FLEX/DIRECT 标签决定清空。`turn.context` 与 `context_window` 记录累计统计，全局源时间轴和轮次不重置。纯译文始终增量写入磁盘，不保留无限增长的内存副本。
 

@@ -11,6 +11,33 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from flex_web import server
 
 
+@pytest.mark.parametrize('extra,eager,count_cache', [
+    ([], True, 64),
+    (['--cuda-graphs', '--audio-token-cache-size', '0'], False, 0),
+    (['--audio-token-cache-size', '8'], True, 8),
+])
+def test_performance_options_reach_model_without_loading_it(monkeypatch, extra, eager, count_cache):
+    monkeypatch.setattr(sys, 'argv', ['run.py', '--backend', 'mock', '--no-log', *extra])
+    captured = {}
+    monkeypatch.setattr(server, 'create_app', lambda settings: captured.setdefault('settings', settings))
+    monkeypatch.setattr(uvicorn, 'run', lambda *args, **kwargs: None)
+    server.main()
+    options = captured['settings'].model_options
+    assert options.enforce_eager is eager
+    assert options.audio_token_cache_size == count_cache
+    assert options.history_window_seconds == 120
+    assert options.history_retain_seconds == 60
+
+
+@pytest.mark.parametrize('value', ['-1', '1025'])
+def test_invalid_audio_token_cache_fails_before_model_creation(monkeypatch, value):
+    monkeypatch.setattr(sys, 'argv', ['run.py', '--backend', 'mock', '--audio-token-cache-size', value])
+    monkeypatch.setattr(server, 'create_app', lambda *_: pytest.fail('Must validate first'))
+    with pytest.raises(SystemExit) as error:
+        server.main()
+    assert error.value.code == 2
+
+
 def test_long_session_cli_settings_reach_model_and_result_store(monkeypatch, tmp_path):
     monkeypatch.delenv('FLEX_ACCESS_TOKEN', raising=False)
     monkeypatch.setattr(sys, 'argv', [

@@ -251,7 +251,9 @@ def run_stream(args, engine, reader, output, state, *, clock=time.monotonic,
                          service_s=completed - dispatch, generation_finished_elapsed_s=completed - start,
                          dispatch_lag_s=max(0.0, dispatch - start - source_end)
                          if args.pace == 'realtime' else None,
-                         prompt_tokens=result.prompt_tokens, context=context)
+                         prompt_tokens=result.prompt_tokens, context=context,
+                         output_tokens=len(result.token_ids),
+                         timings=dict(getattr(result, 'timings', {})))
             output.event('turn', **event)
             output.append(delta)
             if delta:
@@ -294,6 +296,10 @@ def parse_args(argv=None):
     p.add_argument('--max-audio-turns', type=int, default=256)
     p.add_argument('--max-tokens', type=int, default=160)
     p.add_argument('--mm-processor-cache-gb', type=float, default=2.0)
+    p.add_argument('--audio-token-cache-size', type=int, default=64,
+                   help='Bounded exact audio-token count memo; 0 disables it (default 64)')
+    p.add_argument('--cuda-graphs', action='store_true',
+                   help='Opt in to vLLM compilation/CUDA graphs; default keeps eager execution')
     p.add_argument('--image-slots', type=int, choices=(0, 1), default=1,
                    help='1: keep vision initialization enabled to avoid affected Qwen3-Omni '
                         'meta/CUDA failures; input is still audio-only. 0: disable on fixed builds')
@@ -327,6 +333,8 @@ def model_options(args):
                         max_tokens=args.max_tokens, protocol_form=args.protocol_form,
                         max_chunk_seconds=args.chunk_seconds,
                         mm_processor_cache_gb=args.mm_processor_cache_gb,
+                        audio_token_cache_size=args.audio_token_cache_size,
+                        enforce_eager=not args.cuda_graphs,
                         context_policy=args.context_policy, history_window_seconds=args.history_window_seconds,
                         history_retain_seconds=args.history_retain_seconds,
                         prefix_caching=not args.no_prefix_caching, image_slots=args.image_slots)
@@ -345,6 +353,8 @@ def main(argv=None):
                              model_name=Path(args.model).name if args.model else None,
                              protocol_form=args.protocol_form, max_model_len=args.max_model_len,
                              image_slots=args.image_slots,
+                             enforce_eager=not args.cuda_graphs,
+                             audio_token_cache_size=args.audio_token_cache_size,
                              max_audio_turns=args.max_audio_turns, max_tokens=args.max_tokens,
                              chunk_seconds=args.chunk_seconds, pace=args.pace,
                              context_policy=args.context_policy, history_window_seconds=args.history_window_seconds,

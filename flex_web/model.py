@@ -12,16 +12,19 @@ native vLLM 0.11.1 API. GPU dependencies are imported only in the real backend.
 The mock backend tests transport and UI; it NEVER claims to translate speech.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 import math
 import os
 from pathlib import Path
 import re
 import time
+import uuid
 from types import MappingProxyType
 
 import numpy as np
+
+from .audio_tokens import AudioTokenCounter
 
 
 LOG = logging.getLogger(__name__)
@@ -100,6 +103,7 @@ class ModelOptions:
     protocol_form: str = 'auto'
     max_chunk_seconds: float = 3.0
     mm_processor_cache_gb: float = 2.0
+    audio_token_cache_size: int = 64
     enforce_eager: bool = True
     prefix_caching: bool = True
     seed: int = 42
@@ -118,6 +122,11 @@ class ModelOptions:
             raise ValueError('context_policy must be rolling or stop')
         if type(self.image_slots) is not int or self.image_slots not in (0, 1):
             raise ValueError('image_slots must be 0 or 1')
+        if (type(self.audio_token_cache_size) is not int
+                or not 0 <= self.audio_token_cache_size <= 1024):
+            raise ValueError('audio_token_cache_size must be an integer between 0 and 1024')
+        if type(self.enforce_eager) is not bool:
+            raise ValueError('enforce_eager must be a boolean')
         for name in ('gpu_memory_utilization', 'max_chunk_seconds', 'mm_processor_cache_gb',
                      'history_window_seconds', 'history_retain_seconds'):
             if not math.isfinite(getattr(self, name)):
@@ -145,6 +154,7 @@ class Generation:
     prompt_tokens: int
     finish_reason: str
     audio_extra_tokens: int = 0
+    timings: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -154,6 +164,7 @@ class CommittedTurn:
     audio: np.ndarray
     token_ids: tuple
     audio_extra_tokens: int
+    audio_id: str
 
 
 @dataclass(frozen=True)
@@ -165,6 +176,7 @@ class _WindowPlan:
     audios: list
     audio_extra_tokens: int
     reasons: tuple = ()
+    audio_ids: tuple = ()
 
 
 def load_tokenizer_checked(model, form):
@@ -230,6 +242,9 @@ class ModelEngine:
             'history_window_seconds': self.options.history_window_seconds,
             'history_retain_seconds': self.options.history_retain_seconds,
             'max_batch_size': self.options.max_batch_size,
+            'enforce_eager': self.options.enforce_eager,
+            'audio_token_cache_size': self.options.audio_token_cache_size,
+            'stable_audio_ids': backend == 'vllm',
             'mock': backend == 'mock',
         }
         if backend == 'mock':
@@ -277,6 +292,16 @@ class ModelEngine:
         # sender cache. This independent, uncached counter touches only new audio.
         self.counter = InputPreprocessor(self.llm.llm_engine.model_config, self.tok,
                                          mm_processor_cache=None)
+        self._audio_token_counter = AudioTokenCounter.for_preprocessor(
+            self.counter, vllm_version=vllm.__version__,
+            max_entries=opts.audio_token_cache_size)
+        self._audio_count_cache_hit = False
+        self._audio_count_mode = self._audio_token_counter.mode
+        self.metadata['audio_count_mode'] = self._audio_token_counter.mode
+        self.metadata['audio_count_reason'] = self._audio_token_counter.reason
+        LOG.info('Audio token counter mode=%s entries=%s reason=%s',
+                 self._audio_token_counter.mode, opts.audio_token_cache_size,
+                 self._audio_token_counter.reason)
         self.sampling = SamplingParams(
             temperature=0.0, top_p=1.0, top_k=-1, repetition_penalty=1.0,
             max_tokens=opts.max_tokens, seed=opts.seed,
@@ -338,8 +363,10 @@ class ModelEngine:
                     results[index] = exc
             return results
         try:
+            generate_started = time.perf_counter()
             outputs = self.llm.generate([value[3] for _, _, value in prepared],
                                         self.sampling, use_tqdm=False)
+            engine_generate_s = time.perf_counter() - generate_started
             if len(outputs) != len(prepared):
                 raise RuntimeError('backend batch output count does not match request count')
         except Exception as exc:
@@ -350,7 +377,8 @@ class ModelEngine:
             return results
         for (index, session, value), output in zip(prepared, outputs):
             try:
-                results[index] = session._finish_generation(value, output)
+                results[index] = session._finish_generation(value, output,
+                                                             engine_generate_s=engine_generate_s)
             except Exception as exc:
                 results[index] = exc
         return results
@@ -364,6 +392,8 @@ class ModelEngine:
         if self._closed:
             return
         self._closed = True
+        if hasattr(self, '_audio_token_counter'):
+            self._audio_token_counter.clear()
         if self.backend == 'vllm' and hasattr(self, 'llm'):
             core = getattr(self.llm.llm_engine, 'engine_core', None)
             shutdown = getattr(core, 'shutdown', None)
@@ -384,6 +414,16 @@ class ModelEngine:
             session.close()
 
     def audio_expansion(self, audio):
+        self._audio_count_cache_hit = False
+        extra, hit = self._audio_token_counter.count(audio, self._exact_audio_expansion)
+        self._audio_count_cache_hit = hit
+        self._audio_count_mode = self._audio_token_counter.mode
+        self.metadata['audio_count_mode'] = self._audio_token_counter.mode
+        self.metadata['audio_count_reason'] = self._audio_token_counter.reason
+        return extra
+
+    def _exact_audio_expansion(self, audio):
+        """Count only new input through an independent processor, never the live cache."""
         probe = self.TokensPrompt(prompt_token_ids=self.audio_turn,
                                  multi_modal_data={'audio': [audio]})
         expanded = self.counter.preprocess(probe)['prompt_token_ids']
@@ -500,7 +540,8 @@ class ModelSession:
             reasons.append('audio_window')
         if not reasons:
             return _WindowPlan(0, self.history, self.audios,
-                               self.committed_audio_extra_tokens)
+                               self.committed_audio_extra_tokens,
+                               audio_ids=tuple(turn.audio_id for turn in self._turns))
         if opts.context_policy == 'stop':
             raise ContextLimit(
                 'context stop policy reached ' + ', '.join(reasons)
@@ -529,7 +570,8 @@ class ModelSession:
         for turn in kept:
             history.extend(self._turn_tokens(turn))
         return _WindowPlan(remove_count, history, [turn.audio for turn in kept],
-                           sum(turn.audio_extra_tokens for turn in kept), tuple(reasons))
+                           sum(turn.audio_extra_tokens for turn in kept), tuple(reasons),
+                           tuple(turn.audio_id for turn in kept))
 
     def _check_audio(self, audio):
         audio = np.asarray(audio, dtype=np.float32)
@@ -550,17 +592,30 @@ class ModelSession:
 
     def _prepare_generation(self, audio):
         """Build a private prospective request; do not mutate session state."""
+        prepare_started = time.perf_counter()
         if self._closed or self.engine._closed:
             raise RuntimeError('model session is closed')
         if self._pending is not None:
             raise RuntimeError('previous generation must be committed or session closed')
         opts, engine = self.engine.options, self.engine
         audio = self._check_audio(audio)
+        # Bind identity AFTER snapshotting the actual model input (including
+        # caller-side tail padding). Fresh attempts get fresh identities even
+        # after failure; committed snapshots keep theirs across window moves.
+        audio_id = uuid.uuid4().hex
+        count_started = time.perf_counter()
         extra = (max(0, math.ceil(len(audio) / SAMPLE_RATE * 13) - 1)
                  if engine.backend == 'mock' else engine.audio_expansion(audio))
+        timings = {
+            'audio_count_s': time.perf_counter() - count_started,
+            'audio_count_cache_hit': (False if engine.backend == 'mock' else
+                                      getattr(engine, '_audio_count_cache_hit', False)),
+            'audio_count_mode': ('mock' if engine.backend == 'mock' else
+                                 getattr(engine, '_audio_count_mode', 'exact')),
+        }
         plan = self._prepare_window(audio, extra)
         if engine.backend == 'mock':
-            return audio, extra, plan, None, None
+            request, expected_tokens = None, None
         else:
             ids = plan.history + engine.audio_turn + engine.asst_head
             expected_tokens = len(ids) + plan.audio_extra_tokens + extra
@@ -568,19 +623,25 @@ class ModelSession:
                 raise ContextLimit(f'expanded prompt={expected_tokens} + max_tokens={opts.max_tokens} '
                                    f'> max_model_len={opts.max_model_len}; session stopped')
             request = engine.TokensPrompt(
-                prompt_token_ids=ids, multi_modal_data={'audio': plan.audios + [audio]})
-            return audio, extra, plan, request, expected_tokens
+                prompt_token_ids=ids,
+                multi_modal_data={'audio': plan.audios + [audio]},
+                multi_modal_uuids={'audio': [*plan.audio_ids, audio_id]})
+        timings['request_prepare_s'] = time.perf_counter() - prepare_started
+        return audio, extra, plan, request, expected_tokens, audio_id, timings
 
-    def _finish_generation(self, prepared, output=None):
+    def _finish_generation(self, prepared, output=None, *, engine_generate_s=0.0):
         """Decode one output into this session's pending slot, never commit it."""
+        decode_started = time.perf_counter()
         if self._closed or self.engine._closed:
             raise RuntimeError('model session is closed')
         if self._pending is not None:
             raise RuntimeError('previous generation must be committed or session closed')
-        audio, extra, plan, _, expected_tokens = prepared
+        audio, extra, plan, _, expected_tokens, audio_id, timings = prepared
         engine = self.engine
         if engine.backend == 'mock':
             result = self._mock_generate(audio, plan, extra)
+            engine_generate_s = time.perf_counter() - decode_started
+            decode_started = time.perf_counter()
         else:
             completion = output.outputs[0]
             token_ids = list(completion.token_ids)
@@ -591,10 +652,15 @@ class ModelSession:
             actual_ids = getattr(output, 'prompt_token_ids', None)
             prompt_tokens = len(actual_ids) if actual_ids is not None else expected_tokens
             if prompt_tokens != expected_tokens:
+                engine._audio_token_counter.disable('actual prompt expansion mismatch')
+                engine.metadata['audio_count_mode'] = engine._audio_token_counter.mode
+                engine.metadata['audio_count_reason'] = engine._audio_token_counter.reason
                 raise RuntimeError(f'context expansion mismatch: counted={expected_tokens}, '
                                    f'engine={prompt_tokens}; reply NOT committed')
             result = Generation(reply, token_ids, prompt_tokens, completion.finish_reason, extra)
-        self._pending = (result, audio, plan)
+        result.timings = {**timings, 'engine_generate_s': engine_generate_s,
+                          'response_decode_s': time.perf_counter() - decode_started}
+        self._pending = (result, audio, plan, audio_id)
         return result
 
     def _mock_generate(self, audio, plan, extra):
@@ -656,7 +722,8 @@ class ModelSession:
                      self._rollovers, self.total_committed_turns + 1, plan.reasons,
                      plan.remove_count, dropped_samples / SAMPLE_RATE, len(self._turns))
         # Keep actual generated token IDs, not decode/strip/re-encoded text.
-        turn = CommittedTurn(snapshot, tuple(generation.token_ids), generation.audio_extra_tokens)
+        turn = CommittedTurn(snapshot, tuple(generation.token_ids), generation.audio_extra_tokens,
+                             self._pending[3])
         self.history.extend(self._turn_tokens(turn))
         self.audios.append(snapshot)
         self._turns.append(turn)

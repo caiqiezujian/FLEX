@@ -6,12 +6,13 @@
 
 使用已经能加载你的 Qwen3-Omni checkpoint 的 Linux / Python / CUDA / vLLM 环境。不自动安装或升级 GPU 依赖；目标是单张 A800 80 GB，真实显存和速度以服务器实测为准。模型必须是完整 merged checkpoint，且包含与训练一致、已经补齐的 tokenizer/processor。
 
-包内只有五个文件，必须放在同一目录：
+包内只有六个文件，必须放在同一目录：
 
 ```text
 FLEX-S2TT/
   infer_audio.py             读音频、逐块推理、保存结果
   flex_model.py              本地模型加载与 SFT 多轮协议
+  flex_audio_tokens.py       音频 token 计数与有界缓存
   run_infer.sh               一条命令启动
   requirements-infer.txt     仅 NumPy；不安装 Web 或 GPU 框架
   README.md
@@ -50,6 +51,10 @@ CUDA_VISIBLE_DEVICES=6 python -u infer_audio.py \
 
 全部参数：`python infer_audio.py --help`。`PYTHON=/path/to/python bash run_infer.sh ...` 可指定解释器。
 
+输入处理会为每块实际模型音频保存稳定 ID，后续引用历史块时复用该 ID。音频 token 计数缓存默认最多保存 64 个长度条目，仅在处理器兼容检查通过时启用；不符合条件时仍使用准确预处理计数。可追加 `--audio-token-cache-size 0` 关闭计数缓存做对照，不影响 vLLM 的其他缓存。缓存不改变音频、模型提示或输出协议。
+
+默认保持原来的 eager 执行。可追加 `--cuda-graphs` 允许 vLLM 使用受支持的编译／CUDA Graph 路径；实际模式由引擎选择，首次编译捕获可能更慢且增加显存开销。请用同一模型、音频和 chunk 大小做对照，启动或运行不兼容时移除该参数即可恢复默认设置。这里没有承诺 A800 上的加速幅度。
+
 ## 3. 输出
 
 默认在当前目录的 `outputs/` 下自动新建一个带时间戳和随机后缀的目录，每次运行独立保存：
@@ -63,6 +68,8 @@ outputs/s2tt_.../
 可以追加 `--output-dir /path/to/new-result` 指定输出位置；该目录必须尚不存在，避免覆盖已有结果。文件逐轮写入并 flush。终端也输出增量译文和运行日志，纯文本以 `translation.txt` 为准。
 
 `events.jsonl` 包含 start、model_ready、turn、done；协议失败另有 rejected_turn 和 error。遇到不带标签的响应，终端及日志会保留原始回复与 token ID，不再只看到笼统错误；无效回复不会混入译文。日志可能包含文件名、译文或错误中的私人路径，分享前请检查。
+
+每轮 `timings` 自动记录音频计数、请求准备、引擎调用和响应解码耗时，以及计数缓存是否命中。请求准备时间包含音频计数时间，不能把两者相加；引擎调用是 CPU 墙钟时间，包含引擎内部处理，并非纯 GPU 时间或首字延迟。mock 的数值仅用于验证字段与流程。
 
 ## 4. 流式逻辑
 

@@ -71,7 +71,7 @@ cd FLEX
 CUDA_VISIBLE_DEVICES=6 bash run_infer.sh /absolute/path/to/checkpoint-merged /absolute/path/to/audio.wav --direction en-zh
 ```
 
-默认 1 秒分块、fast 模式，逐块推理但不等待播放时钟；追加 `--pace realtime` 可模拟实时到达。先停止占用同一 GPU 的 Web 服务。也可以使用不含任何 Web 文件的五文件独立包，见 [快速说明](docs/S2TT-QUICKSTART.md)。
+默认 1 秒分块、fast 模式，逐块推理但不等待播放时钟；追加 `--pace realtime` 可模拟实时到达。先停止占用同一 GPU 的 Web 服务。也可以使用不含任何 Web 文件的六文件独立包，见 [快速说明](docs/S2TT-QUICKSTART.md)。
 
 如果暂时不需要平台，可以直接运行 `infer_audio.py`。它复用同一模型适配层，但**不启动 Web 服务，不需要浏览器，也不需要 FastAPI**。先把音频放到 GPU 服务器，再指定本地文件路径：
 
@@ -284,6 +284,8 @@ python run.py --backend mock --host 127.0.0.1 --port 8000
 | `--history-window-seconds` | 120 | 模型当前窗口的音频时长上限；token/轮数可更早触发滚动 |
 | `--history-retain-seconds` | 60 | 滚动后的近期音频保留目标，实际仍受 token/轮数约束 |
 | `--max-tokens` | 160 | 每轮生成长度上限 |
+| `--audio-token-cache-size` | 64 | 准确音频 token 数的有界缓存容量；0 关闭，仅对已核对的原生处理器启用 |
+| `--cuda-graphs` | 未启用 | 允许 vLLM 使用编译/CUDA Graph；默认继续 eager，需在目标 GPU 对照验证 |
 | `--protocol-form` | `auto` | `auto` / `special` / `text`；必须与权重训练形式一致 |
 | `--image-slots` | 1 | Qwen3-Omni 初始化兼容选项；不向翻译模型传入视频画面 |
 | `--ffmpeg` | 系统 PATH | 上传音视频解码使用的 FFmpeg 可执行文件路径 |
@@ -293,6 +295,29 @@ python run.py --backend mock --host 127.0.0.1 --port 8000
 | `--max-result-mb` | 256 | 单会话临时事件+纯文本预算，达到时显式停止并保留有效前缀 |
 | `--result-retention-hours` | 24 | 已结束结果的最长临时保存时间；最多 8 个会话 |
 | `--no-log` | 未启用 | 禁用持久 JSONL 日志；完整导出仍使用临时磁盘 |
+
+### 推理开销与可选加速
+
+每块最终输入模型的音频绑定独立、稳定的 ID，重复作为历史输入时通过 vLLM `multi_modal_uuids` 复用该 ID，减少反复计算音频内容哈希的开销。不同会话隔离；裁窗同步移除应用层的旧 ID。原始 PCM 仍随请求提供，因此引擎缓存被逐出后仍可重新处理，不依赖缓存永远命中。这不等于持久化的原生流式 KV 会话，也不能保证裁窗后前缀缓存继续命中。
+
+音频 token 计数只在已核对的 vLLM 0.11.1 / Transformers 4.57.1 原生 Qwen3-Omni 处理链中按有效采样长度缓存准确结果，容量默认 64；首次出现的长度仍由独立预处理器准确计数。无法确认处理链时保留逐块准确计数，不用“每秒约 13 token”的估算代替。正式模型返回的展开数仍与计数校验，不一致就拒绝提交。可追加 `--audio-token-cache-size 0` 关闭这层缓存做对照，不会关闭已有的多模态或 LLM 前缀缓存。
+
+Web JSON 导出、服务端会话日志和单音频 `events.jsonl` 的 `turn` 自动增加 `output_tokens` 与 `timings`：
+
+| 字段 | 含义 |
+|---|---|
+| `output_tokens` | 本轮模型响应 token 数，含策略标签，不含被移除的结束 token |
+| `timings.audio_count_s` | 本轮音频 token 计数/缓存查询的墙钟时间 |
+| `timings.request_prepare_s` | 本轮输入准备时间，**已包含 audio_count_s** |
+| `timings.engine_generate_s` | 整个批次的 vLLM 调用墙钟时间；同批请求共享该数值 |
+| `timings.response_decode_s` | 本轮生成结果解码与展开数校验时间 |
+| `timings.audio_count_cache_hit` / `audio_count_mode` | 计数缓存是否命中及实际计数路径；不是 GPU/KV 缓存命中率 |
+
+这些字段不要求额外导出操作即可写入已有日志；`--no-log` 时仍可在会话 JSON 导出中查看。它们不是 CUDA event 计时，不拆分音频编码/prefill/decode，也不是首字延迟或 AL/LAAL。`service_s` 继续表示整个调度批次的服务时间，调度排队单独记为 `scheduler_wait_s`；不要把相互包含的字段直接相加。
+
+默认保持 eager。需要测试 CUDA Graph 时，在原来的启动命令末尾追加 `--cuda-graphs`；单音频 CLI 也支持。它可能增加启动捕获时间和显存，具体图模式取决于当前 vLLM/attention backend；需要用同一 checkpoint、同一音频和块长在 A800 对照，未宣称已验证真机加速。失败时移除该参数恢复 eager，不自动重试或重复提交已生成译文。
+
+历史默认仍是 120/60 秒。测试历史规模对耗时的影响时，可在原命令末尾追加 `--history-window-seconds 20 --history-retain-seconds 10`：超过约 20 秒后裁到最近约 10 秒，再继续增长；token/轮次预算可能更早触发。它是质量与速度的对照配置，不是已验证最佳参数，须检查裁窗附近的漏译、重复和指代。保留当前 WAIT/FLEX/DIRECT 提交语义和四路调度，不在本次改动中逐 token 发布未完成的译文。
 
 ## 5. 目前的真实边界
 
