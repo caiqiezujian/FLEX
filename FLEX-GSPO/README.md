@@ -2,21 +2,37 @@
 
 检查、审计、监控和诊断脚本统一放在 `Scripts/`，完整入口与离线回放输入要求见 [Scripts 使用索引](Scripts/README.md)。下文命令均从项目根目录执行；数据准备、训练入口和 `tests/` 保持原位置。历史记录中的版本、测试结果仍对应当时运行，脚本路径已更新为当前位置。
 
-迁移到新磁盘后从 SFT 开始新实验，见 [data06 迁移与 v3 训练步骤](docx/data06迁移与v3训练.md)。已有 prepared 清单使用 `Scripts/relocate_prepared_data.py` 同步实际音频路径、编码引用和文件元数据，无须全局替换源码。
+**2026-11-02 更新范围：第二批数据格式适配与最新 SFT 短提示词对齐。继续使用已有 COMET22 QALCO v4，奖励公式、配置和训练容量不变。** 新数据准备与训练的完整命令见 [第二批数据与 COMET22 v4 训练](docx/第二批数据与COMET22_v4训练.md)。
+
+GSPO 当前共享提示词与 `SFT-Scripts/prepare_duplex_data.py` 的最新短模板一致。旧 prepared `train.jsonl` 内嵌了旧提示词，需要用新版 `01_prepare.sh` 从原始 JSONL 重新生成到新输出目录；原 WAV 不复制、不重切。新训练应使用确实按该短提示词训练的 SFT checkpoint，不能假定历史 `checkpoint-4410-merged` 已匹配。本文后面的历史 v2/v3 示例及历史文档保留当时命令；恢复旧实验需使用原提交、原数据和原配置，不能直接套用当前共享提示词。
+
+迁移到新磁盘的历史步骤见 [data06 迁移与 v3 训练步骤](docx/data06迁移与v3训练.md)。`Scripts/relocate_prepared_data.py` 用于同步音频路径、编码引用和文件元数据，不负责将旧提示词迁移为新提示词。
+
+## 第二批原始数据
+
+`01_prepare.sh --input-format segments` 直接读取 `audio + srcs + chooses`：英文片段按顺序以空格连接，中文片段按顺序直接连接，音频引用原路径，不要求改回 `en/zh/lang/key`。新格式无需 `--audio-dir`；旧格式仍可通过 `--input-format legacy --audio-dir /实际音频目录` 使用。`rejects`、`voice_end` 不作为这版在线 GSPO 的监督字段。准备阶段仅生成时间分块计划，训练阶段由当前模型在线采样 G8，无需预先制造离线轨迹。
 
 ## 最新实验入口：QALCO v4
 
 2026-10-28 新增独立入口 **06_train_qalco_v4.sh + configs/qalco_v4.json**。在完整同音频 G8 内分别缩放质量与门控后的时延，给标准差设置下限；训练框架只再减去组均值，不做第二次标准差归一化。空译、格式错误、严重循环进入明确失败分支，失败分数相对于本组可评分候选设置，减少固定 −4 对组均值的拉低。具体公式、局限和验收见 [QALCO v4 训练说明](docx/QALCO_v4训练说明.md)。
 
-继续使用已有 **COMET22**，无需部署新模型或重新切音频。保留 **G8 / batch32 / micro2 / 3000步 / 每500步保存**，以及已跑通的四卡同步、EOF、offload 和缓存设置；不扩大显存预算。v2/v3 配置保持独立，启动 v4 请使用新输出目录，从原 SFT 合并模型起跑。
+继续使用已有 **COMET22**，无需新增质量模型服务或重新切音频。保留 **G8 / batch32 / micro2 / 3000步 / 每500步保存**，以及现有四卡同步、EOF、offload 和缓存设置；不扩大显存预算。v4 的质量权重 `1.0`、时延权重 `0.25`、连续质量门控及长度/重复成本均不变。
+
+下面 `models/new-sft-merged` **只是模型路径示例，必须替换成确实使用最新短提示词训练的实际 SFT 合并 checkpoint**。数据路径对应[第二批准备说明](docx/第二批数据与COMET22_v4训练.md)中新生成的清单，训练输出使用新目录。
 
 ~~~bash
 cd /data06/yb/Code/FLEX/FLEX-GSPO
 source /data06/yb/venvs/flex-gspo-online/bin/activate
 bash 06_train_qalco_v4.sh \
-  /data06/yb/Code/FLEX/models/checkpoint-4410-merged \
-  /data06/yb/Code/FLEX/datasets/gspo_online_prepared_v3_1027/train.jsonl \
-  /data06/yb/Code/FLEX/outputs/gspo_v4_g8_b32_3000_1028_001
+  /data06/yb/Code/FLEX/models/new-sft-merged \
+  /data06/yb/Code/FLEX/datasets/gspo_prepared_batch2_v4_shortprompt_1102/train.jsonl \
+  /data06/yb/Code/FLEX/outputs/gspo_v4_comet22_batch2_shortprompt_g8_b32_3000_001 \
+  --gpu-ids 0,1,2,3 \
+  --group-size 8 \
+  --global-batch-size 32 \
+  --micro-batch-size 2 \
+  --train-iters 3000 \
+  --save-steps 500
 ~~~
 
 验证由用户自行安排；如需 GPU 采样、更新、保存的两步短验收，可在另一个新目录追加 `--train-iters 2 --save-steps 2`，它不是正式训练的启动条件。新版 normalized reward 的均值不能当作质量上升曲线；TensorBoard 应同时看原始 `quality/mean`、`latency_seconds/mean`、空译/格式错误比例、组内质量标准差和 `estimated_advantage`，翻译改善仍需固定验证样本。分项缩放不能修复 COMET 未识别的否定范围、漏译或幻觉错误。

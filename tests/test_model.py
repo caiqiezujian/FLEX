@@ -202,6 +202,19 @@ def test_inference_prompt_matches_sft_preparation(target, trained_language):
     assert SYSTEM_PROMPTS[target] == templates[0].format(target_lang=trained_language)
 
 
+def test_chinese_inference_prompt_matches_gspo_preparation():
+    source = Path(__file__).resolve().parents[1] / 'FLEX-GSPO' / 'flex_gspo' / 'prompts.py'
+    tree = ast.parse(source.read_text(encoding='utf-8'))
+    prompts = [
+        ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(name, ast.Name) and name.id == 'SYSTEM_PROMPT' for name in node.targets)
+    ]
+    assert len(prompts) == 1, 'Review the GSPO prompt source and inference alignment'
+    assert SYSTEM_PROMPTS['zh'] == prompts[0]
+
+
 def test_one_engine_two_directions_and_shutdown(fake_vllm, monkeypatch):
     options, observed, _ = fake_vllm
     monkeypatch.delenv('VLLM_WORKER_MULTIPROC_METHOD', raising=False)

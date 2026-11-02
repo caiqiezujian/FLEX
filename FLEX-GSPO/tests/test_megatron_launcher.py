@@ -364,6 +364,52 @@ class TestMegatronLauncher(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "first virtual audio"):
                 launcher.validate_local_inputs(a)
 
+    def test_old_prepared_prompt_has_actionable_rebuild_error(self):
+        with tempfile.TemporaryDirectory() as temp, redirect_stdout(StringIO()):
+            a = self.prepared_fixture(Path(temp))
+            path = Path(a.dataset)
+            rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+            rows[0]["messages"][0]["content"] = "obsolete SFT instruction"
+            content = "\n".join(json.dumps(row) for row in rows) + "\n"
+            path.write_text(content, encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Re-run 01_prepare.sh"):
+                launcher.validate_local_inputs(a)
+            self.assertEqual(path.read_text(encoding="utf-8"), content)
+
+    def test_segmented_prepare_is_accepted_by_current_v4_launcher(self):
+        from flex_gspo.prepare import PrepareOptions, prepare_dataset
+        from test_prepare import write_pcm
+
+        with tempfile.TemporaryDirectory() as temp, redirect_stdout(StringIO()):
+            root = Path(temp)
+            model = root / "short-prompt-sft"
+            model.mkdir()
+            rows = []
+            for index in range(4):
+                audio = root / f"clip-{index}.wav"
+                write_pcm(audio)
+                rows.append({"audio": str(audio), "srcs": ["The meeting", "starts at nine."],
+                             "chooses": ["会议", "九点开始。"], "voice_end": False})
+            raw = root / "raw.jsonl"
+            raw.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+            output = root / "prepared"
+            report = prepare_dataset(PrepareOptions(input_jsonl=str(raw), output_dir=str(output),
+                                                     input_format="segments", workers=2))
+            self.assertTrue(report["manifest_published"])
+            args = launcher.parser().parse_args([
+                str(model), str(output / "train.jsonl"), str(root / "new-run"),
+                "--reward-config", str(ROOT / "configs" / "qalco_v4.json"),
+                "--global-batch-size", "32", "--group-size", "8", "--micro-batch-size", "2",
+            ])
+            info = launcher.validate_local_inputs(args)
+            self.assertEqual(info["tasks"], 4)
+            command = launcher.build_command(args)
+            self.assertEqual(command[command.index("--multi_turn_scheduler") + 1], "flex_stream")
+            self.assertEqual(command[command.index("--scale_rewards") + 1], "none")
+            reward = json.loads(Path(args.reward_config).read_text(encoding="utf-8"))["reward"]
+            self.assertEqual(reward["quality_provider"], "comet22")
+            self.assertEqual(reward["v4"]["latency_weight"], 0.25)
+
     def test_resume_identity_rejects_reward_or_data_change(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

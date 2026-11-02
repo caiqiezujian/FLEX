@@ -39,7 +39,7 @@ class PreparationError(ValueError):
 @dataclass(frozen=True)
 class PrepareOptions:
     input_jsonl: str = "/data/yb/Flex/datasets/1019/en2zh_train_gspo_1.jsonl"
-    audio_dir: str = "/data/yb/Flex/datasets/data_001"
+    audio_dir: str | None = None
     output_dir: str = "/data/yb/Flex/datasets/gspo_online_prepared"
     chunk_seconds: int = 1
     workers: int = 8
@@ -48,6 +48,7 @@ class PrepareOptions:
     limit: int | None = None
     max_duration_seconds: float | None = 40.0
     system_prompt_file: str | None = None
+    input_format: str = "auto"
 
 
 def _write_json_line(stream, value: Any) -> None:
@@ -164,14 +165,71 @@ def plan_chunks(duration_seconds: float, chunk_seconds: int = 1) -> list[dict[st
     ]
 
 
-def normalize_record(record: Any, audio_root: Path) -> dict[str, Any]:
+def _record_key(key: Any) -> str:
+    if not isinstance(key, str) or not key or key != key.strip():
+        raise PreparationError("id/key must be a nonempty string without surrounding whitespace")
+    if key in (".", "..") or any(char in key for char in ("/", "\\", "\x00")):
+        raise PreparationError("id/key must be a filename stem, not a path")
+    return key
+
+
+def _segments(record: dict[str, Any], name: str) -> list[str]:
+    values = record.get(name)
+    if not isinstance(values, list) or not values:
+        raise PreparationError(f"{name} must be a nonempty list of strings")
+    for index, value in enumerate(values):
+        if not isinstance(value, str) or not value.strip():
+            raise PreparationError(f"{name}[{index}] must be a nonempty string")
+    return [value.strip() for value in values]
+
+
+def normalize_record(record: Any, audio_root: Path | None = None, *,
+                     input_format: str = "auto", input_dir: Path | None = None) -> dict[str, Any]:
+    """Normalize supervision only; text segments do not provide audio timestamps.
+
+    Explicit audio paths are authoritative for segmented input. Relative paths
+    are anchored to the input JSONL, never silently redirected to --audio-dir.
+    """
     if not isinstance(record, dict):
         raise PreparationError("Each nonempty JSONL line must contain an object")
-    key = record.get("key")
-    if not isinstance(key, str) or not key or key != key.strip():
-        raise PreparationError("key must be a nonempty string without surrounding whitespace")
-    if key in (".", "..") or any(char in key for char in ("/", "\\", "\x00")):
-        raise PreparationError("key must be a filename stem, not a path")
+    if input_format not in ("auto", "segments", "legacy"):
+        raise PreparationError("input_format must be auto, segments, or legacy")
+    selected = input_format
+    if selected == "auto":
+        # Segment fields are decisive, including malformed/incomplete ones.
+        # Older key/en/zh rows may also carry an incidental audio field.
+        if any(name in record for name in ("srcs", "chooses")):
+            selected = "segments"
+        elif all(name in record for name in ("lang", "key", "en", "zh")):
+            selected = "legacy"
+        else:
+            selected = "segments" if "audio" in record else "legacy"
+    if selected == "segments":
+        if record.get("lang", "en") != "en":
+            raise PreparationError("Segmented input is English-to-Chinese; lang, if present, must be 'en'")
+        audio = record.get("audio")
+        if not isinstance(audio, str) or not audio.strip() or "\x00" in audio:
+            raise PreparationError("audio must be a nonempty local WAV path string")
+        if audio != audio.strip() or "://" in audio:
+            raise PreparationError("audio must be a local path without surrounding whitespace, not a URL")
+        audio_path = Path(audio).expanduser()
+        if not audio_path.is_absolute():
+            if input_dir is None:
+                raise PreparationError("Relative audio path requires the input JSONL directory")
+            audio_path = input_dir / audio_path
+        resolved_audio = audio_path.resolve()
+        if resolved_audio.suffix.lower() != ".wav":
+            raise PreparationError("audio must point to a .wav file")
+        key = _record_key(record.get("id", record.get("key", resolved_audio.stem)))
+        source_parts, target_parts = _segments(record, "srcs"), _segments(record, "chooses")
+        if len(source_parts) != len(target_parts):
+            raise PreparationError("srcs and chooses must have the same number of aligned segments")
+        return {
+            "id": key, "audio_path": str(resolved_audio),
+            "source_text": " ".join(source_parts), "reference_text": "".join(target_parts),
+            "input_format": "segments", "input_segment_count": len(source_parts),
+        }
+    key = _record_key(record.get("key"))
     if record.get("lang") != "en":
         raise PreparationError("Only lang='en' English-to-Chinese records are supported in this first version")
     texts = {}
@@ -181,6 +239,11 @@ def normalize_record(record: Any, audio_root: Path) -> dict[str, Any]:
         if not isinstance(value, str) or not value.strip():
             raise PreparationError(f"{language}.txt must be a nonempty string")
         texts[language] = value.strip()
+    if audio_root is None:
+        raise PreparationError("Legacy key/en.txt/zh.txt input requires --audio-dir")
+    audio_root = audio_root.resolve()
+    if not audio_root.is_dir():
+        raise PreparationError(f"Audio directory does not exist: {audio_root}")
     audio_path = audio_root / f"{key}.wav"
     # A malicious key/drive prefix must never escape the explicitly chosen root.
     try:
@@ -193,6 +256,7 @@ def normalize_record(record: Any, audio_root: Path) -> dict[str, Any]:
         "audio_path": str(resolved_audio),
         "source_text": texts["en"],
         "reference_text": texts["zh"],
+        "input_format": "legacy",
     }
 
 
@@ -230,14 +294,16 @@ def build_row(record: dict[str, Any], *, chunk_seconds: int, max_duration_second
     }
 
 
-def _validate_options(options: PrepareOptions) -> tuple[Path, Path, Path, str]:
+def _validate_options(options: PrepareOptions) -> tuple[Path, Path | None, Path, str]:
     input_path = Path(options.input_jsonl).expanduser().resolve()
-    audio_root = Path(options.audio_dir).expanduser().resolve()
+    audio_root = Path(options.audio_dir).expanduser().resolve() if options.audio_dir else None
     output_root = Path(options.output_dir).expanduser().resolve()
     if not input_path.is_file():
         raise PreparationError(f"Input JSONL does not exist: {input_path}")
-    if not audio_root.is_dir():
-        raise PreparationError(f"Audio directory does not exist: {audio_root}")
+    if options.input_format not in ("auto", "segments", "legacy"):
+        raise PreparationError("input_format must be auto, segments, or legacy")
+    if options.input_format == "legacy" and (audio_root is None or not audio_root.is_dir()):
+        raise PreparationError("Legacy input requires an existing --audio-dir")
     if output_root == audio_root or output_root == input_path.parent:
         raise PreparationError("Use a dedicated output directory, separate from input JSONL/audio directories")
     if options.workers < 1 or options.workers > 256:
@@ -255,7 +321,7 @@ def _validate_options(options: PrepareOptions) -> tuple[Path, Path, Path, str]:
     if options.system_prompt_file:
         system_prompt = Path(options.system_prompt_file).read_text(encoding="utf-8-sig").strip()
         if system_prompt != SYSTEM_PROMPT:
-            raise PreparationError("system_prompt_file must exactly match the preserved EN-to-ZH SFT prompt; "
+            raise PreparationError("system_prompt_file must exactly match the current EN-to-ZH SFT concise strategy prompt; "
                                    "the online scheduler does not accept an untrained prompt override")
     output_root.mkdir(parents=True, exist_ok=True)
     existing = [name for name in OUTPUT_NAMES if (output_root / name).exists()]
@@ -289,17 +355,20 @@ def prepare_dataset(options: PrepareOptions) -> dict[str, Any]:
         lock_path.unlink(missing_ok=True)
 
 
-def _prepare_validated(options: PrepareOptions, input_path: Path, audio_root: Path,
+def _prepare_validated(options: PrepareOptions, input_path: Path, audio_root: Path | None,
                        output_root: Path, system_prompt: str) -> dict[str, Any]:
     started = time.monotonic()
     last_log = started
     input_bytes = input_path.stat().st_size
     counters = {"physical_lines": 0, "rows_read": 0, "unique_rows": 0, "accepted_rows": 0,
                 "rejected_rows": 0, "duplicate_rows": 0, "conflicting_duplicate_rows": 0,
-                "blank_lines": 0, "bytes_read": 0, "audio_seconds": 0.0, "chunks": 0}
-    LOGGER.info("Preparing online RL input: jsonl=%s audio_dir=%s output_dir=%s workers=%s chunk=%ss",
-                input_path, audio_root, output_root, options.workers, options.chunk_seconds)
+                "id_collision_rows": 0, "blank_lines": 0, "bytes_read": 0, "audio_seconds": 0.0, "chunks": 0}
+    accepted_by_format = {"legacy": 0, "segments": 0}
+    LOGGER.info("Preparing online RL input: jsonl=%s format=%s legacy_audio_dir=%s output_dir=%s workers=%s chunk=%ss",
+                input_path, options.input_format, audio_root, output_root, options.workers, options.chunk_seconds)
     LOGGER.info("No waveform copies, chunk files, model calls, or offline candidate trajectories will be created")
+    LOGGER.info("Segmented input: srcs -> space-joined English; chooses -> concatenated Chinese. "
+                "audio is authoritative; rejects/voice_end do not control the episode or reward reference")
 
     def progress(force=False):
         nonlocal last_log
@@ -318,7 +387,7 @@ def _prepare_validated(options: PrepareOptions, input_path: Path, audio_root: Pa
         stage = Path(temporary)
         connection = sqlite3.connect(stage / "keys.sqlite3")
         connection.execute("PRAGMA cache_size=-4096")
-        connection.execute("CREATE TABLE seen (key TEXT PRIMARY KEY, line INTEGER NOT NULL, digest TEXT NOT NULL)")
+        connection.execute("CREATE TABLE seen (key TEXT PRIMARY KEY, line INTEGER NOT NULL, digest TEXT NOT NULL, audio_path TEXT NOT NULL)")
         try:
             with (stage / "train.jsonl").open("w", encoding="utf-8", newline="\n") as manifest, \
                     (stage / "rejected.jsonl").open("w", encoding="utf-8", newline="\n") as rejected, \
@@ -347,6 +416,7 @@ def _prepare_validated(options: PrepareOptions, input_path: Path, audio_root: Pa
                     _write_json_line(manifest, row)
                     task = json.loads(row["flex_task"])
                     counters["accepted_rows"] += 1
+                    accepted_by_format[task["input_format"]] += 1
                     counters["audio_seconds"] += task["duration_seconds"]
                     counters["chunks"] += len(task["chunks"])
                     progress()
@@ -364,16 +434,25 @@ def _prepare_validated(options: PrepareOptions, input_path: Path, audio_root: Pa
                         try:
                             # utf-8-sig accepts a BOM without loosening JSON validation.
                             parsed = json.loads(raw_line.decode("utf-8-sig"))
-                            if isinstance(parsed, dict) and isinstance(parsed.get("key"), str):
-                                key = parsed["key"]
-                            record = normalize_record(parsed, audio_root)
+                            if isinstance(parsed, dict):
+                                key = next((parsed[name] for name in ("id", "key", "audio")
+                                            if isinstance(parsed.get(name), str)), None)
+                            record = normalize_record(parsed, audio_root, input_format=options.input_format,
+                                                      input_dir=input_path.parent)
                         except (ValueError, OSError, UnicodeError) as exc:
                             reject(line_number, key, exc)
                             progress()
                             continue
-                        digest = hashlib.sha256(json.dumps(record, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
-                        previous = connection.execute("SELECT line, digest FROM seen WHERE key=?", (record["id"],)).fetchone()
+                        identity = {name: record[name] for name in ("id", "audio_path", "source_text", "reference_text")}
+                        digest = hashlib.sha256(json.dumps(identity, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+                        previous = connection.execute("SELECT line, digest, audio_path FROM seen WHERE key=?", (record["id"],)).fetchone()
                         if previous is not None:
+                            if record["audio_path"] != previous[2]:
+                                counters["id_collision_rows"] += 1
+                                reject(line_number, record["id"], "Same id/key refers to different audio paths; "
+                                       "assign distinct id values. First occurrence is line " + str(previous[0]))
+                                progress()
+                                continue
                             conflict = digest != previous[1]
                             counters["duplicate_rows"] += 1
                             counters["conflicting_duplicate_rows"] += int(conflict)
@@ -381,7 +460,8 @@ def _prepare_validated(options: PrepareOptions, input_path: Path, audio_root: Pa
                                                          "duplicate_line": line_number, "conflicting_text": conflict})
                             progress()
                             continue
-                        connection.execute("INSERT INTO seen VALUES (?, ?, ?)", (record["id"], line_number, digest))
+                        connection.execute("INSERT INTO seen VALUES (?, ?, ?, ?)",
+                                           (record["id"], line_number, digest, record["audio_path"]))
                         counters["unique_rows"] += 1
                         if counters["unique_rows"] % 1000 == 0:
                             connection.commit()
@@ -405,7 +485,11 @@ def _prepare_validated(options: PrepareOptions, input_path: Path, audio_root: Pa
                 "status": "ready" if published else "failed",
                 "manifest_published": published,
                 "manifest_path": str(output_root / "train.jsonl") if published else None,
-                "input_jsonl": str(input_path), "audio_dir": str(audio_root),
+                "input_jsonl": str(input_path), "audio_dir": str(audio_root) if audio_root else None,
+                "input_format": options.input_format, "accepted_by_format": accepted_by_format,
+                "segmented_fields": {"source": "srcs joined with spaces", "reference": "chooses concatenated",
+                                     "audio": "audio path; relative to input JSONL directory if needed",
+                                     "ignored": ["rejects", "voice_end"], "timestamps_available": False},
                 "direction": "en2zh", "source_audio_modified": False,
                 "offline_trajectories_required": False,
                 "audio_validation": "header structure and declared PCM/float payload bounds, not full sample decoding",
@@ -429,8 +513,8 @@ def _prepare_validated(options: PrepareOptions, input_path: Path, audio_root: Pa
                 os.replace(stage / "train.jsonl", output_root / "train.jsonl")
             progress(force=True)
             if published:
-                LOGGER.info("Ready: %s (%s tasks); original WAV files remain in %s",
-                            output_root / "train.jsonl", counters["accepted_rows"], audio_root)
+                LOGGER.info("Ready: %s (%s tasks, formats=%s); WAV files remain at their original paths",
+                            output_root / "train.jsonl", counters["accepted_rows"], accepted_by_format)
             else:
                 LOGGER.error("No training manifest published. Inspect %s; fix input or explicitly use "
                              "--skip-invalid with a new output directory", output_root / "rejected.jsonl")

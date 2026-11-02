@@ -11,7 +11,7 @@
 - 模型是训练后的完整 merged checkpoint，包含匹配的 tokenizer/processor，不是单独 LoRA adapter。同一个双向 checkpoint 通过目标语言 prompt 切换方向。
 - 不要仅把 `infer_audio.py` 单文件拷走；保留同目录下的 `flex_web/` 模块。无需安装 Web 依赖。
 
-Web 与本 CLI 共用 `flex_web/model.py` 的精简策略提示词，与 `SFT-Scripts/prepare_duplex_data.py` 的模板一致；目标语言分别为 `中文` 和训练使用的 `English`。DIRECT 表示可以直接自然续接，FLEX 表示需要暂缓部分内容或调整表达结构，两者不按句子是否完整区分。默认面向已确认用此模板训练的 checkpoint；旧 checkpoint 应继续使用其训练 JSONL 中的准确 system 提示，更新推理代码不会改变模型的训练历史。`FLEX-GSPO/` 的旧版训练提示独立维护，不属于本次 Web/CLI 对齐范围。
+Web 与本 CLI 共用 `flex_web/model.py` 的精简策略提示词，与 `SFT-Scripts/prepare_duplex_data.py` 的模板一致；目标语言分别为 `中文` 和训练使用的 `English`。DIRECT 表示可以直接自然续接，FLEX 表示需要暂缓部分内容或调整表达结构，两者不按句子是否完整区分。`FLEX-GSPO/` 的英中 system 提示也使用此模板。默认面向已确认用此模板训练的 checkpoint；旧 checkpoint 应继续使用其训练 JSONL 中的准确 system 提示，更新推理或训练代码不会改变模型的训练历史。
 
 ```bash
 python -m pip install -r requirements-infer.txt

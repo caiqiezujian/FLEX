@@ -12,8 +12,12 @@ from flex_gspo.prepare import PreparationError, PrepareOptions, prepare_dataset
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input-jsonl", default=PrepareOptions.input_jsonl, help="Raw JSONL: lang/key/en.txt/zh.txt")
-    parser.add_argument("--audio-dir", default=PrepareOptions.audio_dir, help="Original WAV directory, filenames are key.wav")
+    parser.add_argument("--input-jsonl", default=PrepareOptions.input_jsonl,
+                        help="Raw JSONL: audio/srcs/chooses, or legacy lang/key/en.txt/zh.txt")
+    parser.add_argument("--input-format", choices=("auto", "segments", "legacy"), default="auto",
+                        help="auto detects each row; segments reads audio/srcs/chooses; legacy reads key/en.txt/zh.txt")
+    parser.add_argument("--audio-dir", default=None,
+                        help="Required only for legacy key.wav input; does not override segmented audio paths")
     parser.add_argument("--output-dir", default=PrepareOptions.output_dir, help="Dedicated output directory; existing outputs are never overwritten")
     parser.add_argument("--chunk-seconds", type=int, default=1, help="Fixed causal chunk duration, integer 1..8 (default: 1)")
     parser.add_argument("--workers", type=int, default=8, help="Concurrent WAV-header probes, not model workers (default: 8)")
@@ -22,7 +26,7 @@ def main(argv=None):
     parser.add_argument("--limit", type=int, help="Prepare only the first N distinct eligible keys for a smoke test")
     parser.add_argument("--max-duration-seconds", type=float, default=40.0,
                         help="Reject clips over this training budget (default: 40); increase context/turn limits together")
-    parser.add_argument("--system-prompt-file", help="Optional UTF-8 prompt assertion: must exactly match the preserved SFT prompt")
+    parser.add_argument("--system-prompt-file", help="Optional UTF-8 prompt assertion: must exactly match the current SFT concise strategy prompt")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
     try:

@@ -186,6 +186,21 @@ class OnlineHooksTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "causal chunk plan"):
             asyncio.run(self.hooks.on_turn_end(self.request, choice_fixture(), 1))
 
+    def test_old_prepared_system_prompt_is_rejected_without_rewriting_history(self):
+        request = request_fixture()
+        request.messages[0]["content"] = (
+            "你是一个同声传译专家，负责将用户音频中的语音同声翻译为中文。"
+            "用户将按时间顺序逐块发送音频。每收到一块音频后，立即输出响应："
+            "若该块暂无可翻译内容，输出<|WAIT|>；若仅能确认部分译文、语义尚不完整，输出<|FLEX|>并紧跟"
+            "确信的译文（只输出有把握的部分，宁少勿错）；若译文语义已完整，输出<|DIRECT|>并紧跟新识别"
+            "的译文。所有译文均为增量输出：只输出新增内容，不重复、不修改此前已输出的任何译文。"
+        )
+        before = deepcopy(request.messages)
+        with self.assertRaisesRegex(ValueError, "SFT prompt"):
+            asyncio.run(self.hooks.on_trajectory_start([request]))
+        self.assertEqual(request.messages, before)
+        self.assertNotIn(STATE_KEY, request.data_dict)
+
     def test_unpack_copies_input_and_rejects_missing_reference(self):
         original = task_fixture()
         unpacked = unpack_task(original)
@@ -195,10 +210,10 @@ class OnlineHooksTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "reference"):
             unpack_task(original)
 
-    def test_prompt_equals_original_sft_literal_when_source_is_available(self):
-        source = Path(__file__).resolve().parents[2] / "Scripts" / "prepare_duplex_data.py"
+    def test_prompt_equals_current_sft_literal_when_source_is_available(self):
+        source = Path(__file__).resolve().parents[2] / "SFT-Scripts" / "prepare_duplex_data.py"
         if not source.is_file():
-            self.skipTest("Original SFT script not included in this standalone checkout")
+            self.skipTest("SFT-Scripts is not included in this standalone checkout")
         module = ast.parse(source.read_text(encoding="utf-8"))
         expression = next(node.value for node in module.body if isinstance(node, ast.Assign)
                           and any(isinstance(name, ast.Name) and name.id == "PROTOCOL_SYSTEM_PROMPT_TEMPLATE"

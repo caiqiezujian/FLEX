@@ -215,8 +215,10 @@ def validate_local_inputs(a: argparse.Namespace) -> dict:
         json.load(f)
     from flex_gspo.audio import encode_chunk_ref
     from flex_gspo.online import unpack_task
-    from flex_gspo.prompts import initial_messages
+    from flex_gspo.prompts import SYSTEM_PROMPT, initial_messages
     count, digest = 0, hashlib.sha256()
+    print("[preflight] SFT prompt: concise strategy template; sha256="
+          + hashlib.sha256(SYSTEM_PROMPT.encode("utf-8")).hexdigest(), flush=True)
     print("[preflight] Validating and hashing task manifest (metadata only; no audio decode)...", flush=True)
     with Path(a.dataset).open("rb") as handle:
         for line_number, raw in enumerate(handle, 1):
@@ -227,8 +229,13 @@ def validate_local_inputs(a: argparse.Namespace) -> dict:
             if not isinstance(row, dict) or not isinstance(row.get("flex_task"), str):
                 raise ValueError(f"Line {line_number}: expected prepared train.jsonl with JSON-string flex_task")
             task = unpack_task(row["flex_task"])
-            if row.get("messages") != initial_messages() or row.get("audios") != [encode_chunk_ref(task, 0)]:
-                raise ValueError(f"Line {line_number}: initial actor input differs from SFT prompt + first virtual audio chunk")
+            if row.get("messages") != initial_messages():
+                raise ValueError(f"Line {line_number}: prepared messages differ from the current SFT prompt. "
+                                 "Re-run 01_prepare.sh from the raw JSONL into a NEW output directory; "
+                                 "WAVs are reused without copying. Use the checkpoint trained with this prompt. "
+                                 "Old training runs must resume with their original code and dataset.")
+            if row.get("audios") != [encode_chunk_ref(task, 0)]:
+                raise ValueError(f"Line {line_number}: initial actor input must contain only the first virtual audio chunk")
             if row.get("images") or row.get("videos"):
                 raise ValueError(f"Line {line_number}: audio-only training cannot contain images/videos")
             if len(task["chunks"]) + 1 > a.max_turns:
