@@ -44,7 +44,7 @@ ASCEND_RT_VISIBLE_DEVICES=0 python3 -m flex_web_d910b.smoke_audio \
 
 ## 实验：音频 token 计数复用
 
-默认关闭。在原 Web 启动命令末尾添加 `--audio-token-cache-size 64` 可申请启用；`0` 是关闭。仅在 **vLLM 0.28.0 + Transformers 5.6.2 或 5.5.3** 的原生 Qwen3-Omni/Whisper 处理链和固定配置检查通过时才启用，其他版本、处理器或自定义参数回退逐块精确计数，既不升级依赖也不猜算 token 数。首次遇到一种实际采样长度仍精确计算，再复用该整数；真实音频始终照常送入模型。缓存容量有界，不保存波形或译文。
+默认关闭。在原 Web 启动命令末尾添加 `--audio-token-cache-size 64` 可申请启用；`0` 是关闭。仅在 **vLLM 0.28.0 + Transformers 5.6.2 或 5.5.3** 的原生 Qwen3-Omni/Whisper 处理链和固定配置检查通过时才启用，其他版本、处理器或自定义参数回退逐块精确计数，既不升级依赖也不猜算 token 数。对 tokenizer 初始化参数中的音频覆盖项和未知音频参数扩展也保守回退；运行中出现变化会禁用并清空缓存。首次遇到一种实际采样长度仍精确计算，再复用该整数；真实音频始终照常送入模型。缓存容量有界，不保存波形或译文。
 
 查看启动日志 `Audio token counter mode=length_lru` 是否真正启用；`mode=exact` 代表没有启用并说明原因。导出的 JSON 每轮 `timings.audio_count_mode`、`audio_count_cache_hit`、`audio_count_s`、`engine_generate_s` 可用于 A/B。`request_prepare_s` 已包含 `audio_count_s`，不要相加。即便启用后也继续校验 vLLM 返回的输入 token 数；如果缺失或总数不一致，会关闭计数缓存并拒绝本轮提交，不会自动重试。
 

@@ -17,7 +17,7 @@ def native_type(module, name, **attrs):
 
 
 def fake_tokenizer(token_id=151646):
-    tokenizer = SimpleNamespace(token_id=token_id)
+    tokenizer = SimpleNamespace(token_id=token_id, init_kwargs={})
     tokenizer.convert_tokens_to_ids = lambda _: tokenizer.token_id
     tokenizer.encode = lambda text, add_special_tokens=False: [tokenizer.token_id]
     return tokenizer
@@ -43,6 +43,63 @@ def native028(monkeypatch, request):
                              multimodal_config=SimpleNamespace(mm_processor_kwargs=None))
     prep = SimpleNamespace(renderer=SimpleNamespace(mm_processor=mm, tokenizer=tokenizer), model_config=config)
     return prep, hf, feature
+
+
+@pytest.mark.parametrize('key', ['sampling_rate', 'raw_speech', 'padding', 'max_length',
+                                 'truncation', 'pad_to_multiple_of',
+                                 'return_attention_mask', 'return_tensors'])
+def test_tokenizer_audio_kwarg_override_forces_exact(native028, key):
+    prep, hf, _ = native028
+    hf.tokenizer.init_kwargs[key] = True
+    counter = AudioTokenCounter.for_preprocessor(prep, vllm_version='0.28.0', max_entries=64)
+    assert counter.mode == 'exact'
+
+
+def test_tokenizer_audio_kwarg_mutation_disables_existing_cache(native028):
+    prep, hf, _ = native028
+    counter = AudioTokenCounter.for_preprocessor(prep, vllm_version='0.28.0', max_entries=64)
+    audio = np.zeros(16000, dtype=np.float32)
+    assert counter.count(audio, lambda _: 12) == (12, False)
+    hf.tokenizer.init_kwargs['truncation'] = True
+    assert counter.count(audio, lambda _: 17) == (17, False)
+    assert counter.mode == 'exact' and not counter._counts
+
+
+def test_custom_feature_audio_kwarg_override_forces_exact(native028):
+    prep, hf, feature = native028
+    feature.valid_kwargs = type('Extra', (), {'__annotations__': {'future_audio_flag': bool}})
+    hf.tokenizer.init_kwargs['future_audio_flag'] = True
+    assert AudioTokenCounter.for_preprocessor(prep, vllm_version='0.28.0', max_entries=64).mode == 'exact'
+
+
+def test_custom_audio_argument_schema_forces_exact_even_without_override(native028):
+    prep, _, feature = native028
+    feature.valid_kwargs = type('Extra', (), {'__annotations__': {'future_audio_flag': bool}})
+    assert AudioTokenCounter.for_preprocessor(prep, vllm_version='0.28.0', max_entries=64).mode == 'exact'
+
+
+def test_tokenizer_unrelated_config_preserves_cache(native028):
+    prep, hf, _ = native028
+    hf.tokenizer.init_kwargs['model_max_length'] = 8192
+    counter = AudioTokenCounter.for_preprocessor(prep, vllm_version='0.28.0', max_entries=64)
+    assert counter.mode == 'length_lru'
+
+
+def test_missing_tokenizer_init_kwargs_forces_exact(native028):
+    prep, hf, _ = native028
+    del hf.tokenizer.init_kwargs
+    assert AudioTokenCounter.for_preprocessor(prep, vllm_version='0.28.0', max_entries=64).mode == 'exact'
+
+
+def test_audio_kwarg_schema_change_disables_existing_cache(native028):
+    prep, hf, feature = native028
+    hf.tokenizer.init_kwargs['future_audio_flag'] = True
+    counter = AudioTokenCounter.for_preprocessor(prep, vllm_version='0.28.0', max_entries=64)
+    audio = np.zeros(16000, dtype=np.float32)
+    assert counter.count(audio, lambda _: 12) == (12, False)
+    feature.valid_kwargs = type('Extra', (), {'__annotations__': {'future_audio_flag': bool}})
+    assert counter.count(audio, lambda _: 17) == (17, False)
+    assert counter.mode == 'exact' and not counter._counts
 
 
 def build(native028, size=64, version='0.28.0'):

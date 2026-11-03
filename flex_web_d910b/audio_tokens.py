@@ -20,6 +20,7 @@ https://github.com/huggingface/transformers/blob/v5.6.2/src/transformers/models/
 """
 
 from collections import OrderedDict
+from collections.abc import Mapping
 from numbers import Integral
 
 import numpy as np
@@ -35,6 +36,12 @@ _FEATURE_FIELDS = ('sampling_rate', 'hop_length', 'n_fft', 'n_samples',
                    'chunk_length', 'nb_max_frames', 'feature_size',
                    'padding_side', 'padding_value', 'return_attention_mask',
                    'dither')
+# Transformers 5.5.3/5.6.2 AudioKwargs: ProcessorMixin._merge_kwargs may
+# override audio defaults from tokenizer.init_kwargs before the call.
+_AUDIO_TOKENIZER_KWARGS = frozenset({
+    'sampling_rate', 'raw_speech', 'padding', 'max_length', 'truncation',
+    'pad_to_multiple_of', 'return_attention_mask', 'return_tensors',
+})
 
 
 def _type_id(value):
@@ -116,6 +123,14 @@ class AudioTokenCounter:
                     if (renderer.tokenizer is not renderer_tokenizer or hf_processor.tokenizer is not tokenizer
                             or getattr(model_config, 'multimodal_config', None) is not original_mm_config):
                         raise ValueError('tokenizer or multimodal configuration changed')
+                    init_kwargs = getattr(tokenizer, 'init_kwargs', None)
+                    if not isinstance(init_kwargs, Mapping):
+                        raise ValueError('tokenizer initialization arguments unavailable')
+                    valid_kwargs = getattr(feature, 'valid_kwargs', None)
+                    if valid_kwargs is not None:
+                        raise ValueError('custom audio feature argument schema')
+                    if set(init_kwargs) & _AUDIO_TOKENIZER_KWARGS:
+                        raise ValueError('tokenizer initialization overrides audio parameters')
                     token_id = tokenizer.convert_tokens_to_ids(hf_processor.audio_token)
                     if isinstance(token_id, bool) or not isinstance(token_id, Integral) or token_id < 0:
                         raise ValueError('invalid audio placeholder token ID')
