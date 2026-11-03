@@ -20,6 +20,19 @@ GSPO 当前共享提示词与 `SFT-Scripts/prepare_duplex_data.py` 的最新短�
 
 ## 最新实验入口：QALCO v4
 
+**训练入口选择：要运行此前确认的 COMET22、分项归一化、空译相对惩罚版本，请使用 `06_train_qalco_v4.sh`。`05_train_qalco_v3.sh` 是旧 v3，不是同一奖励。**
+
+| 对比项 | `05_train_qalco_v3.sh` | `06_train_qalco_v4.sh` |
+| --- | --- | --- |
+| 默认奖励配置 | `configs/qalco_v3.json` | `configs/qalco_v4.json` |
+| 质量服务 | COMET22 | COMET22 |
+| 归一化 | 组合奖励后由训练器做组标准化 | 质量、门控时延分别在有效候选间归一化；最终仅减完整组均值 |
+| 全程 WAIT / 格式错误 / 严重循环 | 固定 `−4` | 本组最低有效候选奖励 `−0.25` |
+| G8 全部失败 | 同分，奖励优势均为零 | 每条 `−0.25`，奖励优势均为零 |
+| 默认训练容量 | 四卡、G8、B32、micro2、3000 步、每 500 步保存 | 相同 |
+
+v4 的 `0.25` 是失败候选与本组最低有效候选的间隔，不是每个空译都固定给 `−0.25`；整组没有有效候选时才回退到 `−0.25`。`06` 已显式列出完整训练预设，命令末尾的参数可以覆盖预设。以下说明均假定没有额外指定其他 `--reward-config`。
+
 2026-10-28 新增独立入口 **06_train_qalco_v4.sh + configs/qalco_v4.json**。在完整同音频 G8 内分别缩放质量与门控后的时延，给标准差设置下限；训练框架只再减去组均值，不做第二次标准差归一化。空译、格式错误、严重循环进入明确失败分支，失败分数相对于本组可评分候选设置，减少固定 −4 对组均值的拉低。具体公式、局限和验收见 [QALCO v4 训练说明](docx/QALCO_v4训练说明.md)。
 
 继续使用已有 **COMET22**，无需新增质量模型服务或重新切音频。保留 **G8 / batch32 / micro2 / 3000步 / 每500步保存**，以及现有四卡同步、EOF、offload 和缓存设置；不扩大显存预算。v4 的质量权重 `1.0`、时延权重 `0.25`、连续质量门控及长度/重复成本均不变。
@@ -27,12 +40,12 @@ GSPO 当前共享提示词与 `SFT-Scripts/prepare_duplex_data.py` 的最新短�
 下面 `models/new-sft-merged` **只是模型路径示例，必须替换成确实使用最新短提示词训练的实际 SFT 合并 checkpoint**。数据路径对应[第二批准备说明](docx/第二批数据与COMET22_v4训练.md)中新生成的清单，训练输出使用新目录。
 
 ~~~bash
-cd /data06/yb/Code/FLEX/FLEX-GSPO
-source /data06/yb/venvs/flex-gspo-online/bin/activate
+cd /data/yb/Code/FLEX/FLEX-GSPO
+source /data/yb/vens/flex-gspo-online/bin/activate
 bash 06_train_qalco_v4.sh \
-  /data06/yb/Code/FLEX/models/new-sft-merged \
-  /data06/yb/Code/FLEX/datasets/gspo_prepared_batch2_v4_shortprompt_1102/train.jsonl \
-  /data06/yb/Code/FLEX/outputs/gspo_v4_comet22_batch2_shortprompt_g8_b32_3000_001 \
+  /data/yb/Code/FLEX/models/new-sft-merged \
+  /data/yb/Code/FLEX/datasets/gspo_prepared_batch2_v4_shortprompt_1102/train.jsonl \
+  /data/yb/Code/FLEX/outputs/gspo_v4_comet22_batch2_shortprompt_g8_b32_3000_001 \
   --gpu-ids 0,1,2,3 \
   --group-size 8 \
   --global-batch-size 32 \
