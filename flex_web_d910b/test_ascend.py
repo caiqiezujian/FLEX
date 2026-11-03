@@ -214,10 +214,17 @@ def test_audio_smoke_reads_wav_and_commits_each_turn(monkeypatch, tmp_path, caps
 
     monkeypatch.setattr(smoke_audio, 'ModelEngine', Engine)
     monkeypatch.setattr(sys, 'argv', ['smoke_audio', str(tmp_path), str(wav_path),
-                                     '--target', 'en', '--tensor-parallel-size', '2'])
+                                     '--target', 'en', '--tensor-parallel-size', '2',
+                                     '--audio-token-cache-size', '64',
+                                     '--mm-processor-cache-gb', '1', '--enable-graphs',
+                                     '--enable-prefix-caching'])
     smoke_audio.main()
     assert observed['target'] == 'en'
     assert observed['options'].tensor_parallel_size == 2
+    assert observed['options'].audio_token_cache_size == 64
+    assert observed['options'].mm_processor_cache_gb == 1
+    assert observed['options'].prefix_caching is True
+    assert observed['options'].enforce_eager is False
     assert [entry[1] for entry in observed['committed']] == ['<|WAIT|>', '<|FLEX|>A', '<|DIRECT|> B']
     assert len(observed['generated']) == len(observed['committed']) == 3
     for audio, expected in zip(observed['generated'], [-1., 0., .5]):

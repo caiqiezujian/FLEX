@@ -3,7 +3,8 @@
 This is not an audio-feature cache and never stores a waveform.  The first
 occurrence of each exact sample length is still counted by the independent
 vLLM preprocessor.  The optimization is restricted to the native, audited
-vLLM 0.11.1 / Transformers 4.57.1 Qwen3-Omni audio path.  Other installations
+vLLM 0.11.1 / Transformers 4.57.1 and the experimental vLLM 0.28.0 /
+Transformers 5.5.3 or 5.6.2 native Qwen3-Omni audio paths. Other installations
 keep the original exact counter, and generation must still check its actual
 expanded token count before committing a response.
 
@@ -13,6 +14,9 @@ signal values.  We deliberately do not replace that behavior with a guessed
 tokens-per-second formula.  Primary implementation references:
 https://github.com/vllm-project/vllm/blob/v0.11.1/vllm/model_executor/models/qwen3_omni_moe_thinker.py
 https://github.com/huggingface/transformers/blob/v4.57.1/src/transformers/models/qwen3_omni_moe/processing_qwen3_omni_moe.py
+https://github.com/vllm-project/vllm/blob/v0.28.0/vllm/model_executor/models/qwen3_omni_moe_thinker.py
+https://github.com/huggingface/transformers/blob/v5.5.3/src/transformers/models/qwen3_omni_moe/processing_qwen3_omni_moe.py
+https://github.com/huggingface/transformers/blob/v5.6.2/src/transformers/models/qwen3_omni_moe/processing_qwen3_omni_moe.py
 """
 
 from collections import OrderedDict
@@ -58,23 +62,45 @@ class AudioTokenCounter:
         if not max_entries:
             counter.reason = 'disabled by configuration'
             return counter
-        if vllm_version != '0.11.1':
+        supported_versions = {'0.11.1': frozenset({'4.57.1'}),
+                              '0.28.0': frozenset({'5.5.3', '5.6.2'})}
+        expected_transformers = supported_versions.get(vllm_version)
+        if expected_transformers is None:
             counter.reason = 'unverified vLLM version'
             return counter
         try:
             import transformers
 
-            if getattr(transformers, '__version__', None) != '4.57.1':
+            transformers_version = getattr(transformers, '__version__', None)
+            if transformers_version not in expected_transformers:
                 counter.reason = 'unverified Transformers version'
                 return counter
-            mm_processor = preprocessor._get_mm_processor()
+            if vllm_version == '0.28.0':
+                renderer = preprocessor.renderer
+                mm_processor = renderer.mm_processor
+                def current_processor():
+                    if preprocessor.renderer is not renderer:
+                        raise ValueError('multimodal renderer changed')
+                    return renderer.mm_processor
+            else:
+                mm_processor = preprocessor._get_mm_processor()
+                def current_processor():
+                    return preprocessor._get_mm_processor()
             hf_processor = mm_processor.info.get_hf_processor()
             feature = hf_processor.feature_extractor
+            original_model_config = preprocessor.model_config
+            original_hf_config = original_model_config.hf_config
+            original_mm_config = getattr(original_model_config, 'multimodal_config', None)
+            if vllm_version == '0.28.0':
+                tokenizer = hf_processor.tokenizer
+                # vLLM may give the processor a deep-copied tokenizer; compare
+                # placeholder IDs while tracking each tokenizer independently.
+                renderer_tokenizer = renderer.tokenizer
 
             def signature():
                 # Reject replacement processors and user overrides, rather than
                 # reusing counts across different preprocessing semantics.
-                if preprocessor._get_mm_processor() is not mm_processor:
+                if current_processor() is not mm_processor:
                     raise ValueError('multimodal processor changed')
                 if (_type_id(mm_processor) != _MM_TYPE
                         or _type_id(hf_processor) != _HF_TYPE
@@ -82,6 +108,24 @@ class AudioTokenCounter:
                         or hf_processor.feature_extractor is not feature):
                     raise ValueError('unverified audio processor classes')
                 model_config = preprocessor.model_config
+                if model_config is not original_model_config or model_config.hf_config is not original_hf_config:
+                    raise ValueError('model configuration changed')
+                if vllm_version == '0.28.0' and mm_processor.info.get_hf_processor() is not hf_processor:
+                    raise ValueError('Hugging Face processor changed')
+                if vllm_version == '0.28.0':
+                    if (renderer.tokenizer is not renderer_tokenizer or hf_processor.tokenizer is not tokenizer
+                            or getattr(model_config, 'multimodal_config', None) is not original_mm_config):
+                        raise ValueError('tokenizer or multimodal configuration changed')
+                    token_id = tokenizer.convert_tokens_to_ids(hf_processor.audio_token)
+                    if isinstance(token_id, bool) or not isinstance(token_id, Integral) or token_id < 0:
+                        raise ValueError('invalid audio placeholder token ID')
+                    if renderer_tokenizer.convert_tokens_to_ids(hf_processor.audio_token) != token_id:
+                        raise ValueError('audio placeholder token IDs differ')
+                    for candidate in (tokenizer, renderer_tokenizer):
+                        if candidate.encode(hf_processor.audio_token, add_special_tokens=False) != [token_id]:
+                            raise ValueError('audio placeholder is not a single matching token')
+                else:
+                    token_id = None
                 if model_config.hf_config.model_type != 'qwen3_omni_moe':
                     raise ValueError('unverified model type')
                 if getattr(model_config, 'mm_processor_kwargs', None):
@@ -97,12 +141,12 @@ class AudioTokenCounter:
                 if any(not isinstance(value, (str, int, float, bool, type(None)))
                        for value in values):
                     raise ValueError('non-scalar feature configuration')
-                return values
+                return (values, int(token_id)) if token_id is not None else values
 
             counter._signature = signature()
             counter._signature_reader = signature
             counter.mode = 'length_lru'
-            counter.reason = 'native vLLM 0.11.1 / Transformers 4.57.1 Qwen3-Omni'
+            counter.reason = f'native vLLM {vllm_version} / Transformers {transformers_version} Qwen3-Omni'
         except Exception as exc:
             # The optional optimization must never prevent a previously valid
             # installation from starting.  Exact preprocessing remains intact.

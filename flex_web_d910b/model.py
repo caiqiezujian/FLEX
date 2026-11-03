@@ -323,8 +323,8 @@ class ModelEngine:
                           'length': round(opts.max_chunk_seconds * SAMPLE_RATE)},
                 'image': opts.image_slots, 'video': 0},
             mm_processor_cache_gb=opts.mm_processor_cache_gb, seed=opts.seed)
-        # Never preprocess separately through the live engine's mirrored MM
-        # sender cache. This independent, uncached counter touches only new audio.
+        # Use a separate counter, never the live engine's mirrored MM sender
+        # cache. On newer vLLM this renderer may have its own configured cache.
         self.counter = make_audio_preprocessor(InputPreprocessor, self.llm.llm_engine, self.tok)
         self._audio_token_counter = AudioTokenCounter.for_preprocessor(
             self.counter, vllm_version=vllm.__version__,
@@ -336,6 +336,10 @@ class ModelEngine:
         LOG.info('Audio token counter mode=%s entries=%s reason=%s',
                  self._audio_token_counter.mode, opts.audio_token_cache_size,
                  self._audio_token_counter.reason)
+        if opts.audio_token_cache_size:
+            print(f'[FLEX] Audio token counter mode={self._audio_token_counter.mode} '
+                  f'entries={opts.audio_token_cache_size} '
+                  f'reason={self._audio_token_counter.reason}', flush=True)
         self.sampling = SamplingParams(
             temperature=0.0, top_p=1.0, top_k=-1, repetition_penalty=1.0,
             max_tokens=opts.max_tokens, seed=opts.seed,

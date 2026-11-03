@@ -41,3 +41,11 @@ ASCEND_RT_VISIBLE_DEVICES=0 python3 -m flex_web_d910b.smoke_audio \
 此命令每秒推理一次并打印标签、译文和生成耗时；任一轮协议校验失败会停止，不将不合法的结果提交到历史。
 
 代码根据已安装 vLLM 的 `InputPreprocessor` 构造签名区分旧版 `model_config/tokenizer` 和新版 `vllm_config`；音频 token 数通过独立预处理器计算并在真实生成后校验，缺少实际 token 或校验不符均拒绝提交。此接口和多模态数据结构依赖 vLLM 内部实现，API 静态适配不代表运行已验证。需要在实际服务器依次验证：模型加载、真实音频及三标签、多轮历史裁剪、两方向以及 1～2 人并发的时延和译文质量。
+
+## 实验：音频 token 计数复用
+
+默认关闭。在原 Web 启动命令末尾添加 `--audio-token-cache-size 64` 可申请启用；`0` 是关闭。仅在 **vLLM 0.28.0 + Transformers 5.6.2 或 5.5.3** 的原生 Qwen3-Omni/Whisper 处理链和固定配置检查通过时才启用，其他版本、处理器或自定义参数回退逐块精确计数，既不升级依赖也不猜算 token 数。首次遇到一种实际采样长度仍精确计算，再复用该整数；真实音频始终照常送入模型。缓存容量有界，不保存波形或译文。
+
+查看启动日志 `Audio token counter mode=length_lru` 是否真正启用；`mode=exact` 代表没有启用并说明原因。导出的 JSON 每轮 `timings.audio_count_mode`、`audio_count_cache_hit`、`audio_count_s`、`engine_generate_s` 可用于 A/B。`request_prepare_s` 已包含 `audio_count_s`，不要相加。即便启用后也继续校验 vLLM 返回的输入 token 数；如果缺失或总数不一致，会关闭计数缓存并拒绝本轮提交，不会自动重试。
+
+可在 `smoke_audio.py` 中加 `--audio-token-cache-size 64` 检查逐轮模式和命中；为对照当前 Web 的组合配置，可同时加 `--mm-processor-cache-gb 1 --enable-graphs` 和实际使用的 `--enable-prefix-caching`。单独计数预处理器在新版 vLLM 中有独立 renderer，其多模态缓存也会按配置占用主机内存；它不与正式引擎的 sender cache 共享。需在真实 910B、实际 checkpoint 和 Transformers 版本上对比缓存开关，覆盖不同音频、尾块与裁窗，确认翻译、标签、计数和实际延迟。静态源码检查及模拟测试不代表真机无冲突或保证提速。
