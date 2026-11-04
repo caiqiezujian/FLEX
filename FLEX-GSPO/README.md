@@ -92,20 +92,6 @@ bash 06_train_qalco_v4.sh \
 
 4 卡与 8 卡均可在新实验中选择；卡数/DP 布局已纳入运行身份，不能把旧四卡原生 checkpoint 当作八卡的精确断点继续。物理 GPU 编号变动而卡数保持一致，不会仅因此改变运行身份。该适配在本地通过启动器与模拟多卡逻辑检查；真实八卡 CUDA/NCCL、显存峰值和吞吐仍需服务器实测，不能据此保证两倍速度。
 
-### 初始化 offload 的 CUDA 错误诊断
-
-若错误位于 `offload_megatron_model_to_cpu` 的 `param.data.to('cpu', non_blocking=True)`，这发生在首次 vLLM 引擎创建之前，不是已进入奖励计算。仅凭 `CUDA error: invalid argument` 不能确定张量存储、前序异步操作或运行环境中的哪一项有问题；不能跳过失败参数或直接关闭 offload 后声称修复。
-
-当前入口支持可选 `--debug-offload`。在原训练命令末尾追加 `--debug-offload --train-iters 2 --save-steps 2`，并将第三个位置参数改为一个**新的诊断输出目录**。该开关在 shell 清除旧调试变量之后设置 `CUDA_LAUNCH_BLOCKING=1`，关闭耗时的 C++ 地址符号化，并在 offload 入口、出口同步 CUDA。失败时打印 `[FLEX offload]` 参数名称、shape、stride、storage 大小/偏移、与 DDP buffer 的关联及原始异常；不打印参数值、源文或音频，不改变原搬运算法，不重试或吞掉异常。正常训练不加此开关，避免额外同步开销。
-
-将整个命令末尾接 `2>&1 | tee /tmp/flex_gspo_offload_debug.log` 可保存终端日志，之前先执行 `set -o pipefail` 以保留训练失败的退出状态。结束后运行：
-
-~~~bash
-grep -E '\[FLEX offload\]|AcceleratorError|CUDA error|Traceback' /tmp/flex_gspo_offload_debug.log | tail -n 100
-~~~
-
-日志中的失败位置仍需结合同步阶段与存储信息解释；此功能用于采证，不代表 CUDA 问题已经修复。如果两步通过，只能说明该次诊断没有复现，不能证明长期训练无故障。
-
 验证由用户自行安排；如需 GPU 采样、更新、保存的两步短验收，可在另一个新目录追加 `--train-iters 2 --save-steps 2`，它不是正式训练的启动条件。新版 normalized reward 的均值不能当作质量上升曲线；TensorBoard 应同时看原始 `quality/mean`、`latency_seconds/mean`、空译/格式错误比例、组内质量标准差和 `estimated_advantage`，翻译改善仍需固定验证样本。分项缩放不能修复 COMET 未识别的否定范围、漏译或幻觉错误。
 
 v4 启动器不调用 `Scripts/check_comet22_service.py`，不在启动前请求 COMET 做语义或评分预检。该脚本和 `configs/quality_regressions_v4.jsonl` 保留为独立手工诊断，运行时机及结果审查由用户自行安排；检查结果不作为训练启动条件，对照文件也不纳入 `run_identity` 恢复身份。取消预检不表示 COMET 的误判已解决，通过少量对照也不能保证真实数据没有误判。启动时的数据、框架和恢复一致性检查，以及训练运行时的服务响应校验继续保留；COMET22 与现有 v4 奖励公式、参数不变。

@@ -228,19 +228,6 @@ class TestMegatronLauncher(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "rollout-log-every"):
             launcher.build_command(self.args("--rollout-log-every", "0"))
 
-    def test_offload_debug_is_opt_in_and_keeps_upstream_training_command(self):
-        normal = self.args("--global-batch-size", "64", "--gpu-ids", "0,1,2,3,4,5,6,7")
-        debug = self.args("--global-batch-size", "64", "--gpu-ids", "0,1,2,3,4,5,6,7", "--debug-offload")
-        self.assertEqual(launcher.build_command(normal), launcher.build_command(debug))
-        with patch.dict(launcher.os.environ, {"FLEX_DEBUG_OFFLOAD": "1", "CUDA_LAUNCH_BLOCKING": "0"}):
-            self.assertNotIn("FLEX_DEBUG_OFFLOAD", launcher.build_environment(normal))
-            self.assertEqual(launcher.build_environment(normal)["CUDA_LAUNCH_BLOCKING"], "0")
-            env = launcher.build_environment(debug)
-        self.assertEqual(env["FLEX_DEBUG_OFFLOAD"], "1")
-        self.assertEqual(env["CUDA_LAUNCH_BLOCKING"], "1")
-        self.assertEqual(env["TORCH_SHOW_CPP_STACKTRACES"], "0")
-        self.assertEqual(env["TORCH_DISABLE_ADDR2LINE"], "1")
-
     def test_formal_3000_recipe_keeps_accepted_batch_and_disables_audio_log_reencode(self):
         script = (ROOT / "03_train_3000.sh").read_text(encoding="utf-8")
         command = script[script.index("exec bash "):].replace("\\\n", " ")

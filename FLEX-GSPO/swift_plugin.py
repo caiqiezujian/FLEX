@@ -20,7 +20,6 @@ from flex_gspo.audio import materialize_chunk_refs
 from flex_gspo.online import FlexStreamHooks
 from flex_gspo.online_reward import OnlineQalcoReward, load_reward_config
 from flex_gspo.rollout_sync import install_rollout_sync_patch
-from flex_gspo.offload_diagnostics import install_offload_diagnostics
 from flex_gspo.group_reward import install_group_reward_patch, is_group_scoring_active
 from flex_gspo.rewards import RewardError
 
@@ -39,7 +38,6 @@ class FlexStreamScheduler(FlexStreamHooks, MultiTurnScheduler):
         # The trainer module is fully imported now; only patch its FLEX path.
         # The vLLM process group is looked up later, after engine creation.
         install_rollout_sync_patch()
-        install_offload_diagnostics()
         if load_reward_config()["reward"].get("version", 1) in (3, 4):
             install_group_reward_patch()
         super().__init__(*args, **kwargs)
