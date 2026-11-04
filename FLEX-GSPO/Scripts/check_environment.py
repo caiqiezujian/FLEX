@@ -123,9 +123,6 @@ def inventory(model: str | None = None, require_training: bool = False, required
         from flex_gspo.rollout_sync import validate_rollout_sync_source
         result["flex_rollout_sync"] = validate_rollout_sync_source(
             (root / "swift/megatron/trainers/rollout_mixin.py").read_text(encoding="utf-8"))
-        from flex_gspo.offload_compat import validate_offload_source
-        result["flex_model_offload"] = validate_offload_source(
-            (root / "swift/megatron/trainers/utils.py").read_text(encoding="utf-8"))
         if os.environ.get("FLEX_REWARD_CONFIG"):
             from flex_gspo.online_reward import load_reward_config
             config = load_reward_config()

@@ -96,14 +96,6 @@ bash 06_train_qalco_v4.sh \
 
 v4 启动器不调用 `Scripts/check_comet22_service.py`，不在启动前请求 COMET 做语义或评分预检。该脚本和 `configs/quality_regressions_v4.jsonl` 保留为独立手工诊断，运行时机及结果审查由用户自行安排；检查结果不作为训练启动条件，对照文件也不纳入 `run_identity` 恢复身份。取消预检不表示 COMET 的误判已解决，通过少量对照也不能保证真实数据没有误判。启动时的数据、框架和恢复一致性检查，以及训练运行时的服务响应校验继续保留；COMET22 与现有 v4 奖励公式、参数不变。
 
-### 模型 CPU 卸载兼容
-
-FLEX 自动安装 `flex_gspo/offload_compat.py`，不需要诊断参数或修改已安装的 SWIFT 文件。针对首次模型卸载在 `torch.empty(device='cpu', pin_memory=True)` 报 CUDA invalid argument 的路径，将这一处申请改为 `pin_memory=False`，使用并复用普通 CPU 缓冲区。没有捕获后忽略 CUDA 错误，也不跳过参数或训练步骤。
-
-卸载前等待模型所在 CUDA 设备上的操作完成；保留上游 DDP buffer 的存储记录、重用以及“同步复制完成后释放 GPU 存储”的顺序。冻结参数及参考模型的 CPU 搬运改为同步，避免 `non_blocking=True` 隐式申请锁页内存。优化器卸载仍采用上游实现。没有新增诊断刷屏，CPU 到 GPU 的恢复可能变慢；奖励、batch、并行布局均不变。
-
-这项修改提供锁页分配失败的兼容路径，并不能证明服务器的驱动、主机锁页资源或全部 CUDA 状态正常。本地测试覆盖控制流程及数据存储约定；真实 4/8 卡启动、更新和保存仍以服务器运行结果为准。
-
 ## 历史实验入口：QALCO v3
 
 2026-10-23 新增 **05_train_qalco_v3.sh + configs/qalco_v3.json**：质量门控时延、完整同音频 G8 的质量约束长度基准、局部循环复读成本。只使用已有 COMET22 服务，不增加模型服务，不重做数据，不改变已跑通的四卡 Megatron 在线 GSPO 流程。
