@@ -498,6 +498,137 @@ class SourceContractTests(unittest.TestCase):
             self.assertIsNone(record["components"]["latency_seconds"])
         self.assertGreater(trainers[2].reward_funcs[0].scorer.last_records[-1]["components"]["group_brevity_excess"], 0.)
 
+    def test_v4_eight_ranks_match_complete_g8_rewards_for_aligned_and_split_groups(self):
+        from flex_gspo.normalized_reward import finalize_group
+        from flex_gspo.online_reward import OnlineQalcoReward, load_reward_config
+        from flex_gspo.qalco import QalcoScorer
+
+        config = load_reward_config(ROOT / "configs" / "qalco_v4.json")
+        options = ["我们在北京开会。", "我们今天在北京开会。", "今天我们正在北京开会。",
+                   "今天我们在北京举行会议。", "今天我们在北京举行年度会议。",
+                   "今天我们正在北京举行年度会议。", "今天我们正在北京举行年度预算会议。",
+                   "今天我们在北京开会，讨论明年的预算、具体安排和需要解决的其他事项。"]
+
+        class Quality:
+            def score_batch(self, source, hypotheses, reference):
+                group = int(source.rsplit(" ", 1)[-1])
+                scores = [.90, .89, .88, .87, .86, .85, .72, .84]
+                return [scores[options.index(text)] + group * .002 for text in hypotheses]
+
+        # B64 gives each rank one complete G8. B32 (micro1) also verifies G8
+        # spanning two ranks; a rank-local finalizer would give wrong moments.
+        for batch_size in (64, 32):
+            with self.subTest(generation_batch_size=batch_size):
+                local_count = batch_size // 8
+                tasks, trajectories, samples, expected = [], [], [], []
+                reference_scorer = QalcoScorer(config, quality_model=Quality())
+                for group in range(batch_size // 8):
+                    task = {"id": f"v4-task-{group}", "source_lang": "en", "target_lang": "zh",
+                            "source_text": f"Today we meet in Beijing and discuss the annual budget. Group {group}",
+                            "reference_text": "今天我们在北京开会，讨论年度预算。", "duration_seconds": 2.,
+                            "chunks": [{"end_seconds": 1.}, {"end_seconds": 2.}]}
+                    current = []
+                    for index in range(8):
+                        empty = group == 0 or (group == 1 and index < 2)
+                        early = index % 3 == 0
+                        current.append({"schema_version": 2, "valid": True, "error": None, "complete_input": True,
+                                        "episode_complete": True, "eof_completed": True, "turns": [
+                            {"kind": "audio", "response": "<|DIRECT|>" + options[index]
+                             if early and not empty else "<|WAIT|>", "audio_end_seconds": 1.,
+                             "finish_reason": "stop"},
+                            {"kind": "audio", "response": "<|DIRECT|>" + options[index]
+                             if not early and not empty else "<|WAIT|>", "audio_end_seconds": 2.,
+                             "finish_reason": "stop"},
+                            {"kind": "eof", "response": "<|WAIT|>", "audio_end_seconds": 2.,
+                             "finish_reason": "stop", "eof_elapsed_seconds": .01}]})
+                    # Independent full-group scoring is the oracle, before any
+                    # distributed rank slicing or metadata reconstruction.
+                    provisional = reference_scorer.score_group(task, current)
+                    items = []
+                    for record in provisional:
+                        c = record["components"]
+                        items.append({"eligible": c["eligible"], "quality": c.get("quality"),
+                                      "latency": c.get("latency_seconds"), "units": c["emitted_units"],
+                                      "repetition": c["repetition_penalty"], "reward": record["reward"]})
+                    expected.extend(finalize_group(items, reference_scorer.settings))
+                    tasks.extend([task] * 8)
+                    trajectories.extend(current)
+                    samples.extend(_sample(task, f"v4-g{group}-c{index}", f"v4-prompt-{group}")
+                                   for index in range(8))
+
+                trainers = []
+                for rank in range(8):
+                    with patch("flex_gspo.online_reward.LOG.warning"):
+                        adapter = OnlineQalcoReward(config, scorer=QalcoScorer(config, quality_model=Quality()),
+                                                   log_dir="")
+                    trainer = _trainer(rank, [], size=8)
+                    trainer.num_generations, trainer.generation_batch_size = 8, batch_size
+                    trainer.scale_rewards = "none"
+                    trainer.reward_funcs = [SimpleNamespace(scorer=adapter)]
+                    trainers.append(trainer)
+                collective = Collective(size=8)
+                results, errors, contexts = {}, {}, {}
+
+                def run(rank):
+                    start, stop = rank * local_count, (rank + 1) * local_count
+
+                    def original(current, local_samples):
+                        adapter = current.reward_funcs[0].scorer
+                        values = adapter(["LAST RESPONSE NOT FULL TRANSLATION"] * local_count,
+                                         flex_task=tasks[start:stop],
+                                         rollout_infos=[{"flex_trajectory": value} for value in trajectories[start:stop]],
+                                         request_id=[sample.request_id for sample in local_samples],
+                                         prompt_id=[sample.prompt_id for sample in local_samples],
+                                         trainer_state=current.state)
+                        self.assertEqual(adapter._calls, 0)
+                        return FakeTensor([[value] for value in values])
+                    try:
+                        results[rank] = run_group_reward_scoring(
+                            trainers[rank], samples[start:stop], original, collective.for_rank(rank),
+                            finalizer=finalize_group)
+                    except BaseException as exc:
+                        errors[rank] = exc
+                    finally:
+                        contexts[rank] = is_group_scoring_active()
+
+                threads = [Thread(target=run, args=(rank,), daemon=True) for rank in range(8)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(6)
+                self.assertFalse(any(thread.is_alive() for thread in threads), "An eight-rank reward peer hung")
+                self.assertEqual(errors, {})
+                self.assertEqual(collective.counts, [2] * 8)
+                self.assertEqual(contexts, {rank: False for rank in range(8)})
+                group_ids = {}
+                for rank, trainer in enumerate(trainers):
+                    adapter = trainer.reward_funcs[0].scorer
+                    self.assertEqual(adapter._calls, 1)
+                    self.assertEqual(len(adapter.last_records), local_count)
+                    self.assertEqual(results[rank].values, [[record["reward"]] for record in adapter.last_records])
+                    for offset, record in enumerate(adapter.last_records):
+                        index = rank * local_count + offset
+                        group, candidate = divmod(index, 8)
+                        c, oracle = record["components"], expected[index]
+                        self.assertAlmostEqual(record["reward"], oracle["reward"], places=12)
+                        for key in ("normalized_quality", "normalized_latency", "estimated_advantage",
+                                    "group_length_anchor", "group_eligible_count", "group_all_invalid"):
+                            self.assertEqual(c[key], oracle[key], key)
+                        self.assertEqual((c["global_group_index"], c["group_candidate_index"], c["group_size"]),
+                                         (group, candidate, 8))
+                        self.assertEqual(c["group_prompt_id"], samples[index].prompt_id)
+                        self.assertEqual(c["group_request_id"], samples[index].request_id)
+                        self.assertEqual(record["trajectory"], trajectories[index])
+                        group_ids.setdefault(group, set()).add(c["global_group_id"])
+                        if group == 0:
+                            self.assertEqual(c["estimated_advantage"], 0.)
+                        if group == 1 and candidate < 2:
+                            self.assertEqual(c["error"], "no measurable translation")
+                            self.assertIsNone(c["quality"])
+                            self.assertLess(record["reward"], min(row["reward"] for row in expected[10:16]))
+                self.assertTrue(all(len(ids) == 1 for ids in group_ids.values()))
+                self.assertEqual(len(set().union(*group_ids.values())), batch_size // 8)
+
 
 if __name__ == "__main__":
     unittest.main()

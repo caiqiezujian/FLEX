@@ -28,7 +28,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("dataset", help="Prepared train.jsonl, NOT trajectories.jsonl")
     p.add_argument("output", help="New run directory, or existing run with --resume-from")
     p.add_argument("--reward-config", default=str(ROOT / "configs" / "default.json"))
-    p.add_argument("--gpu-ids", default=os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,2,3"))
+    p.add_argument("--gpu-ids", default=os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,2,3"),
+                   help="Four or eight distinct local GPU IDs; eight GPUs with G8/micro2 require global batch >=64")
     p.add_argument("--group-size", type=int, default=8)
     p.add_argument("--global-batch-size", type=int, default=16)
     p.add_argument("--micro-batch-size", type=int, default=1)
@@ -65,10 +66,21 @@ def parser() -> argparse.ArgumentParser:
     return p
 
 
+def parallel_layout(a: argparse.Namespace) -> dict[str, int]:
+    """Single-node TP2/EP2 training, with independent four-GPU rollout engines."""
+    gpu_ids = [x.strip() for x in a.gpu_ids.split(",")]
+    if len(gpu_ids) not in (4, 8) or not all(gpu_ids) or len(set(gpu_ids)) != len(gpu_ids):
+        raise ValueError("This recipe requires four or eight distinct GPU IDs, e.g. "
+                         "--gpu-ids 0,1,2,3 or --gpu-ids 0,1,2,3,4,5,6,7")
+    world_size = len(gpu_ids)
+    return {"world_size": world_size, "tensor_parallel_size": 2, "expert_parallel_size": 2,
+            "pipeline_parallel_size": 1, "context_parallel_size": 1,
+            "data_parallel_size": world_size // 2,
+            "vllm_tensor_parallel_size": 4, "vllm_replicas": world_size // 4}
+
+
 def validate_options(a: argparse.Namespace) -> None:
-    gpu_ids = [x.strip() for x in a.gpu_ids.split(",") if x.strip()]
-    if len(gpu_ids) != 4 or len(set(gpu_ids)) != 4:
-        raise ValueError("This recipe requires four distinct GPU IDs, e.g. --gpu-ids 0,1,2,3")
+    layout = parallel_layout(a)
     for name in ("group_size", "global_batch_size", "micro_batch_size", "steps_per_generation", "train_iters",
                  "max_turns", "max_length", "max_new_tokens", "lora_rank", "save_steps", "vllm_max_num_seqs", "dataset_num_proc", "rollout_log_every"):
         if getattr(a, name) <= 0:
@@ -78,13 +90,18 @@ def validate_options(a: argparse.Namespace) -> None:
     generation_batch = a.global_batch_size * a.steps_per_generation
     if generation_batch % a.group_size:
         raise ValueError("global-batch-size * steps-per-generation must be divisible by group-size")
-    # TP2/PP1/CP1 on four cards => DP2. EP is not a further divisor of DP.
-    if (generation_batch // a.group_size) % (2 * a.micro_batch_size):
-        raise ValueError("Prompt count per generation must be divisible by DP(2) * micro-batch-size")
-    if a.global_batch_size % (2 * a.micro_batch_size):
-        raise ValueError("global-batch-size must be divisible by DP(2) * micro-batch-size")
-    if generation_batch < 4:
-        raise ValueError("Four ranks require at least four trajectories per generation batch")
+    # EP is not a further divisor of DP. TP2/PP1/CP1 => DP2 on four GPUs, DP4 on eight.
+    dp_size = layout["data_parallel_size"]
+    if (generation_batch // a.group_size) % (dp_size * a.micro_batch_size):
+        raise ValueError(f"Prompt count per generation must be divisible by DP({dp_size}) * micro-batch-size. "
+                         f"With G{a.group_size}/micro{a.micro_batch_size}, generation batch must be a multiple "
+                         f"of {a.group_size * dp_size * a.micro_batch_size}; generation batch = "
+                         "global-batch-size * steps-per-generation.")
+    if a.global_batch_size % (dp_size * a.micro_batch_size):
+        raise ValueError(f"global-batch-size must be divisible by DP({dp_size}) * micro-batch-size")
+    if generation_batch < layout["world_size"] or generation_batch % layout["world_size"]:
+        raise ValueError("Generation batch must be at least the GPU count and divisible by it, "
+                         "so each rollout rank owns the same number of trajectories")
     if not 0 < a.vllm_memory < 0.9:
         raise ValueError("--vllm-memory must be between 0 and 0.9; GPUs are shared with training")
     if not all(math.isfinite(v) for v in (a.lr, a.temperature, a.kl_beta, a.lora_alpha, a.vllm_memory,
@@ -111,12 +128,13 @@ def load_settings(a: argparse.Namespace) -> dict:
 def build_command(a: argparse.Namespace, *, reward_settings=None) -> list[str]:
     """Flags checked against the audited upstream implementation."""
     validate_options(a)
+    layout = parallel_layout(a)
     settings = load_settings(a) if reward_settings is None else reward_settings
     # v4 normalizes quality and gated delay inside complete prompt groups.
     # Upstream still subtracts the group mean; a second std division would
     # amplify near-ties again and undo the configured component scale floors.
     scale_rewards = "none" if settings["version"] == 4 else "group"
-    cmd = [sys.executable, "-m", "torch.distributed.run", "--nproc_per_node", "4", "--nnodes", "1",
+    cmd = [sys.executable, "-m", "torch.distributed.run", "--nproc_per_node", str(layout["world_size"]), "--nnodes", "1",
            "--master_port", str(a.master_port), "--module", "swift.cli._megatron.rlhf"]
     pairs = {
         "rlhf_type": "grpo", "model": a.model, "model_type": "qwen3_omni_moe",
@@ -130,8 +148,10 @@ def build_command(a: argparse.Namespace, *, reward_settings=None) -> list[str]:
         "tuner_type": "lora", "lora_rank": a.lora_rank, "lora_alpha": a.lora_alpha,
         "target_modules": "all-linear", "freeze_llm": "false", "freeze_vit": "true",
         "freeze_aligner": "true", "bf16": "true", "bridge_backend": "mcore-bridge",
-        "tensor_model_parallel_size": "2", "expert_model_parallel_size": "2",
-        "pipeline_model_parallel_size": "1", "context_parallel_size": "1",
+        "tensor_model_parallel_size": layout["tensor_parallel_size"],
+        "expert_model_parallel_size": layout["expert_parallel_size"],
+        "pipeline_model_parallel_size": layout["pipeline_parallel_size"],
+        "context_parallel_size": layout["context_parallel_size"],
         "sequence_parallel": "true", "padding_free": "false",
         "moe_grouped_gemm": "true", "moe_permute_fusion": "true", "moe_aux_loss_coeff": "0",
         "recompute_granularity": a.recompute_granularity,
@@ -143,7 +163,7 @@ def build_command(a: argparse.Namespace, *, reward_settings=None) -> list[str]:
         "max_length": a.max_length, "max_completion_length": a.max_new_tokens,
         "completion_length_limit_scope": "per_round", "max_turns": a.max_turns,
         "temperature": a.temperature, "top_p": "1", "top_k": "-1", "repetition_penalty": "1",
-        "use_vllm": "true", "vllm_mode": "colocate", "vllm_tensor_parallel_size": "4",
+        "use_vllm": "true", "vllm_mode": "colocate", "vllm_tensor_parallel_size": layout["vllm_tensor_parallel_size"],
         "vllm_enable_lora": "false", "vllm_gpu_memory_utilization": a.vllm_memory,
         "vllm_max_model_len": a.max_length + a.max_new_tokens,
         "vllm_max_num_seqs": a.vllm_max_num_seqs, "vllm_enforce_eager": "true",
@@ -303,6 +323,8 @@ def run_identity(a: argparse.Namespace, manifest: dict) -> dict:
     settings = {k: v for k, v in vars(a).items() if k not in ignored}
     source_files = [ROOT / "swift_plugin.py", ROOT / "train_megatron.py", *sorted((ROOT / "flex_gspo").glob("*.py"))]
     identity = {"schema": 1, "framework_commit": AUDITED_SWIFT_COMMIT, "model_path": str(model),
+            # Physical device IDs may change; world size/DP may not change during exact resume.
+            "parallelism": parallel_layout(a),
             "model_metadata_sha256": model_metadata, "weight_file_metadata": weights,
             "dataset_sha256": manifest["sha256"], "dataset_tasks": manifest["tasks"],
             "reward_config_sha256": hash_file(Path(a.reward_config)), "settings": settings,
@@ -325,7 +347,7 @@ def verify_resume_identity(a: argparse.Namespace, identity: dict) -> None:
     if not prior:
         raise ValueError("Cannot verify resume: no launch_*.json run identity beside the original checkpoint/run")
     if not any(old == identity for old in prior):
-        raise ValueError("Resume rejected: model/data/reward/code or training settings differ from the original run. "
+        raise ValueError("Resume rejected: model/data/reward/code, parallelism or training settings differ from the original run. "
                          "Restore the original configuration, including train-iters/LR horizon, or start a new run.")
 
 
@@ -334,12 +356,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         settings = load_settings(a)
         cmd, env = build_command(a, reward_settings=settings), build_environment(a)
+        layout = parallel_layout(a)
         if a.vllm_mm_processor_cache_gb > 0:
             print("[launch] WARNING: Multimodal caches are enabled explicitly. This removes the default "
                   "bypass for the observed vLLM 0.19.1 cache-clear hang; verify an upstream fix and a "
                   "multi-step sleep/wake test before a long run. KV prefix caching is independent.",
                   file=sys.stderr, flush=True)
         plan = {"audited_swift_commit": AUDITED_SWIFT_COMMIT, "argv": cmd,
+                "parallelism": layout,
                 "reward_settings": settings,
                 "quality_validation": {"mode": "manual", "automatic_service_probe": False},
                 "reward_normalization": {
@@ -376,7 +400,7 @@ def main(argv: list[str] | None = None) -> int:
         print("[launch] Quality validation is manual; no startup scoring probe. "
               "Training rewards continue to use COMET22.", flush=True)
         subprocess.run([sys.executable, str(ROOT / "Scripts" / "check_environment.py"), "--model", a.model,
-                        "--require-training", "--required-gpus", "4"], env=env, check=True)
+                        "--require-training", "--required-gpus", str(layout["world_size"])], env=env, check=True)
         output = Path(a.output)
         output.mkdir(parents=True, exist_ok=True)
         stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
@@ -385,7 +409,9 @@ def main(argv: list[str] | None = None) -> int:
         plan.update(run_id=env["FLEX_RUN_ID"], session_id=env["FLEX_SESSION_ID"])
         with (output / f"launch_{stamp}.json").open("x", encoding="utf-8") as f:
             json.dump(plan, f, ensure_ascii=False, indent=2)
-        print("[launch] Starting four ranks; fresh online rollouts, no offline candidate file.", flush=True)
+        print(f"[launch] Starting {layout['world_size']} ranks; training DP={layout['data_parallel_size']}, "
+              f"vLLM TP={layout['vllm_tensor_parallel_size']} x {layout['vllm_replicas']} replicas; "
+              "fresh online rollouts, no offline candidate file.", flush=True)
         return subprocess.run(cmd, env=env, check=False).returncode
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
         print(f"[launch] ERROR: {exc}", file=sys.stderr, flush=True)

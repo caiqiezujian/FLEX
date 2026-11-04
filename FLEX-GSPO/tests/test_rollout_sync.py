@@ -1,4 +1,4 @@
-"""Run the actual upstream turn loop on four simulated distributed ranks.
+"""Run the actual upstream turn loop on four or eight simulated ranks.
 
 The simulator fails promptly on a departed collective participant; it does not
 need CUDA, NCCL, model weights or a distributed process group. The loop and the
@@ -50,12 +50,13 @@ class CollectiveParticipationError(RuntimeError):
 class Collectives:
     """Blocking all-gather semantics, with explicit collective-order checks."""
 
-    def __init__(self):
+    def __init__(self, ranks=WORLD):
         self.condition = Condition()
         self.exited = set()
         self.counters = {}
         self.rounds = {}
-        self.inference_calls = {rank: [] for rank in WORLD}
+        self.inference_calls = {rank: [] for rank in ranks}
+        self.engine_requests = {rank: [] for rank in ranks}
 
     def gather(self, rank, group, kind, values):
         group = tuple(group)
@@ -111,12 +112,12 @@ def _request(rank, turns):
                            images=[], videos=[], chat_template_kwargs={})
 
 
-def _output(invalid=False):
+def _output(invalid=False, owner=None):
     ids = [3, 151645] if invalid else [151676, 151645]
     choice = SimpleNamespace(message=SimpleNamespace(content="BAD" if invalid else "<|WAIT|>"),
                              token_ids=ids, finish_reason="stop",
                              logprobs={"content": [{"logprob": -.1} for _ in ids]})
-    return SimpleNamespace(response=SimpleNamespace(choices=[choice]))
+    return SimpleNamespace(response=SimpleNamespace(choices=[choice], owner=owner))
 
 
 @unittest.skipUnless((SWIFT / "swift/rollout/agent_loop.py").exists(), "Set FLEX_SWIFT_SOURCE to the audited checkout")
@@ -134,9 +135,23 @@ class FourRankRolloutTests(unittest.TestCase):
         _compile_definitions("swift/rollout/agent_loop.py", ["extract_logprobs_from_choice", "_identity_gather",
                              "_run_multi_turn_impl"], namespace)
         cls.namespace = namespace
+        # Exercise the real TP gather/slice implementation in the eight-rank
+        # tests; a fake engine only supplies deterministic model responses.
+        path = SWIFT / "swift/megatron/trainers/rollout_mixin.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        mixin, = [node for node in tree.body if isinstance(node, ast.ClassDef)
+                  and node.name == "MegatronRolloutMixin"]
+        method, = [node for node in mixin.body if isinstance(node, ast.FunctionDef)
+                   and node.name == "_colocate_rollout"]
+        future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
+        module = ast.fix_missing_locations(ast.Module(body=[future, method], type_ignores=[]))
+        cls.colocate_code = compile(module, str(path), "exec")
 
-    def run_case(self, lengths, stop_groups=None, invalid_ranks=()):
-        collective = Collectives()
+    def run_case(self, lengths, stop_groups=None, invalid_ranks=(), engine_groups=None):
+        ranks = tuple(range(len(lengths)))
+        actual_colocate = engine_groups is not None
+        engine_groups = engine_groups or (ranks,) * len(ranks)
+        collective = Collectives(ranks)
         results, errors = {}, {}
         scheduler_type = type("TestFlexScheduler", (FlexStreamHooks, self.namespace["MultiTurnScheduler"]), {})
 
@@ -147,19 +162,41 @@ class FourRankRolloutTests(unittest.TestCase):
                                            template=SimpleNamespace(_get_response_prefix=lambda _: ""), max_turns=8)
                 requests = [_request(rank, lengths[rank])] if lengths[rank] else []
                 loop.run_until_complete(scheduler.on_trajectory_start(requests))
-                first_outputs = [_output(rank in invalid_ranks)] if requests else []
+                first_outputs = [_output(rank in invalid_ranks, owner=requests[0].uuid)] if requests else []
+                engine_group = engine_groups[rank]
+
+                def all_gather_object(output, value, group):
+                    # Real object collectives serialize payloads. Copies keep
+                    # other simulated ranks from mutating this rank's history.
+                    kind = "input-lengths" if isinstance(value, int) else "input-requests"
+                    output[:] = copy.deepcopy(collective.gather(rank, group, kind, [copy.deepcopy(value)]))
+
+                distributed = SimpleNamespace(get_world_size=lambda group: len(group),
+                                              get_rank=lambda group: group.index(rank),
+                                              all_gather_object=all_gather_object)
+
+                def engine_infer(infer_requests, request_config, use_tqdm):
+                    owners = [request.uuid for request in infer_requests]
+                    collective.engine_requests[rank].append(owners)
+                    return [_output(owner=request.uuid) for request in infer_requests]
+
+                trainer = SimpleNamespace(vllm_mode="colocate", vllm_tensor_parallel_size=len(engine_group),
+                                          vllm_tp_group=engine_group, samples2requests=lambda values: values,
+                                          engine=SimpleNamespace(infer=engine_infer),
+                                          args=SimpleNamespace(router_replay_mode=None))
+                namespace = {"torch": SimpleNamespace(distributed=distributed)}
+                exec(self.colocate_code, namespace)
 
                 def infer(batch, config):
                     collective.inference_calls[rank].append([len(req.audios) for req in batch])
-                    collective.gather(rank, WORLD, "vllm-inference", [len(batch)])
-                    return [_output() for _ in batch]
+                    if actual_colocate:
+                        return namespace["_colocate_rollout"](trainer, batch, config)
+                    collective.gather(rank, engine_group, "vllm-inference", [len(batch)])
+                    return [_output(owner=request.uuid) for request in batch]
 
                 if stop_groups is None:
                     # Exercise production group selection, not an idealized
                     # replacement predicate. Data partition groups remain OLD_GROUPS.
-                    trainer = SimpleNamespace(vllm_mode="colocate", vllm_tensor_parallel_size=4,
-                                              vllm_tp_group=WORLD)
-                    distributed = SimpleNamespace(get_world_size=lambda group: len(group))
                     gather = make_completion_gather(
                         trainer,
                         lambda values, group: collective.gather(rank, group, "turn-finished", values),
@@ -177,7 +214,7 @@ class FourRankRolloutTests(unittest.TestCase):
 
         template_stub = SimpleNamespace(StdTemplateInputs=lambda **kwargs: SimpleNamespace(**kwargs))
         with patch.dict("sys.modules", {"swift.template": template_stub}), patch("flex_gspo.rollout_sync.progress"):
-            threads = [Thread(target=run_rank, args=(rank,), daemon=True) for rank in WORLD]
+            threads = [Thread(target=run_rank, args=(rank,), daemon=True) for rank in ranks]
             for thread in threads:
                 thread.start()
             for thread in threads:
@@ -192,6 +229,7 @@ class FourRankRolloutTests(unittest.TestCase):
                 continue
             turns = audio_turns if rank in invalid_ranks else audio_turns + 1
             result, = results[rank]
+            self.assertEqual(result.response.owner, f"candidate-{rank}")
             self.assertEqual(result.rollout_infos["num_turns"], turns)
             self.assertEqual(len(result.rollout_infos["audios"]), audio_turns)
             self.assertEqual(result.response_loss_mask, [[1, 1]] * turns)
@@ -236,6 +274,43 @@ class FourRankRolloutTests(unittest.TestCase):
         self.assertEqual(errors, {})
         self.assert_preserved(results, [0, 0, 0, 0])
         self.assertTrue(all(not calls for calls in collective.inference_calls.values()))
+
+    def test_eight_ranks_two_tp4_engines_finish_independently_and_preserve_ownership(self):
+        groups = ((0, 1, 2, 3),) * 4 + ((4, 5, 6, 7),) * 4
+        lengths = [0, 1, 2, 1, 1, 3, 0, 5]
+        collective, results, errors = self.run_case(lengths, engine_groups=groups)
+        self.assertEqual(errors, {})
+        self.assert_preserved(results, lengths)
+        # The first engine finishes three rounds sooner. Its empty rank must
+        # participate locally, without waiting for the other engine to finish.
+        self.assertEqual([len(collective.inference_calls[rank]) for rank in range(8)], [3] * 4 + [6] * 4)
+        self.assertEqual(collective.inference_calls[0], [[], [], []])
+        self.assertEqual(collective.inference_calls[6], [[], [], [], [], [], []])
+        for group in (groups[0], groups[4]):
+            expected_owners = {f"candidate-{rank}" for rank in group}
+            for rank in group:
+                self.assertEqual(collective.engine_requests[rank], collective.engine_requests[group[0]])
+                self.assertTrue(all(set(batch) <= expected_owners for batch in collective.engine_requests[rank]))
+        self.assertEqual({group for group, _ in collective.rounds}, {groups[0], groups[4]})
+
+    def test_eight_ranks_empty_engine_exits_while_other_engine_completes(self):
+        groups = ((0, 1, 2, 3),) * 4 + ((4, 5, 6, 7),) * 4
+        lengths = [0, 0, 0, 0, 1, 3, 0, 2]
+        collective, results, errors = self.run_case(lengths, engine_groups=groups)
+        self.assertEqual(errors, {})
+        self.assert_preserved(results, lengths)
+        for rank in range(4):
+            self.assertEqual(collective.inference_calls[rank], [])
+        self.assertEqual([len(collective.inference_calls[rank]) for rank in range(4, 8)], [4] * 4)
+
+    def test_eight_ranks_invalid_candidate_does_not_drop_engine_collectives(self):
+        groups = ((0, 1, 2, 3),) * 4 + ((4, 5, 6, 7),) * 4
+        collective, results, errors = self.run_case([1, 2, 0, 1, 5, 1, 0, 4],
+                                                   invalid_ranks={4}, engine_groups=groups)
+        self.assertEqual(errors, {})
+        self.assert_preserved(results, [1, 2, 0, 1, 1, 1, 0, 4], invalid_ranks={4})
+        self.assertFalse(results[4][0].rollout_infos["flex_trajectory"]["complete_input"])
+        self.assertEqual(collective.inference_calls[4], [[], [], [], [], []])
 
 
 if __name__ == "__main__":

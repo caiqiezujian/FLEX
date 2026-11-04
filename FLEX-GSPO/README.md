@@ -35,7 +35,7 @@ v4 的 `0.25` 是失败候选与本组最低有效候选的间隔，不是每个
 
 2026-10-28 新增独立入口 **06_train_qalco_v4.sh + configs/qalco_v4.json**。在完整同音频 G8 内分别缩放质量与门控后的时延，给标准差设置下限；训练框架只再减去组均值，不做第二次标准差归一化。空译、格式错误、严重循环进入明确失败分支，失败分数相对于本组可评分候选设置，减少固定 −4 对组均值的拉低。具体公式、局限和验收见 [QALCO v4 训练说明](docx/QALCO_v4训练说明.md)。
 
-继续使用已有 **COMET22**，无需新增质量模型服务或重新切音频。保留 **G8 / batch32 / micro2 / 3000步 / 每500步保存**，以及现有四卡同步、EOF、offload 和缓存设置；不扩大显存预算。v4 的质量权重 `1.0`、时延权重 `0.25`、连续质量门控及长度/重复成本均不变。
+继续使用已有 **COMET22**，无需新增质量模型服务或重新切音频。默认保留 **四卡 / G8 / batch32 / micro2 / 3000步 / 每500步保存**，以及现有同步、EOF、offload 和缓存设置。也支持通过参数选择八卡，见下方配置；v4 的质量权重 `1.0`、时延权重 `0.25`、连续质量门控及长度/重复成本均不变。
 
 下面 `models/new-sft-merged` **只是模型路径示例，必须替换成确实使用最新短提示词训练的实际 SFT 合并 checkpoint**。数据路径对应[第二批准备说明](docx/第二批数据与COMET22_v4训练.md)中新生成的清单，训练输出使用新目录。
 
@@ -53,6 +53,44 @@ bash 06_train_qalco_v4.sh \
   --train-iters 3000 \
   --save-steps 500
 ~~~
+
+### 同一入口选择 4 卡或 8 卡
+
+`06_train_qalco_v4.sh` 默认四卡；`--gpu-ids` 决定本机进程数和环境检查的 GPU 数量。八卡需要使用包含此次适配的 `train_megatron.py`，旧启动器固定四个进程，不能仅修改 GPU 列表。
+
+| 参数/行为 | 四卡默认 | 八卡配置 |
+| --- | --- | --- |
+| `--gpu-ids` | `0,1,2,3` | `0,1,2,3,4,5,6,7` |
+| `--group-size` | 8 | 8 |
+| `--global-batch-size` | 32 | 64 |
+| `--micro-batch-size` | 2 | 2 |
+| `--steps-per-generation` | 1 | 1 |
+| 每次采样的音频抽样数 × 候选数 | 4 × 8 | 8 × 8 |
+| 训练 TP / EP / DP | 2 / 2 / 2 | 2 / 2 / 4 |
+| vLLM 推理组 | 1 组，每组 TP4 | 2 组，每组 TP4 |
+| 每组 vLLM 显存比例 / 并发上限 | 0.50 / 32 | 0.50 / 32 |
+
+八卡命令示例（模型目录仍需替换为实际 SFT checkpoint）：
+
+~~~bash
+cd /data/yb/Code/FLEX/FLEX-GSPO
+source /data/yb/vens/flex-gspo-online/bin/activate
+bash 06_train_qalco_v4.sh \
+  /data/yb/Code/FLEX/models/new-sft-merged \
+  /data/yb/Code/FLEX/datasets/gspo_prepared_batch2_v4_shortprompt_1102/train.jsonl \
+  /data/yb/Code/FLEX/outputs/gspo_v4_comet22_8gpu_g8_b64_3000_001 \
+  --gpu-ids 0,1,2,3,4,5,6,7 \
+  --group-size 8 \
+  --global-batch-size 64 \
+  --micro-batch-size 2 \
+  --steps-per-generation 1 \
+  --train-iters 3000 \
+  --save-steps 500
+~~~
+
+原数据直接复用，无需重新准备；学习率、KL、LoRA、奖励配置均沿用四卡设置。八卡下 G8/B32/micro2 无法满足 DP4 的 prompt 分配要求，启动器会提示应改 B64；如需维持 B32，可使用 micro1。3000 步 B64 对应 192000 条候选、24000 次音频抽样，约为 3000 步 B32 的两倍；若比较相同采样量，可另设 1500 步 B64，但优化器更新次数和学习率调度也随之变化。
+
+4 卡与 8 卡均可在新实验中选择；卡数/DP 布局已纳入运行身份，不能把旧四卡原生 checkpoint 当作八卡的精确断点继续。物理 GPU 编号变动而卡数保持一致，不会仅因此改变运行身份。该适配在本地通过启动器与模拟多卡逻辑检查；真实八卡 CUDA/NCCL、显存峰值和吞吐仍需服务器实测，不能据此保证两倍速度。
 
 验证由用户自行安排；如需 GPU 采样、更新、保存的两步短验收，可在另一个新目录追加 `--train-iters 2 --save-steps 2`，它不是正式训练的启动条件。新版 normalized reward 的均值不能当作质量上升曲线；TensorBoard 应同时看原始 `quality/mean`、`latency_seconds/mean`、空译/格式错误比例、组内质量标准差和 `estimated_advantage`，翻译改善仍需固定验证样本。分项缩放不能修复 COMET 未识别的否定范围、漏译或幻觉错误。
 

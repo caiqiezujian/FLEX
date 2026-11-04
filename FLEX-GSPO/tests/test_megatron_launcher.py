@@ -32,6 +32,33 @@ class TestMegatronLauncher(unittest.TestCase):
     def test_smoke_batch_alignment(self):
         launcher.build_command(self.args("--group-size", "2", "--global-batch-size", "4", "--train-iters", "2"))
 
+    def test_four_and_eight_gpu_commands_keep_model_sharding_and_reward(self):
+        shared = ("--micro-batch-size", "2", "--vllm-memory", "0.5", "--vllm-max-num-seqs", "32",
+                  "--reward-config", str(ROOT / "configs" / "qalco_v4.json"))
+        before = launcher.build_command(self.args("--gpu-ids", "0,1,2,3", "--global-batch-size", "32", *shared))
+        after_args = self.args("--gpu-ids", "0,1,2,3,4,5,6,7", "--global-batch-size", "64", *shared)
+        after = launcher.build_command(after_args)
+        self.assertEqual(len(before), len(after))
+        changed = {before[index - 1] for index, (old, new) in enumerate(zip(before, after)) if old != new}
+        self.assertEqual(changed, {"--nproc_per_node", "--global_batch_size"})
+        for flag, value in (("--nproc_per_node", "8"), ("--tensor_model_parallel_size", "2"),
+                            ("--expert_model_parallel_size", "2"), ("--vllm_tensor_parallel_size", "4"),
+                            ("--num_generations", "8"), ("--scale_rewards", "none"),
+                            ("--lr", "1e-06"), ("--beta", "0.01")):
+            self.assertEqual(after[after.index(flag) + 1], value)
+        self.assertEqual(launcher.build_environment(after_args)["CUDA_VISIBLE_DEVICES"], "0,1,2,3,4,5,6,7")
+
+    def test_eight_gpu_batch_alignment_and_invalid_device_lists(self):
+        for devices in ("0,1,2,3,4,5", "0,1,2,3,4,5,6,6", "0,1,2,3,", "0,1,,3"):
+            with self.subTest(devices=devices), self.assertRaises(ValueError):
+                launcher.build_command(self.args("--gpu-ids", devices, "--global-batch-size", "64"))
+        with self.assertRaisesRegex(ValueError, r"DP\(4\).+64"):
+            launcher.build_command(self.args("--gpu-ids", "0,1,2,3,4,5,6,7", "--global-batch-size", "32",
+                                             "--micro-batch-size", "2"))
+        # Keeping B32 is possible on eight GPUs when each DP replica gets micro1.
+        launcher.build_command(self.args("--gpu-ids", "0,1,2,3,4,5,6,7", "--global-batch-size", "32",
+                                         "--micro-batch-size", "1"))
+
     def test_invalid_batch_and_gpus_fail(self):
         for extra in (("--global-batch-size", "8"), ("--gpu-ids", "0,1"), ("--group-size", "1"),
                       ("--gpu-ids", "0,1,2,2"), ("--temperature", "0"), ("--lr", "nan"), ("--kl-beta", "inf")):
@@ -166,6 +193,21 @@ class TestMegatronLauncher(unittest.TestCase):
         self.assertEqual(plan["sampling"]["fresh_prompts_per_generation"], 4)
         self.assertEqual(plan["argv"][plan["argv"].index("--train_iters") + 1], "2")
 
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(StringIO()) as stdout:
+            output = Path(directory) / "eight-gpu-dry-run"
+            with patch.object(launcher.subprocess, "run") as run:
+                code = launcher.main(["/missing/model", "/missing/train.jsonl", str(output), *options,
+                                      "--gpu-ids", "0,1,2,3,4,5,6,7", "--global-batch-size", "64", "--dry-run"])
+            run.assert_not_called()
+            self.assertEqual(code, 0)
+            self.assertFalse(output.exists())
+            plan = json.JSONDecoder().raw_decode(stdout.getvalue())[0]
+            self.assertEqual(plan["parallelism"]["world_size"], 8)
+            self.assertEqual(plan["parallelism"]["data_parallel_size"], 4)
+            self.assertEqual(plan["parallelism"]["vllm_replicas"], 2)
+            self.assertEqual(plan["sampling"]["fresh_prompts_per_generation"], 8)
+            self.assertEqual(plan["reward_settings"]["version"], 4)
+
     def test_command_rejects_missing_or_invalid_reward_config(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "bad.json"
@@ -260,6 +302,24 @@ class TestMegatronLauncher(unittest.TestCase):
                              [launcher.sys.executable, str(ROOT / "Scripts" / "check_environment.py")])
             self.assertTrue(run.call_args.kwargs["check"])
             self.assertFalse(list(Path(temp).glob("launch_*.json")))
+
+    def test_eight_gpu_launch_preflight_checks_all_selected_gpus(self):
+        with tempfile.TemporaryDirectory() as temp, redirect_stdout(StringIO()), \
+                patch.object(launcher, "validate_local_inputs", return_value={}), \
+                patch.object(launcher, "run_identity", return_value={}), \
+                patch.object(launcher, "verify_resume_identity"), \
+                patch.object(launcher.subprocess, "run") as run:
+            run.return_value.returncode = 0
+            status = launcher.main(["/missing/model", "/missing/data", temp,
+                                    "--reward-config", str(ROOT / "configs" / "qalco_v4.json"),
+                                    "--gpu-ids", "0,1,2,3,4,5,6,7", "--global-batch-size", "64",
+                                    "--micro-batch-size", "2"])
+            self.assertEqual(status, 0)
+            environment_check, training = run.call_args_list
+            check_command, train_command = environment_check.args[0], training.args[0]
+            self.assertEqual(check_command[check_command.index("--required-gpus") + 1], "8")
+            self.assertEqual(train_command[train_command.index("--nproc_per_node") + 1], "8")
+            self.assertEqual(training.kwargs["env"]["CUDA_VISIBLE_DEVICES"], "0,1,2,3,4,5,6,7")
 
     def test_v4_identity_does_not_require_or_hash_manual_quality_cases(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -421,6 +481,27 @@ class TestMegatronLauncher(unittest.TestCase):
             launcher.verify_resume_identity(a, original)
             with self.assertRaisesRegex(ValueError, "Resume rejected"):
                 launcher.verify_resume_identity(a, dict(original, dataset_sha256="changed"))
+
+    def test_resume_identity_tracks_gpu_count_but_not_physical_device_numbers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            args = self.args("--global-batch-size", "64", "--micro-batch-size", "2")
+            args.model, args.output = str(root / "model"), str(root / "run")
+            Path(args.model).mkdir()
+            Path(args.output).mkdir()
+            manifest = {"sha256": "same-data", "tasks": 8}
+            args.gpu_ids = "0,1,2,3"
+            four = launcher.run_identity(args, manifest)
+            args.gpu_ids = "4,5,6,7"
+            self.assertEqual(four, launcher.run_identity(args, manifest))
+            args.gpu_ids = "0,1,2,3,4,5,6,7"
+            eight = launcher.run_identity(args, manifest)
+            self.assertNotEqual(four, eight)
+            self.assertEqual(eight["parallelism"]["data_parallel_size"], 4)
+            (Path(args.output) / "launch_original.json").write_text(json.dumps({"run_identity": four}), encoding="utf-8")
+            args.resume_from = str(Path(args.output) / "checkpoint-500")
+            with self.assertRaisesRegex(ValueError, "Resume rejected.+parallelism"):
+                launcher.verify_resume_identity(args, eight)
 
     def test_merged_export_metadata_is_not_resumable(self):
         with tempfile.TemporaryDirectory() as temp, redirect_stdout(StringIO()):

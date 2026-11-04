@@ -12,6 +12,7 @@
 #   默认 scale_rewards=group：总奖励减完整 G8 均值，再除组标准差。
 # 【默认容量】四卡，G8/B16/micro1；3000 步，每 500 步保存；lr=1e-6。
 #   LoRA rank/alpha=8/32；vLLM 显存比例=0.40，max_num_seqs=16。
+#   支持单机 4 或 8 卡，进程数自动跟随 --gpu-ids；G8/micro2/steps1 时八卡需 B64。
 # 【选择版本】上层 03/04/05/06 会覆盖部分默认参数；尤其 05 选 v3，06 选 v4。
 #   --reward-config 优先于这里的默认说明，实际版本/权重见启动时的 reward_settings。
 # 【用法】bash 02_train.sh /sft-merged /prepared/train.jsonl /new-run [参数]

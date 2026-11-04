@@ -22,6 +22,11 @@
 #   全组都失败时每条为 -0.25，任务奖励优势为零（KL 等项仍可能产生更新）。
 # 【训练参数】四卡 G8/B32/micro2，3000 步，每 500 步保存；lr=1e-6，LoRA=8/32。
 #   vLLM 显存比例 .50、max_num_seqs=32、MM cache=0；最多 65 轮（含 EOF）。
+# 【4/8 卡共用】默认仍是四卡；八卡追加 --gpu-ids 0,1,2,3,4,5,6,7 --global-batch-size 64。
+#   启动器按 GPU 数自动启动 4/8 个进程；训练 TP2/EP2，DP 分别为 2/4。
+#   vLLM 保持每组 TP4，四卡一组、八卡两组；每组的显存比例和并发上限保持不变。
+#   G8/micro2/steps1 时四卡用 B32，八卡用 B64；八卡若保留 B32，需显式 micro1。
+#   3000 步 B64 的采样总量约为 B32 的两倍；卡数切换使用新实验目录，不作精确续训。
 # 【用法】bash 06_train_qalco_v4.sh /sft-merged /prepared/train.jsonl /new-run [参数]
 #   旧/新格式准备的 train.jsonl 均可用；先激活 Docker 内训练 venv。
 #   尾部参数（含 --reward-config）可覆盖预设；--dry-run 只打印实际生效配置。
@@ -29,7 +34,7 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-# 四卡训练参数显式列出；共用入口负责调试环境清理、Megatron/vLLM 与 TensorBoard。
+# 默认四卡参数显式列出；尾部可选八卡预设，共用入口负责环境清理与训练/监控。
 # MM cache=0 保留此前缓存清理卡住问题的绕过设置。
 exec bash "${SCRIPT_DIR}/04_train_throughput.sh" \
   --reward-config "${SCRIPT_DIR}/configs/qalco_v4.json" \
