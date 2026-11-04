@@ -30,6 +30,7 @@
 # 【用法】bash 06_train_qalco_v4.sh /sft-merged /prepared/train.jsonl /new-run [参数]
 #   旧/新格式准备的 train.jsonl 均可用；先激活 Docker 内训练 venv。
 #   尾部参数（含 --reward-config）可覆盖预设；--dry-run 只打印实际生效配置。
+#   --debug-offload 可选排障：保留原搬运算法，增加 CUDA 同步与失败参数元数据；正式训练不加。
 # ==============================================================================
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

@@ -55,6 +55,8 @@ def parser() -> argparse.ArgumentParser:
                    help="Keep full for the accepted recipe; selective is an opt-in speed/memory experiment")
     p.add_argument("--performance-log", choices=("on", "off"), default="off",
                    help="Optional CPU wall-clock phase JSONL; no CUDA synchronization or new collectives")
+    p.add_argument("--debug-offload", action="store_true",
+                   help="Opt-in CUDA/offload diagnostics; synchronizes CUDA and logs failing tensor metadata. Use a separate short run")
     p.add_argument("--master-port", type=int, default=29581)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--dataset-num-proc", type=int, default=4)
@@ -196,6 +198,12 @@ def build_command(a: argparse.Namespace, *, reward_settings=None) -> list[str]:
 
 def build_environment(a: argparse.Namespace) -> dict[str, str]:
     env = dict(os.environ)
+    env.pop("FLEX_DEBUG_OFFLOAD", None)
+    if a.debug_offload:
+        # Applied after 03_train_3000.sh clears inherited debug flags.
+        env.update({"FLEX_DEBUG_OFFLOAD": "1", "CUDA_LAUNCH_BLOCKING": "1",
+                    "TORCH_SHOW_CPP_STACKTRACES": "0", "TORCH_DISABLE_ADDR2LINE": "1",
+                    "PYTHONFAULTHANDLER": "1"})
     env.update({"CUDA_VISIBLE_DEVICES": a.gpu_ids, "ENABLE_AUDIO_OUTPUT": "0", "PYTHONUNBUFFERED": "1",
                 "CUDA_DEVICE_MAX_CONNECTIONS": "1", "TOKENIZERS_PARALLELISM": "false",
                 "FLEX_REWARD_CONFIG": str(Path(a.reward_config).resolve()),
@@ -364,6 +372,7 @@ def main(argv: list[str] | None = None) -> int:
                   file=sys.stderr, flush=True)
         plan = {"audited_swift_commit": AUDITED_SWIFT_COMMIT, "argv": cmd,
                 "parallelism": layout,
+                "debug_offload": a.debug_offload,
                 "reward_settings": settings,
                 "quality_validation": {"mode": "manual", "automatic_service_probe": False},
                 "reward_normalization": {
