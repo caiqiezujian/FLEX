@@ -1,7 +1,7 @@
-"""Local, text-only Qwen3-Omni inference shared by file and Web entry points.
+"""Independent, local Qwen3-Omni adapter for file and batch S2TT inference.
 
-The server owns one ModelEngine on one serial worker thread. Creating a session
-changes only its private conversation, never loads another model. Audio is mono
+One ModelEngine is reused serially across files. Creating a session changes only
+its private conversation, never loads another model. Audio is mono
 float32 at 16 kHz. WAIT consumes an audio turn just like FLEX/DIRECT; all three
 responses remain in history. Context exhaustion is explicit, not a sliding reset.
 
@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import time
+from types import MappingProxyType
 
 import numpy as np
 
@@ -30,14 +31,25 @@ STOP_TOKENS = ('<|im_end|>', '<|endoftext|>')
 BASE_SPECIALS = ('<|im_start|>', '<|im_end|>', '<|endoftext|>',
                  '<|audio_start|>', '<|audio_pad|>', '<|audio_end|>')
 
-# Intentionally identical to CURRENT SFT preparation, not a new FLEX definition.
-SYSTEM_PROMPT_TEMPLATE = (
-    '你是一个同声传译专家，负责将用户音频中的语音同声翻译为{target_lang}。'
-    '用户将按时间顺序逐块发送音频。每收到一块音频后，立即输出响应：'
-    '若该块暂无可翻译内容，输出<|WAIT|>；若仅能确认部分译文、语义尚不完整，输出<|FLEX|>并紧跟'
-    '确信的译文（只输出有把握的部分，宁少勿错）；若译文语义已完整，输出<|DIRECT|>并紧跟新识别'
-    '的译文。所有译文均为增量输出：只输出新增内容，不重复、不修改此前已输出的任何译文。'
+SUPPORTED_DIRECTIONS = ('en-zh', 'zh-en')
+
+# Match SFT-Scripts/prepare_duplex_data.py exactly. Direction codes are routing
+# values; the prompt must use the actual trained language words 中文 / English.
+PROTOCOL_SYSTEM_PROMPT_TEMPLATE = (
+    '将用户按顺序发送的音频同声翻译为{target_lang}。'
+    '结合已听音频和历史译文，每轮只输出以下一种：'
+    '暂无可靠新增译文时，仅输出<|WAIT|>；'
+    '可直接自然续接时，输出<|DIRECT|>加新增译文；'
+    '需暂缓部分内容或调整表达结构时，输出<|FLEX|>加可靠的新增译文。'
+    '译文只追加，不重复、不回改、不猜测后文；条件允许时补齐此前暂缓且尚未译出的内容。'
+    'DIRECT与FLEX按策略区分，不按句子是否完整区分。'
+    '按语义使用标点，不随音频块机械加句号，不用省略号占位。'
+    '除WAIT外，译文不能为空；不输出解释。'
 )
+SYSTEM_PROMPTS = MappingProxyType({
+    'zh': PROTOCOL_SYSTEM_PROMPT_TEMPLATE.format(target_lang='中文'),
+    'en': PROTOCOL_SYSTEM_PROMPT_TEMPLATE.format(target_lang='English'),
+})
 
 
 class ProtocolError(RuntimeError):
@@ -170,7 +182,7 @@ class ModelEngine:
         self.metadata = {
             'backend': backend,
             'model_name': Path(self.options.model).name if self.options.model else 'DEMO — no model',
-            'directions': ['en-zh', 'zh-en'],
+            'directions': list(SUPPORTED_DIRECTIONS),
             'sample_rate': SAMPLE_RATE,
             'max_model_len': self.options.max_model_len,
             'max_audio_turns': self.options.max_audio_turns,
@@ -291,8 +303,7 @@ class ModelSession:
     def __init__(self, engine, target_lang):
         self.engine = engine
         self.target_lang = target_lang
-        self.system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-            target_lang={'zh': '中文', 'en': '英文'}[target_lang])
+        self.system_prompt = SYSTEM_PROMPTS[target_lang]
         self.audios = []
         self.committed_audio_extra_tokens = 0
         self._closed = False

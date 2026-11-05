@@ -1,5 +1,13 @@
 # 本地验证记录
 
+## 2026-11-05：独立 S2TT 提示词与语言映射对齐
+
+- 独立 `FLEX-S2TT/flex_model.py` 原先保留旧的完整性判断提示，并将英文目标写为“英文”。现逐字采用 SFT 的精简策略模板，目标映射为 `zh → 中文`、`en → English`；单音频、批量及 JSONL 更新继续使用 `en-zh` / `zh-en` 方向参数。CLI 方向选项与模型元数据共用同一常量。
+- `FLEX-S2TT` 中运行 `python -m unittest discover -s tests -v`：**37 tests OK**。新增 3 项检查覆盖本地完整提示/ID、双向 CLI 到实际模型适配器请求、SFT/Web/GSPO 跨目录一致性。独立复制目录时仅跨仓库检查跳过，运行时不依赖训练或 Web 目录。此前 WAIT 停止及 60.179 秒尾块回归继续通过。
+- 文档明确区分仓库中的独立批量目录与 `tools/package_s2tt.py` 生成的六文件单音频包，避免仅更新共享模型却遗漏另一份适配器。`git diff --check` 通过。
+
+**验证边界：** 使用确定性 fake vLLM 检查真实适配器构造的请求，未运行服务器 checkpoint 或验证 GPU 翻译质量。训练的实际 system 内容仍以准备好的 JSONL 为准；当前语言值已确认为 `中文` / `English`。
+
 ## 2026-11-05：WAIT 标签立即终止生成
 
 - 修复独立 `FLEX-S2TT/flex_model.py` 与 Web/根目录 CLI 共用的 `flex_web/model.py`：完整 WAIT 标签作为终止动作。特殊协议按单个 WAIT token 停止，文本协议按完整标签停止；开启 `include_stop_str_in_output`，WAIT token 保留用于协议校验和历史提交，只有原 EOS token 被移除。DIRECT/FLEX 仍生成正文并等待结束符；真正的长度截断、嵌套标签仍被拒绝。

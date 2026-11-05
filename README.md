@@ -60,6 +60,7 @@ cd FLEX
 - [SFT：虚拟音频分块、LoRA 训练及完整权重导出](SFT-Scripts/README.md)
 - [强化学习方法、奖励公式与完整示例](FLEX-GSPO/docx/QALCO强化学习方案详解.md)
 - [先做单音频流式 S2TT，不启动网页](docs/S2TT.md)
+- [独立 S2TT：单音频、批量推理与 JSONL 更新](FLEX-S2TT/README.md)
 - [客户端/服务端协议](docs/PROTOCOL.md)
 - [已完成的验证与未验证边界](docs/VALIDATION.md)
 - [开发与测试](CONTRIBUTING.md)
@@ -74,6 +75,8 @@ CUDA_VISIBLE_DEVICES=6 bash run_infer.sh /absolute/path/to/checkpoint-merged /ab
 ```
 
 默认 1 秒分块、fast 模式，逐块推理但不等待播放时钟；追加 `--pace realtime` 可模拟实时到达。先停止占用同一 GPU 的 Web 服务。也可以使用不含任何 Web 文件的六文件独立包，见 [快速说明](docs/S2TT-QUICKSTART.md)。
+
+仓库内的 `FLEX-S2TT/` 使用自己的 `flex_model.py`，支持批量推理和 JSONL 更新；`tools/package_s2tt.py` 则从根目录 CLI 和 Web 模型适配器生成六文件单音频包，不会更新仓库内的 `FLEX-S2TT/`。两条路径的提示词和三标签协议通过一致性测试核对。更新独立批量部署时请同步实际使用的 `FLEX-S2TT/` 目录。
 
 如果暂时不需要平台，可以直接运行 `infer_audio.py`。它复用同一模型适配层，但**不启动 Web 服务，不需要浏览器，也不需要 FastAPI**。先把音频放到 GPU 服务器，再指定本地文件路径：
 

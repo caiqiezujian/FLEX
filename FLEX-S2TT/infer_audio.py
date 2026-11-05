@@ -1,7 +1,8 @@
 """File-to-text FLEX inference without the Web server or browser.
 
-Uses the same local model adapter and SFT history as FLEX Live. A file is fed
-in fixed chronological chunks, never as a full-recording model request.
+Uses this folder's independent adapter with the current SFT prompt and audio-turn
+layout. A file is fed in fixed chronological chunks, never as a full-recording
+model request.
 """
 from __future__ import annotations
 
@@ -23,7 +24,7 @@ import wave
 
 import numpy as np
 
-from flex_model import ModelEngine, ModelOptions, ProtocolError, SAMPLE_RATE, parse_reply
+from flex_model import ModelEngine, ModelOptions, ProtocolError, SAMPLE_RATE, SUPPORTED_DIRECTIONS, parse_reply
 
 
 LOG = logging.getLogger('flex.s2tt')
@@ -268,7 +269,7 @@ def run_stream(args, engine, reader, output, state, *, clock=time.monotonic,
 def add_inference_arguments(p, *, default_pace='realtime'):
     """Shared model/stream options for single-file and folder inference."""
     p.add_argument('--model', default='', help='Local merged checkpoint and matching tokenizer/processor')
-    p.add_argument('--direction', choices=('en-zh', 'zh-en'), default='en-zh')
+    p.add_argument('--direction', choices=SUPPORTED_DIRECTIONS, default='en-zh')
     p.add_argument('--chunk-seconds', type=float, default=1.0)
     p.add_argument('--pace', choices=('realtime', 'fast'), default=default_pace,
                    help='realtime: simulate 1x audio arrival; fast: chunked inference without waiting')

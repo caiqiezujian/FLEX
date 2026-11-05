@@ -22,6 +22,15 @@ CUDA_VISIBLE_DEVICES=0 bash run_batch.sh \
 
 Byte 数据集另跑一次，只需换成 Byte 的音频和 JSONL 目录。同一个模型可以使用相同前缀。中译英使用 `--direction zh-en`；一次命令处理一个方向。
 
+方向参数与训练提示中的语言名称分开处理：
+
+| 命令行方向 | 会话目标代码 | 模型提示词首句 |
+| --- | --- | --- |
+| `en-zh` | `zh` | 将用户按顺序发送的音频同声翻译为中文。 |
+| `zh-en` | `en` | 将用户按顺序发送的音频同声翻译为English。 |
+
+完整 system 提示逐字对齐 `SFT-Scripts/prepare_duplex_data.py` 的最新精简模板，DIRECT/FLEX 按策略区分，不按句子完整性区分。`zh` 会映射为 `中文`，`en` 映射为训练使用的 `English`；语言代码不会直接填入提示词。单音频与批量入口共用本目录的 `flex_model.py`，运行时不依赖 Web 或 SFT 目录。
+
 也可以直接调用 Python：
 
 ```bash
@@ -122,7 +131,7 @@ python3 -m pip install -r requirements-infer.txt
 
 模型须包含完整 merged 权重以及训练一致的 tokenizer / processor。启动脚本默认特殊协议 token（WAIT / DIRECT / FLEX ID 为 151676 / 151677 / 151678）；普通文本标签模型使用 `--protocol-form text`。
 
-默认单卡、bfloat16、显存利用率 0.90。`--image-slots 1` 保留兼容所需的初始化名额，实际只输入音频；适用环境可改为 0。本次文件回写改动沿用原模型适配、提示词和生成逻辑。
+默认单卡、bfloat16、显存利用率 0.90。`--image-slots 1` 保留兼容所需的初始化名额，实际只输入音频；适用环境可改为 0。当前提示词适用于采用最新精简 SFT 模板的 checkpoint；旧 checkpoint 应按实际训练 JSONL 核对提示。
 
 `PYTHON=/path/to/python3 bash run_batch.sh ...` 可以指定解释器。相对路径以当前工作目录为准。`--backend mock` 仅供临时测试数据使用，会写入演示文本；正式数据保持默认 vLLM 后端。
 
@@ -156,6 +165,8 @@ FLEX-S2TT/
   README.md
   tests/test_batch.py        原有批量与单文件流程检查
   tests/test_update_jsonl.py 原地回写、异常、中断和字段保留检查
+  tests/test_wait_stop.py    WAIT 停止、尾块覆盖和截断保护
+  tests/test_prompt_contract.py 最新训练提示、语言映射和模型请求检查
 ```
 
 ```bash
