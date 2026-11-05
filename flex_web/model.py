@@ -305,10 +305,19 @@ class ModelEngine:
         LOG.info('Audio token counter mode=%s entries=%s reason=%s',
                  self._audio_token_counter.mode, opts.audio_token_cache_size,
                  self._audio_token_counter.reason)
+        # WAIT is already a complete action: generating beyond it can degenerate
+        # into whitespace until max_tokens. Keep it in the returned token stream
+        # and committed history; self.stop_ids only contains removable EOS tokens.
+        wait_ids = self.enc(PROTOCOL_TAGS[0])
+        sampling_stop_ids = self.stop_ids + (wait_ids if len(wait_ids) == 1 else [])
         self.sampling = SamplingParams(
             temperature=0.0, top_p=1.0, top_k=-1, repetition_penalty=1.0,
             max_tokens=opts.max_tokens, seed=opts.seed,
-            stop_token_ids=self.stop_ids, skip_special_tokens=False)
+            stop_token_ids=sampling_stop_ids,
+            stop=[PROTOCOL_TAGS[0]] if len(wait_ids) > 1 else None,
+            include_stop_str_in_output=True, skip_special_tokens=False)
+        LOG.info('WAIT ends generation immediately; protocol tag is retained (%s)',
+                 'token' if len(wait_ids) == 1 else 'text')
         self.metadata['vllm_version'] = vllm.__version__
 
     def new_session(self, target_lang):

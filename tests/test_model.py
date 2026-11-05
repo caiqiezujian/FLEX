@@ -79,8 +79,8 @@ def fake_transformers(monkeypatch):
 
 
 @pytest.fixture
-def fake_vllm(monkeypatch, tmp_path, fake_transformers):
-    tok = FakeTokenizer()
+def fake_vllm(monkeypatch, tmp_path, fake_transformers, request):
+    tok = FakeTokenizer(getattr(request, 'param', 'special'))
     fake_transformers.append(tok)
     observed = types.SimpleNamespace(llms=[], counters=[], requests=[], count_requests=[],
                                      shutdowns=0, mismatch=0, finish_reason='stop')
@@ -143,6 +143,121 @@ def fake_vllm(monkeypatch, tmp_path, fake_transformers):
     monkeypatch.setitem(sys.modules, 'vllm.inputs.preprocess', preprocess)
     options = ModelOptions(model=str(tmp_path))
     return options, observed, tok
+
+
+def scripted_completion(monkeypatch, engine, tok, continuation):
+    """Exercise token-stop wiring with a deterministic fake generation stream."""
+    original = engine.llm.generate
+    emitted_counts = []
+
+    def generate(requests, sampling, use_tqdm):
+        outputs = original(requests, sampling, use_tqdm)
+        emitted = []
+        reason = 'length'
+        for token in tok.encode(continuation)[:sampling.kwargs['max_tokens']]:
+            emitted.append(token)
+            if token in sampling.kwargs.get('stop_token_ids', []):
+                reason = 'stop'
+                break
+            if any(stop in tok.decode(emitted) for stop in (sampling.kwargs.get('stop') or [])):
+                reason = 'stop'
+                break
+        emitted_counts.append(len(emitted))
+        # vLLM retains the token IDs of matched stop strings/tokens; the model
+        # adapter must preserve WAIT while removing only layout terminators.
+        outputs[0].outputs[0].token_ids = emitted
+        outputs[0].outputs[0].finish_reason = reason
+        return outputs
+
+    monkeypatch.setattr(engine.llm, 'generate', generate)
+    return emitted_counts
+
+
+@pytest.mark.parametrize('fake_vllm', ['special', 'text'], indirect=True)
+def test_wait_stops_before_newline_loop_and_remains_in_next_turn(fake_vllm, monkeypatch):
+    options, observed, tok = fake_vllm
+    engine = ModelEngine(options)
+    session = engine.new_session('zh')
+    audio = np.zeros(16000, np.float32)
+    emitted = scripted_completion(monkeypatch, engine, tok, '<|WAIT|>' + '\n' * 300)
+    try:
+        assert engine.sampling.kwargs['include_stop_str_in_output'] is True
+        first = session.generate(audio)
+        assert first.finish_reason == 'stop'
+        assert first.reply == '<|WAIT|>'
+        assert first.token_ids == tok.encode('<|WAIT|>')
+        assert emitted == [len(first.token_ids)]
+        session.commit(audio, first)
+        assert session.total_committed_turns == 1
+
+        second = session.generate(audio)
+        prompt = tok.decode(observed.requests[-1]['prompt_token_ids'])
+        assert '<|im_start|>assistant\n<|WAIT|><|im_end|>\n' in prompt
+        assert '\n\n' not in prompt
+        session.commit(audio, second)
+        assert session.total_committed_turns == 2
+    finally:
+        session.close()
+        engine.close()
+
+
+@pytest.mark.parametrize('fake_vllm', ['special', 'text'], indirect=True)
+@pytest.mark.parametrize('tag', ['<|DIRECT|>', '<|FLEX|>'])
+def test_translation_actions_continue_until_layout_stop(fake_vllm, monkeypatch, tag):
+    options, _, tok = fake_vllm
+    engine = ModelEngine(options)
+    session = engine.new_session('en')
+    audio = np.zeros(16000, np.float32)
+    scripted_completion(monkeypatch, engine, tok, tag + ' actual translation<|im_end|>\n')
+    try:
+        generation = session.generate(audio)
+        assert generation.finish_reason == 'stop'
+        assert generation.reply == tag + ' actual translation'
+        assert generation.token_ids == tok.encode(generation.reply)
+        session.commit(audio, generation)
+        assert session.total_committed_turns == 1
+    finally:
+        session.close()
+        engine.close()
+
+
+@pytest.mark.parametrize('fake_vllm', ['special', 'text'], indirect=True)
+@pytest.mark.parametrize('tag', ['<|DIRECT|>', '<|FLEX|>'])
+def test_wait_stop_does_not_accept_length_truncated_translation(fake_vllm, monkeypatch, tag):
+    options, _, tok = fake_vllm
+    engine = ModelEngine(options)
+    session = engine.new_session('en')
+    audio = np.zeros(16000, np.float32)
+    scripted_completion(monkeypatch, engine, tok, tag + ' unfinished' * 100)
+    try:
+        generation = session.generate(audio)
+        assert generation.finish_reason == 'length'
+        assert len(generation.token_ids) == options.max_tokens
+        with pytest.raises(ProtocolError, match='finish_reason'):
+            session.commit(audio, generation)
+        assert session.total_committed_turns == 0 and not session.audios
+    finally:
+        session.close()
+        engine.close()
+
+
+@pytest.mark.parametrize('fake_vllm', ['special', 'text'], indirect=True)
+def test_nested_wait_stop_is_still_rejected(fake_vllm, monkeypatch):
+    options, _, tok = fake_vllm
+    engine = ModelEngine(options)
+    session = engine.new_session('en')
+    audio = np.zeros(16000, np.float32)
+    scripted_completion(monkeypatch, engine, tok, '<|DIRECT|> invalid<|WAIT|>' + '\n' * 300)
+    try:
+        generation = session.generate(audio)
+        assert generation.finish_reason == 'stop'
+        assert generation.reply == '<|DIRECT|> invalid<|WAIT|>'
+        with pytest.raises(ProtocolError, match='nested'):
+            session.commit(audio, generation)
+        assert session.total_committed_turns == 0 and not session.audios
+    finally:
+        session.close()
+        engine.close()
 
 
 @pytest.mark.parametrize('reply,expected', [

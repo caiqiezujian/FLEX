@@ -1,5 +1,14 @@
 # 本地验证记录
 
+## 2026-11-05：WAIT 标签立即终止生成
+
+- 修复独立 `FLEX-S2TT/flex_model.py` 与 Web/根目录 CLI 共用的 `flex_web/model.py`：完整 WAIT 标签作为终止动作。特殊协议按单个 WAIT token 停止，文本协议按完整标签停止；开启 `include_stop_str_in_output`，WAIT token 保留用于协议校验和历史提交，只有原 EOS token 被移除。DIRECT/FLEX 仍生成正文并等待结束符；真正的长度截断、嵌套标签仍被拒绝。
+- 根目录 `python -m pytest -q tests --tb=short`：**551 passed, 1 skipped**。新增 12 项停止行为/历史/截断保护回归；跳过项仍为不满足本机依赖的可选真实音频预处理器检查。
+- 独立目录 `python -m unittest discover -s tests -v`：**34 tests OK**。新增 3 项测试（含多种协议子情况），以合成 WAV 和确定性 fake vLLM 驱动真实文件读取与推理适配器：60.179 秒输入完整提交 61 轮，末尾 2864 个真实采样保留、仅模型输入补齐到 16000 采样，WAIT 后数百个换行候选不再生成，最终 `complete_input=true`。校正测试替身的停止字符串 token 保留行为后，新增 3 项再次通过。
+- 已对照 [vLLM 0.11.1 的 stop 检查](https://github.com/vllm-project/vllm/blob/v0.11.1/vllm/v1/core/sched/utils.py)和 [detokenizer](https://github.com/vllm-project/vllm/blob/v0.11.1/vllm/v1/engine/detokenizer.py) 的 token/文本保留规则；`git diff --check` 通过。
+
+**验证边界：** 未在用户 GPU/checkpoint 上复跑原音频，测试验证停止协议和完整输入处理，不证明翻译质量。最终 WAIT 仍标记 `final_wait=true`，输入全部处理并不证明全部语义已译出。不通过丢弃尾音频、增加静音轮或放宽 length 错误处理来规避问题。
+
 ## 2026-11-02：推理提示词对齐新版精简 SFT 模板
 
 - Web 和单音频 CLI 共用的 `flex_web/model.py` 改用 `SFT-Scripts/prepare_duplex_data.py` 中的精简策略模板；中文与英文目标分别填入 `中文`、`English`。DIRECT/FLEX 按翻译策略区分，不按句子完整性区分，并保留增量输出、暂缓内容补齐及标点约束。
