@@ -170,10 +170,10 @@ def audit_rewards(path, window, settings, examples_limit):
             quality_fail_delays.append(c["latency_seconds"])
         if settings is not None:
             values = [c.get(k) for k in ("quality", "latency_seconds", "length_penalty")]
-            if settings.get("version") == 4:
+            if settings.get("version") in (4, 5):
                 # Per-rank callbacks cannot independently certify complete-group
-                # normalization or the dynamic failure baseline. Use the v4
-                # full-group replay tool, never assume an old fixed -4 sentinel.
+                # normalization or the dynamic failure baseline. Rechecking
+                # requires complete groups and the matching quality provider.
                 uncheckable += 1
                 continue
             elif tier in ("invalid", "degenerate"):
@@ -206,7 +206,7 @@ def audit_rewards(path, window, settings, examples_limit):
             "repeated_callback_keys": repeated_callbacks, "noncontiguous_candidate_index_callbacks": malformed_indices,
             "callback_completeness": "No end marker in legacy logs; a contiguous final prefix may still be partial.",
             "formula_recheck": {"enabled": settings is not None, "checked": formula_checked, "mismatches": formula_mismatches, "uncheckable": uncheckable,
-                                "note": "Uses supplied current formula/config; hash match does not prove quality-model identity or semantic reward validity. For v3, uses logged C and P. For v4, no per-rank formula recheck: use Scripts/replay_qalco_v4.py on complete groups."}}, selected + list(recent_invalid) + timing_pairs, pairs
+                                "note": "Uses supplied current formula/config; hash match does not prove quality-model identity or semantic reward validity. For v3, uses logged C and P. For v4/v5, no per-rank formula recheck: complete groups and frozen scores from the same quality provider are required. Scripts/replay_qalco_v4.py is COMET-only and cannot replay v5 MetricX logs."}}, selected + list(recent_invalid) + timing_pairs, pairs
 
 
 def load_settings(config_path, run_dir):
@@ -224,7 +224,7 @@ def load_settings(config_path, run_dir):
         return None, {"status": "not rechecked: missing/mixed launch identities or changed config", "config_sha256": digest}
     settings = validate_settings(json.loads(data.decode("utf-8-sig")))
     return settings, {"status": "config hash matches launch identity", "launch_files": matched,
-                      "settings": {key: settings[key] for key in ("version", "quality_floor", "latency_metric", "latency_budget_seconds", "reference_length_ratio", "latency_weight", "length_weight", "v3", "v4") if key in settings}}
+                      "settings": {key: settings[key] for key in ("version", "quality_provider", "quality_floor", "latency_metric", "latency_budget_seconds", "reference_length_ratio", "latency_weight", "length_weight", "v3", "v4", "v5") if key in settings}}
 
 
 def attach_sources(examples, dataset):

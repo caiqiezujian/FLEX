@@ -136,6 +136,43 @@ class TrainingAuditTests(unittest.TestCase):
                 audit.analyze(args)
             self.assertTrue((root/"rewards"/"rewards-rank0-pid2.jsonl").is_file())
 
+    def test_group_rewards_are_not_rechecked_with_historical_tier_formula(self):
+        for version in (4, 5):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                path = root / "rewards-rank0-pid1.jsonl"
+                normal = self.candidate()
+                failed = self.candidate(index=1, text="", tier="invalid")
+                for row in (normal, failed):
+                    row.update(reward_version=version, reward=-0.25)
+                    row["components"].update(group_finalized=True)
+                self.write_rows(path, [normal, failed])
+                report, _, _ = audit.audit_rewards(path, 1, {"version": version}, 2)
+                self.assertEqual(report["formula_recheck"]["checked"], 0)
+                self.assertEqual(report["formula_recheck"]["mismatches"], 0)
+                self.assertEqual(report["formula_recheck"]["uncheckable"], 2)
+                self.assertIn("cannot replay v5", report["formula_recheck"]["note"])
+
+    def test_v5_settings_summary_keeps_provider_and_versioned_weights(self):
+        from flex_gspo.qalco import validate_settings
+        raw = {"reward": {"provider": "qalco", "version": 5,
+                          "quality_provider": "metricx", "latency_metric": "mean_lag",
+                          "v5": {"latency_weight": 0.5},
+                          "metricx": {"mode": "reference", "backend": "service",
+                                      "service_url": "http://example.invalid",
+                                      "service_id": "audit-only"}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "v5.json"
+            config.write_text(json.dumps(raw), encoding="utf-8")
+            (root / "launch_1.json").write_text(json.dumps({"run_identity": {
+                "reward_config_sha256": hashlib.sha256(config.read_bytes()).hexdigest()}}), encoding="utf-8")
+            loaded, info = audit.load_settings(config, root)
+            self.assertEqual(loaded, validate_settings(raw))
+            self.assertEqual(info["settings"]["quality_provider"], "metricx")
+            self.assertEqual(info["settings"]["v5"]["latency_weight"], 0.5)
+            self.assertNotIn("service_url", json.dumps(info))
+
 
 if __name__ == "__main__":
     unittest.main()

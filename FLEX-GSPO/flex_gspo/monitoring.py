@@ -145,11 +145,12 @@ def _summary(values):
 
 
 def reward_summary(records):
-    """Local callback summaries; v4 advantages are logged by the group scorer.
+    """Local callback summaries; v4/v5 advantages are logged by the group scorer.
 
     Never reconstruct groups from a partial local callback. Group diagnostics
     are candidate-weighted here, and normalized reward means do not measure
-    absolute translation quality. Raw COMET, validity and delay stay separate.
+    absolute translation quality. Raw metric scores, validity and delay stay
+    separate. MetricX's diagnostic 1-error/25 transform is not accuracy.
     """
     result = {"candidates": len(records)}
     scalar_fields = ("quality", "metricx_error", "comet22_score", "latency_seconds", "mean_lag_seconds", "length_penalty",
@@ -160,7 +161,9 @@ def reward_summary(records):
                      "weighted_latency_signal", "quality_group_mean", "quality_group_std",
                      "latency_group_mean", "latency_group_std", "quality_normalization_scale",
                      "latency_normalization_scale", "group_eligible_count", "estimated_advantage",
-                     "group_reward_mean", "failure_reward", "utility_raw")
+                     "group_reward_mean", "failure_reward", "utility_raw",
+                     "metricx_quality_reward", "metricx_group_mean", "metricx_group_std",
+                     "metricx_error_threshold", "latency_cost_cap_seconds", "anchor_metricx_threshold")
     for key in ("reward", *scalar_fields):
         values = [r.get("reward") if key == "reward" else r.get("components", {}).get(key) for r in records]
         for name, value in _summary([float(v) for v in values if number(v)]).items():

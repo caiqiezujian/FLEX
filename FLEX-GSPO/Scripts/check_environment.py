@@ -126,11 +126,11 @@ def inventory(model: str | None = None, require_training: bool = False, required
         if os.environ.get("FLEX_REWARD_CONFIG"):
             from flex_gspo.online_reward import load_reward_config
             config = load_reward_config()
-            if config["reward"].get("version") in (3, 4):
+            if config["reward"].get("version") in (3, 4, 5):
                 from flex_gspo.group_reward import validate_group_reward_source
                 result["flex_group_reward"] = validate_group_reward_source(
                     (root / "swift/megatron/trainers/grpo_trainer.py").read_text(encoding="utf-8"))
-                if config["reward"].get("version") == 4:
+                if config["reward"].get("version") in (4, 5):
                     from flex_gspo.group_reward import validate_v4_advantage_source
                     result["flex_v4_advantage"] = validate_v4_advantage_source(
                         (root / "swift/rl_core/advantage.py").read_text(encoding="utf-8"))

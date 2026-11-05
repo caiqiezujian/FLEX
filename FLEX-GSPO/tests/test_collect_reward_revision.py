@@ -119,6 +119,50 @@ class RewardRevisionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "scaling disagree"):
             self.run_collect()
 
+    def test_v5_export_preserves_metricx_scores_and_center_only_advantages(self):
+        plan = json.loads(self.launch.read_text(encoding="utf-8"))
+        index = plan["argv"].index("--scale_rewards") + 1
+        plan["argv"][index] = "none"
+        self.launch.write_text(json.dumps(plan), encoding="utf-8")
+        for rows in self.rows:
+            for row in rows:
+                if "components" in row:
+                    row["reward_version"] = 5
+                    quality = row["components"].get("quality")
+                    row["components"].update(
+                        quality_metric="metricx24_reference",
+                        metricx_error=None if quality is None else 25 * (1 - quality),
+                    )
+        self.flush_rewards()
+        out, report, selected = self.run_collect()
+        self.assertEqual(report["advantage_scale"], "none")
+        expected = {}
+        for group in selected:
+            mean = group["group"]["reward_mean"]
+            for row in group["candidates"]:
+                self.assertEqual(row["reward_version"], 5)
+                c = row["components"]
+                self.assertEqual(c["quality_metric"], "metricx24_reference")
+                if c["quality"] is None:
+                    self.assertIsNone(c["metricx_error"])
+                else:
+                    self.assertAlmostEqual(c["metricx_error"], 25 * (1 - c["quality"]))
+                expected.setdefault(c["group_candidate_index"], set()).add(round(row["reward"] - mean, 12))
+        seen = 0
+        for path in out.glob("review_part_*.txt"):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if line.startswith("候选: "):
+                    value = json.loads(line[len("候选: "):])
+                    self.assertIn(round(value["estimated_advantage"], 12), expected[value["candidate_index"]])
+                    seen += 1
+        self.assertEqual(seen, len(selected) * 8)
+
+    def test_v5_wrong_launch_scaling_rejected(self):
+        self.rows[0][0]["reward_version"] = 5
+        self.flush_rewards()
+        with self.assertRaisesRegex(ValueError, "scaling disagree"):
+            self.run_collect()
+
     def run_collect(self):
         with redirect_stdout(io.StringIO()):
             out = audit.collect(self.args)

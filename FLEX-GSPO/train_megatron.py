@@ -130,10 +130,10 @@ def build_command(a: argparse.Namespace, *, reward_settings=None) -> list[str]:
     validate_options(a)
     layout = parallel_layout(a)
     settings = load_settings(a) if reward_settings is None else reward_settings
-    # v4 normalizes quality and gated delay inside complete prompt groups.
+    # v4/v5 normalize quality and gated delay inside complete prompt groups.
     # Upstream still subtracts the group mean; a second std division would
     # amplify near-ties again and undo the configured component scale floors.
-    scale_rewards = "none" if settings["version"] == 4 else "group"
+    scale_rewards = "none" if settings["version"] in (4, 5) else "group"
     cmd = [sys.executable, "-m", "torch.distributed.run", "--nproc_per_node", str(layout["world_size"]), "--nnodes", "1",
            "--master_port", str(a.master_port), "--module", "swift.cli._megatron.rlhf"]
     pairs = {
@@ -185,7 +185,7 @@ def build_command(a: argparse.Namespace, *, reward_settings=None) -> list[str]:
     # Keep the original full-mode flags exactly; never pass them in selective mode.
     if a.recompute_granularity == "full":
         pairs.update({"recompute_method": "uniform", "recompute_num_layers": "1"})
-    if settings["version"] == 4:
+    if settings["version"] in (4, 5):
         pairs.update({"advantage_estimator": "grpo", "kl_in_reward": "false"})
     if a.resume_from:
         pairs["mcore_adapter"] = a.resume_from
@@ -367,10 +367,10 @@ def main(argv: list[str] | None = None) -> int:
                 "reward_settings": settings,
                 "quality_validation": {"mode": "manual", "automatic_service_probe": False},
                 "reward_normalization": {
-                    "component_normalization": settings["version"] == 4,
-                    "upstream_scale_rewards": "none" if settings["version"] == 4 else "group",
+                    "component_normalization": settings["version"] in (4, 5),
+                    "upstream_scale_rewards": "none" if settings["version"] in (4, 5) else "group",
                     "upstream_group_mean_baseline": True,
-                    "note": "v4: component scaling then group mean centering only; no second std division. "
+                    "note": "v4/v5: component scaling then group mean centering only; no second std division. "
                             "Normalized reward means are not translation-quality trends."},
                 "environment": {k: env[k] for k in ("CUDA_VISIBLE_DEVICES", "ENABLE_AUDIO_OUTPUT", "FLEX_REWARD_CONFIG",
                                                      "FLEX_REWARD_LOG_DIR", "FLEX_ROLLOUT_LOG_EVERY", "PYTHONPATH")},
@@ -392,13 +392,13 @@ def main(argv: list[str] | None = None) -> int:
         manifest = validate_local_inputs(a)
         plan["run_identity"] = run_identity(a, manifest)
         verify_resume_identity(a, plan["run_identity"])
-        if settings["version"] not in (2, 3, 4):
-            raise ValueError("New training requires QALCO v2/v3/v4 / COMET22 / EOF. v1 is retained for historical audit only.")
+        if settings["version"] not in (2, 3, 4, 5):
+            raise ValueError("New training requires QALCO v2/v3/v4 (COMET22) or v5 (MetricX), with EOF. v1 is retained for historical audit only.")
         # Quality evaluation is an independent, manually invoked diagnostic.
         # Do not call scoring services or gate training on synthetic rankings.
         # Actual rollout scoring still validates responses and propagates errors.
         print("[launch] Quality validation is manual; no startup scoring probe. "
-              "Training rewards continue to use COMET22.", flush=True)
+              f"Training rewards use {settings['quality_provider']}.", flush=True)
         subprocess.run([sys.executable, str(ROOT / "Scripts" / "check_environment.py"), "--model", a.model,
                         "--require-training", "--required-gpus", str(layout["world_size"])], env=env, check=True)
         output = Path(a.output)

@@ -2,8 +2,8 @@
 
 Mean lag/LAAL are target-length scheduling proxies, not semantic latency.
 v2 adds a named deterministic EOF text cost, never measured wall-clock time.
-Length excess is not semantic redundancy. COMET22 (v2) and historical MetricX
-(v1) are fallible proxies, not calibrated accuracy or independent fluency.
+Length excess is not semantic redundancy. COMET22 (v2-v4) and MetricX (v1/v5)
+are fallible proxies, not calibrated accuracy or independent fluency.
 """
 
 from bisect import bisect_left
@@ -39,22 +39,24 @@ def validate_settings(config):
         raise RewardError("QALCO v1 requires reward.provider=qalco")
     allowed = {"provider", "quality_floor", "version", "quality_provider", "comet22", "eof_delay_seconds",
                "latency_budget_seconds", "reference_length_ratio", "latency_weight",
-               "length_weight", "latency_metric", "metricx", "v3", "v4"}
+               "length_weight", "latency_metric", "metricx", "v3", "v4", "v5"}
     if set(settings) - allowed:
         raise RewardError("Unsupported QALCO setting; allowed fields: " + ", ".join(sorted(allowed)))
     settings = dict(settings)
     settings.setdefault("version", 1)  # Historical audit configs keep their exact old formula.
-    if type(settings["version"]) is not int or settings["version"] not in (1, 2, 3, 4):
-        raise RewardError("reward.version must be 1 (historical audit), 2, 3, or 4 (component-scaled experiment)")
+    if type(settings["version"]) is not int or settings["version"] not in (1, 2, 3, 4, 5):
+        raise RewardError("reward.version must be 1 (historical audit), 2, 3, 4, or 5 (MetricX group experiment)")
     if "v3" in settings and settings["version"] != 3:
         raise RewardError("reward.v3 is only valid with reward.version=3")
     if "v4" in settings and settings["version"] != 4:
         raise RewardError("reward.v4 is only valid with reward.version=4")
-    if settings["version"] in (3, 4) and any(name in settings for name in
+    if "v5" in settings and settings["version"] != 5:
+        raise RewardError("reward.v5 is only valid with reward.version=5")
+    if settings["version"] in (3, 4, 5) and any(name in settings for name in
             ("reference_length_ratio", "latency_weight", "length_weight")):
-        raise RewardError("QALCO v3/v4 does not use the old reference-length/tier weights; use versioned settings")
-    settings.setdefault("quality_provider", "metricx" if settings["version"] == 1 else "comet22")
-    expected_provider = "metricx" if settings["version"] == 1 else "comet22"
+        raise RewardError("QALCO v3/v4/v5 does not use the old reference-length/tier weights; use versioned settings")
+    expected_provider = "metricx" if settings["version"] in (1, 5) else "comet22"
+    settings.setdefault("quality_provider", expected_provider)
     if settings["quality_provider"] != expected_provider:
         raise RewardError(f"QALCO v{settings['version']} requires quality_provider={expected_provider}")
     settings["eof_delay_seconds"] = _number(settings.get("eof_delay_seconds", 0.5),
@@ -65,12 +67,13 @@ def validate_settings(config):
     if settings["latency_metric"] not in ("mean_lag", "speech_laal"):
         raise RewardError("latency_metric must be mean_lag or speech_laal")
     if settings["version"] >= 2 and settings["latency_metric"] != "mean_lag":
-        raise RewardError("QALCO v2/v3/v4 requires mean_lag; speech_laal is for historical comparison only")
-    settings["quality_floor"] = _number(
-        settings.get("quality_floor", 0.8 if settings["version"] in (3, 4) else 0.85), "quality_floor", maximum=1, exclusive_minimum=True)
+        raise RewardError("QALCO v2/v3/v4/v5 requires mean_lag; speech_laal is for historical comparison only")
+    if settings["version"] != 5:
+        settings["quality_floor"] = _number(
+            settings.get("quality_floor", 0.8 if settings["version"] in (3, 4) else 0.85), "quality_floor", maximum=1, exclusive_minimum=True)
     settings["latency_budget_seconds"] = _number(
         settings.get("latency_budget_seconds", 3.0), "latency_budget_seconds", exclusive_minimum=True)
-    if settings["version"] not in (3, 4):
+    if settings["version"] not in (3, 4, 5):
         settings["reference_length_ratio"] = _number(
             settings.get("reference_length_ratio", 1.2), "reference_length_ratio", minimum=1)
         for name, default in (("latency_weight", 0.2), ("length_weight", 0.1)):
@@ -78,12 +81,17 @@ def validate_settings(config):
     elif settings["version"] == 3:
         from .gated_reward import validate_v3_settings
         settings = validate_v3_settings(settings)
-    else:
+    elif settings["version"] == 4:
         from .normalized_reward import validate_v4_settings
         settings = validate_v4_settings(settings)
+    else:
+        from .metricx_reward import validate_v5_settings
+        settings = validate_v5_settings(settings)
     if settings["quality_provider"] == "metricx" or "metricx" in settings:
         from .metricx import validate_metricx_settings
         settings["metricx"] = validate_metricx_settings(settings.get("metricx"))
+        if settings["version"] == 5 and settings["metricx"]["mode"] != "reference":
+            raise RewardError("QALCO v5 requires MetricX reference mode (source, translation, reference)")
     if settings["quality_provider"] == "comet22":
         from .comet22 import validate_comet22_settings
         settings["comet22"] = validate_comet22_settings(settings.get("comet22", {}))
@@ -210,8 +218,8 @@ def length_penalty(candidate_units, reference_units, ratio):
 
 
 def combine_reward(quality, latency, length_excess, settings):
-    if settings.get("version") in (3, 4):
-        raise RewardError("QALCO v3/v4 must use complete-group finalization, not the historical tier formula")
+    if settings.get("version") in (3, 4, 5):
+        raise RewardError("QALCO v3/v4/v5 must use complete-group finalization, not the historical tier formula")
     quality = _number(quality, "quality", maximum=1)
     latency = _number(latency, "latency")
     length_excess = _number(length_excess, "length_penalty", maximum=1)
@@ -273,10 +281,12 @@ class QalcoScorer:
     def score_group(self, task, trajectories):
         validate_task(task)
         records, pending, hypotheses = [None] * len(trajectories), [], []
-        # v2/v3/v4 share the accepted EOF and protocol contract; group versions change
+        # v2-v5 share the accepted EOF and protocol contract; group versions change
         # the objective and repetition checks, not the actor observation.
         v2 = self.settings["version"] >= 2
-        group_reward = self.settings["version"] in (3, 4)
+        group_reward = self.settings["version"] in (3, 4, 5)
+        is_comet = self.settings["quality_provider"] == "comet22"
+        quality_metric = "comet22_reference" if is_comet else "metricx24_" + self.settings["metricx"]["mode"]
         eof_cost = self.settings["eof_delay_seconds"] if v2 else 0.0
         reference_units = len(text_units(task["reference_text"]))
         for index, trajectory in enumerate(trajectories):
@@ -326,7 +336,7 @@ class QalcoScorer:
                     records[index] = _invalid("severe cyclic repetition")
                     records[index]["components"].update({"protocol_valid": True, "tier": "degenerate",
                         "severe_repetition": True, "repetition_diagnostics": guard, **statistics,
-                        "length_penalty": excess, "quality_metric": "comet22_reference"})
+                        "length_penalty": excess, "quality_metric": quality_metric})
                     continue
                 statistics["diagnostics"].update({
                     "eof_generation_seconds": turns[-1].get("eof_elapsed_seconds"),
@@ -344,13 +354,16 @@ class QalcoScorer:
                 raise RewardError("quality scorer batch-size mismatch")
             lookup = {}
             for text, raw in zip(unique, raw_scores):
-                lookup[text] = _number(raw, "comet22_score" if v2 else "metricx_error", maximum=1 if v2 else 25)
+                lookup[text] = _number(raw, "comet22_score" if is_comet else "metricx_error", maximum=1 if is_comet else 25)
             for (index, statistics, excess, guard), translation in zip(pending, hypotheses):
                 raw = lookup[translation]
-                quality = raw if v2 else 1 - raw / 25
+                quality = raw if is_comet else 1 - raw / 25
                 use_mean_lag = self.settings["latency_metric"] == "mean_lag"
                 latency = statistics["mean_lag_seconds" if use_mean_lag else "laal_seconds"]
-                if self.settings["version"] == 4:
+                if self.settings["version"] == 5:
+                    from .metricx_reward import provisional_v5
+                    combined = provisional_v5(raw, latency, guard["repetition_penalty"], self.settings)
+                elif self.settings["version"] == 4:
                     from .normalized_reward import provisional_v4
                     combined = provisional_v4(quality, latency, guard["repetition_penalty"], self.settings)
                 elif group_reward:
@@ -364,15 +377,15 @@ class QalcoScorer:
                 reward = combined.pop("reward")
                 records[index] = {"reward": reward, "components": {
                     "protocol_valid": True, "empty_translation": False,
-                    "quality": quality, "metricx_error": None if v2 else raw, **statistics,
-                    "comet22_score": raw if v2 else None,
+                    "quality": quality, "metricx_error": None if is_comet else raw, **statistics,
+                    "comet22_score": raw if is_comet else None,
                     "reward_version": self.settings["version"],
                     "severe_repetition": False, "repetition_diagnostics": guard,
                     "length_penalty": excess, **combined,
                     "latency_seconds": latency,
                     "latency_metric": (("source_clock_mean_positive_lag_plus_eof_proxy" if v2 else "source_clock_mean_positive_lag") if use_mean_lag
                                        else "utterance_speech_laal"),
-                    "quality_metric": "comet22_reference" if v2 else "metricx24_" + self.settings["metricx"]["mode"],
+                    "quality_metric": quality_metric,
                     "prefix_support_checked": False,
                 }}
         if group_reward:

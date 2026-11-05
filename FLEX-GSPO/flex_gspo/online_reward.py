@@ -6,8 +6,8 @@ requires the scheduler's complete ``rollout_infos.flex_trajectory`` instead.
 
 No SWIFT, torch, local quality model, cached offline candidate library, or
 offline calibration artifact is needed here. Framework-side GSPO computes
-group advantages. Versions 3/4 defer logging and reward commitment until the
-synchronized full-group finalizer runs; v4 component scaling cannot use an
+group advantages. Versions 3/4/5 defer logging and reward commitment until the
+synchronized full-group finalizer runs; component scaling cannot use an
 incomplete rank-local batch.
 """
 from __future__ import annotations
@@ -116,8 +116,8 @@ class OnlineQalcoReward:
             self.settings["quality_provider"], self.settings["latency_metric"])
 
     def __call__(self, completions, flex_task=None, rollout_infos=None, **kwargs):
-        if self.settings["version"] in (3, 4) and self._pending_group_commit:
-            raise RewardError("Previous QALCO v3/v4 batch was not finalized; refusing to overwrite pending scores")
+        if self.settings["version"] in (3, 4, 5) and self._pending_group_commit:
+            raise RewardError("Previous QALCO v3/v4/v5 batch was not finalized; refusing to overwrite pending scores")
         if not isinstance(completions, (list, tuple)):
             raise RewardError("completions must be a batch")
         size = len(completions)
@@ -179,7 +179,7 @@ class OnlineQalcoReward:
                     "trajectory": copy.deepcopy(trajectory), "translation": translation, **score,
                 }
         self.last_records = records
-        if self.settings["version"] in (3, 4):
+        if self.settings["version"] in (3, 4, 5):
             self._pending_group_commit = True
         else:
             self._calls += 1
@@ -188,15 +188,15 @@ class OnlineQalcoReward:
         return [float(record["reward"]) for record in records]
 
     def commit_group_rewards(self, finalized_records, trainer_state=None):
-        """Commit v3/v4 only after complete, framework-ordered global groups exist.
+        """Commit v3/v4/v5 only after complete, framework-ordered global groups exist.
 
         Called by the synchronized trainer bridge, never by the local ORM.
         No model/service evaluation here. Preserve raw trajectories verbatim.
         """
-        if self.settings["version"] not in (3, 4):
-            raise RewardError("Group finalization is only supported for QALCO v3/v4")
+        if self.settings["version"] not in (3, 4, 5):
+            raise RewardError("Group finalization is only supported for QALCO v3/v4/v5")
         if not self._pending_group_commit:
-            raise RewardError("No pending QALCO v3/v4 batch; duplicate or out-of-order commit")
+            raise RewardError("No pending QALCO v3/v4/v5 batch; duplicate or out-of-order commit")
         if not isinstance(finalized_records, list) or len(finalized_records) != len(self.last_records):
             raise RewardError("Final reward batch must match the provisional local batch")
         for original, final in zip(self.last_records, finalized_records):
@@ -205,7 +205,7 @@ class OnlineQalcoReward:
                     or final.get("candidate_index_in_local_batch") != original.get("candidate_index_in_local_batch")):
                 raise RewardError("Group finalization reordered or modified candidate evidence")
             if final.get("components", {}).get("group_finalized") is not True:
-                raise RewardError("Refusing to log provisional v3/v4 rewards")
+                raise RewardError("Refusing to log provisional v3/v4/v5 rewards")
             value = final.get("reward")
             if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value):
                 raise RewardError("Nonfinite finalized reward")

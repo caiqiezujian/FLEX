@@ -286,7 +286,7 @@ def collect(args):
                 continue
             if not isinstance(row.get("components"), dict) or not isinstance(row.get("trajectory"), dict):
                 raise ValueError("Malformed reward structure")
-            if (scale_rewards == "none") != (row.get("reward_version") == 4):
+            if (scale_rewards == "none") != (row.get("reward_version") in (4, 5)):
                 raise ValueError("Reward version and launch advantage scaling disagree")
             steps.setdefault(gs + 1, AuditStep()).add_indexed(row, rank, pointer)
     excluded = {s: steps[s].problems(batch, 8, world) if s in steps else ["missing reward records"] for s in sorted(complete)}

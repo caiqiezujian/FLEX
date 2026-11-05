@@ -2,7 +2,7 @@
 
 检查、审计、监控和诊断脚本统一放在 `Scripts/`，完整入口与离线回放输入要求见 [Scripts 使用索引](Scripts/README.md)。下文命令均从项目根目录执行；数据准备、训练入口和 `tests/` 保持原位置。历史记录中的版本、测试结果仍对应当时运行，脚本路径已更新为当前位置。
 
-**2026-11-02 更新范围：第二批数据格式适配与最新 SFT 短提示词对齐。继续使用已有 COMET22 QALCO v4，奖励公式、配置和训练容量不变。** 新数据准备与训练的完整命令见 [第二批数据与 COMET22 v4 训练](docx/第二批数据与COMET22_v4训练.md)。
+**2026-11-05：MetricX QALCO v5 已整合到完整仓库的 `FLEX-GSPO/`。`06_train_qalco_v4.sh` 继续使用 COMET22 v4；新增的 `07_train_qalco_v5.sh` 显式选择 MetricX v5。** 两者共用当前的数据准备、最新 SFT 短提示词与四/八卡训练引擎，不需要从旧的独立目录复制代码。v5 说明与命令见 [QALCO v5 MetricX 训练说明](docx/QALCO_v5_MetricX训练说明.md)。第二批数据准备仍见 [第二批数据与 COMET22 v4 训练](docx/第二批数据与COMET22_v4训练.md)，选择 v5 时使用 07 入口。
 
 GSPO 当前共享提示词与 `SFT-Scripts/prepare_duplex_data.py` 的最新短模板一致。旧 prepared `train.jsonl` 内嵌了旧提示词，需要用新版 `01_prepare.sh` 从原始 JSONL 重新生成到新输出目录；原 WAV 不复制、不重切。新训练应使用确实按该短提示词训练的 SFT checkpoint，不能假定历史 `checkpoint-4410-merged` 已匹配。本文后面的历史 v2/v3 示例及历史文档保留当时命令；恢复旧实验需使用原提交、原数据和原配置，不能直接套用当前共享提示词。
 
@@ -18,7 +18,18 @@ GSPO 当前共享提示词与 `SFT-Scripts/prepare_duplex_data.py` 的最新短�
 
 环境准备、数据处理、训练和监控的完整 1～9 步已按原始数据分开：[旧格式完整指南](docx/GSPO_v4_旧格式数据_完整运行指南.md)、[新格式完整指南](docx/GSPO_v4_新格式数据_完整运行指南.md)。两份统一使用 /data/yb/Code/FLEX 与 /data/yb/vens，包含联网/离线安装、datasets Json/List 检查和两个 TensorBoard 终端；已在训练的环境直接复用。
 
-## 最新实验入口：QALCO v4
+## 奖励入口选择：COMET22 v4 与 MetricX v5
+
+| 入口 | 质量服务 | 配置 | 质量/时延权重 | 默认训练容量 |
+|---|---|---|---|---|
+| `06_train_qalco_v4.sh` | COMET22 reference | `configs/qalco_v4.json` | 1.0 / 0.25 | 四卡 G8/B32/micro2，3000 步，每 500 步保存 |
+| `07_train_qalco_v5.sh` | MetricX-24 reference | `configs/qalco_v5.json` | 1.0 / 0.5 | 同上；八卡用 B64/micro2 |
+
+v5 原始错误分越低越好，质量信号取负错误分。错误分不高于 5 时使用 `min(mean_lag,10)` 秒作为时延成本，否则固定 10 秒；质量和时延分别在完整组的有效候选中归一化后组合。v5 质量权重为 `1.0`，时延权重为 `0.5`。`0.5` 是归一化时延的系数，不是每秒扣分或实际贡献固定占50%；这也不是严格的质量优先排序。原来的 v4 公式、配置及默认入口保持。
+
+两个入口都不在启动时请求质量 API 或执行语义排序门槛；训练中的评分服务契约校验保留。只把 06 替换为 07 即可选择 v5，模型与准备好的数据仍使用当前提示词版本，实验输出换用新目录；完整四卡、八卡及监控命令见 [v5 运行说明](docx/QALCO_v5_MetricX训练说明.md#6-启动与原版本隔离)。
+
+## COMET22 QALCO v4
 
 **训练入口选择：要运行此前确认的 COMET22、分项归一化、空译相对惩罚版本，请使用 `06_train_qalco_v4.sh`。`05_train_qalco_v3.sh` 是旧 v3，不是同一奖励。**
 
