@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Resume a V4 native checkpoint on four GPUs using its exact original code.
+"""Resume a V4 native checkpoint on four GPUs using the current V4 implementation.
 
 This helper lives outside the training source fingerprint. It permits only the
-explicit DP4 -> DP2 / vLLM replicas2 -> replicas1 transition; all other identity
-fields still have to match. No optimizer reset, merged-weight warm start, reward
-change, checkpoint rewrite, or edit to the main checkout is performed.
+explicit DP4 -> DP2 / vLLM replicas2 -> replicas1 transition. Current-source
+mode records source differences without blocking resume; model/data/reward and
+training settings must still match. No optimizer reset, merged-weight warm
+start, reward change or checkpoint rewrite is performed.
 
-Use --source-dir /path/to/original/FLEX-GSPO on a server without Git. The copied
-source is verified directly against launch JSON SHA256 hashes before importing.
-Without --source-dir, the existing Git history lookup remains available.
+No Git is needed by default. --source-dir selects another current FLEX-GSPO
+folder; otherwise the folder containing this script is used. Historical source
+lookup is an optional legacy mode selected only by --repo or --source-commit.
 """
 from __future__ import annotations
 
@@ -33,7 +34,7 @@ IDENTITY_FIELDS = {"schema", "framework_commit", "model_path", "parallelism",
                    "dataset_tasks", "reward_config_sha256", "settings", "code_sha256"}
 
 
-def validate_dp_migration(original: dict, current: dict) -> None:
+def validate_dp_migration(original: dict, current: dict, *, allow_code_change=False) -> None:
     for value in (original, current):
         if not isinstance(value, dict) or not IDENTITY_FIELDS.issubset(value):
             raise ValueError("Missing original/current run identity fields")
@@ -42,6 +43,11 @@ def validate_dp_migration(original: dict, current: dict) -> None:
     before, after = copy.deepcopy(original), copy.deepcopy(current)
     before.pop("parallelism")
     after.pop("parallelism")
+    if allow_code_change:
+        # The caller deliberately uses current code with the original V4
+        # reward/settings. Keep both real fingerprints in the migration audit.
+        before.pop("code_sha256")
+        after.pop("code_sha256")
     if before != after:
         changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
         raise ValueError("Migration must retain original model/data/reward/code/batch/LR horizon; changed: "
@@ -100,7 +106,7 @@ def git(repo, *args):
             f"Git failed (exit {exc.returncode}) in {repo}: "
             f"{' '.join(args)}\n{detail or '(Git returned no stderr)'}\n"
             "Git lookup needs a checkout with the original training history. "
-            "No Git is needed with --source-dir /path/to/original/FLEX-GSPO. "
+            "No Git is needed in default current-source mode or with --source-dir /path/to/FLEX-GSPO. "
             "If this directory was copied without .git, clone the repository "
             "into a separate directory and pass --repo /path/to/that/checkout. "
             "Do not use git init: it does not restore historical commits."
@@ -119,30 +125,29 @@ def validate_source_hashes(expected):
             raise ValueError("Invalid training source fingerprint")
 
 
+def source_hashes(root: Path) -> dict:
+    paths = [root / "train_megatron.py", root / "swift_plugin.py",
+             *sorted((root / "flex_gspo").glob("*.py"))]
+    return {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in paths if p.is_file()}
+
+
+def compare_source_hashes(before: dict, after: dict) -> dict:
+    return {"missing": sorted(set(before) - set(after)),
+            "extra": sorted(set(after) - set(before)),
+            "changed": sorted(name for name in set(before) & set(after) if before[name] != after[name])}
+
+
 def copied_root(directory: Path, expected: dict) -> Path:
-    """Verify a plain copied source folder without invoking Git or importing it."""
+    """Check that current source is runnable; old file hashes are not a gate."""
     validate_source_hashes(expected)
     root = directory.resolve()
     if not root.is_dir():
-        raise ValueError(f"Copied source directory does not exist: {root}")
-    paths = [root / "train_megatron.py", root / "swift_plugin.py",
-             *sorted((root / "flex_gspo").glob("*.py"))]
-    actual = {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
-              for p in paths if p.is_file()}
-    missing = sorted(set(expected) - set(actual))
-    extra = sorted(set(actual) - set(expected))
-    changed = sorted(name for name in set(expected) & set(actual) if expected[name] != actual[name])
-    if missing or extra or changed:
-        detail = json.dumps({"missing": missing, "extra": extra, "changed": changed}, ensure_ascii=False)
-        raise ValueError(f"Copied training source differs from the original launch: {root}\n{detail}\n"
-                         "Copy the original run's FLEX-GSPO source directory (including flex_gspo and Scripts). "
-                         "No files were changed; do not replace the saved fingerprints with new values.")
-    # These support files are executed by the original launcher. They were not
-    # included in its source fingerprint, so check presence without claiming a
-    # historical hash verification for them.
-    for name in ("Scripts/check_environment.py", "Scripts/_bootstrap.py"):
+        raise ValueError(f"Source directory does not exist: {root}")
+    for name in ("train_megatron.py", "swift_plugin.py", "flex_gspo/__init__.py",
+                 "Scripts/check_environment.py", "Scripts/_bootstrap.py"):
         if not (root / name).is_file():
-            raise ValueError(f"Copied source is incomplete: missing {root / name}. Copy the full FLEX-GSPO folder.")
+            raise ValueError(f"Source is incomplete: missing {root / name}. Use a complete FLEX-GSPO folder.")
     return root
 
 
@@ -206,6 +211,9 @@ def select_reward_config(document, root):
     expected = document["run_identity"]["reward_config_sha256"]
     for path in candidates:
         if path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == expected:
+            reward = json.loads(path.read_text(encoding="utf-8-sig")).get("reward", {})
+            if reward.get("version") != 4 or reward.get("quality_provider") != "comet22":
+                raise ValueError("Resume requires the original COMET22 V4 reward config, not a V5 config")
             return path.resolve()
     raise ValueError("Cannot find the original reward config; restore its exact bytes, not a new reward")
 
@@ -219,9 +227,9 @@ def main(argv=None):
     parser.add_argument("--master-port", type=int, default=29583, help="Unused torchrun rendezvous port")
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--source-dir", type=Path,
-                        help="Original FLEX-GSPO folder copied from the training server; hash-checked, no Git required")
+                        help="Current FLEX-GSPO folder; defaults beside this script, source differences are logged, no Git required")
     source.add_argument("--repo", type=Path,
-                        help="Alternative Git checkout with original commit history (default: repository beside this script)")
+                        help="Optional legacy mode: find exact historical source using this Git checkout")
     parser.add_argument("--source-commit", help="Optional exact historical commit; still checked against source hashes")
     parser.add_argument("--dry-run", action="store_true", help="Print migration plan without worktree/model/service changes")
     options = parser.parse_args(argv)
@@ -259,11 +267,17 @@ def main(argv=None):
         output = options.output_dir.resolve()
         if output.exists() and any(output.iterdir()):
             raise ValueError("Use a new empty output directory; the original run is preserved")
-        if options.source_dir is not None:
-            root = copied_root(options.source_dir, original["code_sha256"])
+        use_current_source = options.repo is None and options.source_commit is None
+        if use_current_source:
+            source_dir = options.source_dir if options.source_dir is not None else Path(__file__).resolve().parents[1]
+            root = copied_root(source_dir, original["code_sha256"])
             reward_config = select_reward_config(document, root)
+            actual_source = source_hashes(root)
+            source_changes = compare_source_hashes(original["code_sha256"], actual_source)
             commit, repo = None, None
-            print(f"[migration] Copied source verified: {root}; Git not used.", flush=True)
+            print(f"[migration] Using current source: {root}; COMET22 V4 retained; Git not used.", flush=True)
+            print("[migration] Source differences recorded (not a resume blocker): "
+                  + json.dumps(source_changes, ensure_ascii=False), flush=True)
         else:
             repo_arg = options.repo if options.repo is not None else Path(__file__).resolve().parents[2]
             repo = Path(git(repo_arg, "rev-parse", "--show-toplevel").decode().strip()).resolve()
@@ -273,8 +287,11 @@ def main(argv=None):
         plan = {"migration": "native_v4_world8_to_world4_dp4_to_dp2", "original_launch": str(launch),
                 "migration_helper_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                 "source_commit": commit,
-                "source_mode": "copied" if options.source_dir is not None else "git_history",
-                "source_dir": str(root) if options.source_dir is not None else None,
+                "source_mode": "current" if use_current_source else "git_history",
+                "source_policy": "use_current_v4" if use_current_source else "exact_historical",
+                "source_dir": str(root) if use_current_source else None,
+                "source_code_sha256": actual_source if use_current_source else original["code_sha256"],
+                "source_changes": source_changes if use_current_source else {},
                 "checkpoint": str(checkpoint), "restored_iteration": iteration,
                 "original_parallelism": original["parallelism"], "new_parallelism": LAYOUT4,
                 "global_batch_size": original["settings"].get("global_batch_size"),
@@ -286,12 +303,11 @@ def main(argv=None):
         if options.dry_run:
             print("[migration] Plan only; checkpoint payloads/framework/GPU loading are not verified.", flush=True)
             return 0
-        if options.source_dir is None:
+        if not use_current_source:
             root = historical_root(repo, commit, original["code_sha256"])
             reward_config = select_reward_config(document, root)
         # torchrun and its `python -m` workers put cwd before PYTHONPATH.
-        # Keep both the parent and workers anchored to the historical source,
-        # otherwise a current flex_gspo package could shadow the checked files.
+        # Keep both parent and workers anchored to the selected source folder.
         for value in (original["settings"]["model"], flag_value(document["argv"], "--dataset")):
             if not Path(value).is_absolute():
                 raise ValueError("Migration requires original absolute model/dataset paths")
@@ -304,22 +320,26 @@ def main(argv=None):
         forwarded.extend(["--master-port", str(options.master_port)])
 
         def verify_migration(args, identity):
-            # Called by the ORIGINAL launcher after its native checkpoint,
+            # Called by the selected launcher after its native checkpoint,
             # optimizer/RNG, model, dataset, and prompt preflight succeeds.
             if Path(args.resume_from).resolve() != checkpoint or Path(args.output).resolve() != output:
                 raise ValueError("Migration checkpoint/output mismatch")
-            validate_dp_migration(original, identity)
+            validate_dp_migration(original, identity, allow_code_change=use_current_source)
             # Persistent evidence for the deliberate layout change. Native
             # launcher then writes its normal new run/session identity.
             output.mkdir(parents=True, exist_ok=True)
             with (output / "dp_migration.json").open("x", encoding="utf-8") as handle:
-                json.dump({**plan, "original_launch_sha256": hashlib.sha256(launch.read_bytes()).hexdigest(),
+                json.dump({**plan, "source_changes": compare_source_hashes(original["code_sha256"], identity["code_sha256"]),
+                           "source_code_sha256": identity["code_sha256"],
+                           "original_launch_sha256": hashlib.sha256(launch.read_bytes()).hexdigest(),
                            "original_identity": original, "new_identity": identity}, handle, ensure_ascii=False, indent=2)
-            print("[migration] Verified: only DP/world size and rollout replica count changed. "
-                  "Loading native optimizer/scheduler/RNG; global batch and training horizon retained.", flush=True)
+            print("[migration] Verified: original V4 reward/model/data/training settings retained; "
+                  "DP/world size and rollout replicas migrated. "
+                  + ("Current source differences recorded. " if use_current_source else "Historical source retained. ")
+                  + "Loading native optimizer/scheduler/RNG; global batch and training horizon retained.", flush=True)
 
-        # This explicit migration entry changes only the identity predicate,
-        # never the trainer's model/optimizer algorithms or checkpoint contents.
+        # Preserve original identity evidence; never forge the launch hashes or
+        # reset optimizer state to disguise a current-code continuation as SFT.
         launcher.verify_resume_identity = verify_migration
         return launcher.main(forwarded)
     except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as exc:

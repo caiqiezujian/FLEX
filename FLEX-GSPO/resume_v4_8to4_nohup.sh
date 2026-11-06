@@ -10,12 +10,10 @@ cd /data/yb/Code/FLEX/FLEX-GSPO
 source /data/yb/venvs/flex-gspo-online/bin/activate
 
 # The migration helper automatically reads original training settings from launch JSON.
-# --source-dir uses the ORIGINAL training code copied from the eight-GPU server.
-# It checks file SHA256 against launch JSON; no Git/.git/network needed on this server.
-# Keep the full original FLEX-GSPO folder (flex_gspo/, Scripts/, configs/ included).
-# You may update Scripts/resume_dp_migration.py alone; it is outside the training fingerprint.
-# If this checkout contains newer training code, point --source-dir to a separate original copy.
-# No edits to source files, old checkpoints or old logs.
+# --source-dir uses the CURRENT FLEX-GSPO code and continues the original COMET22 V4 run.
+# No Git/.git/network needed to select source. New V5 files do not switch the reward to V5.
+# Source differences are recorded, not rejected; original V4 config/model/data/settings still checked.
+# No edits to source files, old checkpoints or old logs; optimizer/RNG restoration stays enabled.
 unset CUDA_LAUNCH_BLOCKING TORCH_SHOW_CPP_STACKTRACES TORCH_DISTRIBUTED_DEBUG
 unset NCCL_DEBUG NCCL_DEBUG_SUBSYS FLEX_DEBUG_OFFLOAD
 export PYTHONFAULTHANDLER=1
@@ -25,7 +23,7 @@ mkdir -p /data/yb/Code/FLEX/outputs/logs
 # REQUIRED: replace launch-json and resume-from with files from the SAME old run.
 # --launch-json: original output root/launch_*.json, NOT checkpoint args.json.
 # --resume-from: .../v0-TIMESTAMP/checkpoint-500, NEVER checkpoint-500-merged.
-# --source-dir: copied ORIGINAL FLEX-GSPO, not its parent and not checkpoint-500.
+# --source-dir: CURRENT FLEX-GSPO, not its parent and not checkpoint-500; optional (script folder is default).
 # --output-dir: a NEW empty directory (also change the log/PID names for another retry).
 # --gpu-ids: FOUR available physical GPU IDs; e.g. 0,2,4,6, not necessarily 0..3.
 # Keep the original global batch (normally64), micro2, total3000 and save500:

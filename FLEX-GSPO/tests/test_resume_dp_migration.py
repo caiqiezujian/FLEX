@@ -144,6 +144,37 @@ class DPMigrationIdentityTests(unittest.TestCase):
             migration.validate_dp_migration(self.original, current)
 
 
+class DPMigrationCurrentCodeTests(unittest.TestCase):
+    def test_current_code_can_change_without_overwriting_old_identity(self):
+        original = original_plan()["run_identity"]
+        current = four_gpu_identity(original)
+        old_source = copy.deepcopy(original["code_sha256"])
+        current["code_sha256"] = {"train_megatron.py": "a" * 64,
+                                  "swift_plugin.py": "b" * 64,
+                                  "flex_gspo/metricx_reward.py": "c" * 64}
+        migration.validate_dp_migration(original, current, allow_code_change=True)
+        self.assertEqual(original["code_sha256"], old_source)
+        self.assertNotEqual(current["code_sha256"], old_source)
+        with self.assertRaises(ValueError):
+            migration.validate_dp_migration(original, current)
+
+    def test_allowing_current_code_does_not_allow_different_training_or_reward(self):
+        original = original_plan()["run_identity"]
+        current = four_gpu_identity(original)
+        current["code_sha256"] = {"train_megatron.py": "new current source"}
+        for field, value in (("reward_config_sha256", "v5"), ("dataset_sha256", "other data"),
+                             ("model_path", "/new/model"), ("framework_commit", "other framework")):
+            changed = copy.deepcopy(current)
+            changed[field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                migration.validate_dp_migration(original, changed, allow_code_change=True)
+        for field, value in (("global_batch_size", 32), ("train_iters", 2500), ("lr", 2e-6)):
+            changed = copy.deepcopy(current)
+            changed["settings"][field] = value
+            with self.subTest(setting=field), self.assertRaises(ValueError):
+                migration.validate_dp_migration(original, changed, allow_code_change=True)
+
+
 class DPMigrationArgumentsTests(unittest.TestCase):
     def setUp(self):
         self.document = original_plan()

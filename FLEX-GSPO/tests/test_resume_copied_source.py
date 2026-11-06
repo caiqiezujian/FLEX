@@ -1,4 +1,5 @@
-"""Copied-source migration needs exact source bytes, never a Git executable."""
+"""Current-code V4 resume records source changes while retaining training state."""
+import copy
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 import hashlib
 import importlib.util
@@ -75,6 +76,21 @@ def forbid_git(stack):
             for name in ("git", "find_original_commit", "historical_root")]
 
 
+def printed_plan(text):
+    # Source-change diagnostics may print their own JSON before the full plan.
+    decoder = json.JSONDecoder()
+    for index, character in enumerate(text):
+        if character != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and "migration" in value:
+            return value
+    raise AssertionError("No migration plan was printed")
+
+
 class CopiedSourceValidationTests(unittest.TestCase):
     def test_exact_bytes_and_set_accept_without_git_import_or_rejecting_extra_support_scripts(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
@@ -87,7 +103,7 @@ class CopiedSourceValidationTests(unittest.TestCase):
             for guard in guards:
                 guard.assert_not_called()
 
-    def test_missing_extra_and_changed_training_files_are_rejected_without_repair(self):
+    def test_optional_missing_extra_and_changed_sources_are_allowed_and_recorded_without_repair(self):
         for kind in ("missing", "extra", "changed"):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -98,17 +114,25 @@ class CopiedSourceValidationTests(unittest.TestCase):
                 else:
                     target.write_bytes(b"# different source\n")
                 snapshot = {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
-                with self.assertRaisesRegex(ValueError, kind):
-                    migration.copied_root(root, expected)
+                self.assertEqual(migration.copied_root(root, expected), root.resolve())
+                actual = migration.source_hashes(root)
+                changes = migration.compare_source_hashes(expected, actual)
+                expected_changes = {"missing": [], "extra": [], "changed": []}
+                expected_changes[kind] = [target.relative_to(root).as_posix()]
+                self.assertEqual(changes, expected_changes)
+                if kind != "missing":
+                    self.assertEqual(actual[target.relative_to(root).as_posix()],
+                                     hashlib.sha256(target.read_bytes()).hexdigest())
                 self.assertEqual({p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}, snapshot)
 
-    def test_runtime_support_scripts_are_required_even_outside_the_old_hash_set(self):
-        for name in ("Scripts/check_environment.py", "Scripts/_bootstrap.py"):
+    def test_essential_source_and_runtime_support_files_are_still_required(self):
+        for name in ("train_megatron.py", "swift_plugin.py", "flex_gspo/__init__.py",
+                     "Scripts/check_environment.py", "Scripts/_bootstrap.py"):
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 expected = source_fixture(root)
                 (root / name).unlink()
-                with self.assertRaisesRegex(ValueError, "incomplete"):
+                with self.assertRaises(ValueError):
                     migration.copied_root(root, expected)
 
     def test_invalid_fingerprints_and_wrong_directory_are_rejected(self):
@@ -126,7 +150,7 @@ class CopiedSourceValidationTests(unittest.TestCase):
 
 
 class CopiedSourceMainTests(unittest.TestCase):
-    def test_dry_run_verifies_source_and_reports_copied_provenance_without_git_or_execution(self):
+    def test_dry_run_reports_current_source_provenance_without_git_or_execution(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
             source, _, _, _, output, _, argv = migration_fixture(directory)
             guards = forbid_git(stack)
@@ -135,8 +159,11 @@ class CopiedSourceMainTests(unittest.TestCase):
             stdout = stack.enter_context(redirect_stdout(StringIO()))
             self.assertEqual(migration.main([*argv, "--dry-run"]), 0)
             text = stdout.getvalue()
-            plan = json.JSONDecoder().raw_decode(text[text.index("{"):])[0]
-            self.assertEqual(plan["source_mode"], "copied")
+            plan = printed_plan(text)
+            self.assertEqual(plan["source_mode"], "current")
+            self.assertEqual(plan["source_policy"], "use_current_v4")
+            self.assertEqual(plan["source_changes"], {"missing": [], "extra": [], "changed": []})
+            self.assertEqual(plan["source_code_sha256"], migration.source_hashes(source))
             self.assertIsNone(plan["source_commit"])
             self.assertEqual(plan["source_dir"], str(source.resolve()))
             self.assertEqual((plan["restored_iteration"], plan["global_batch_size"], plan["total_train_iters"]),
@@ -147,16 +174,47 @@ class CopiedSourceMainTests(unittest.TestCase):
             for guard in guards:
                 guard.assert_not_called()
 
-    def test_source_mismatch_stops_before_any_source_execution_or_output_creation(self):
+    def test_source_changes_are_allowed_and_reported_by_dry_run(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
-            source, _, _, _, output, _, argv = migration_fixture(directory)
-            (source / "train_megatron.py").write_bytes(b"raise AssertionError('do not execute changed source')\n")
+            source, _, _, launch, output, document, argv = migration_fixture(directory)
+            original_launch = launch.read_bytes()
+            (source / "train_megatron.py").write_bytes(b"raise AssertionError('dry run must not execute source')\n")
+            (source / "flex_gspo" / "metricx_reward.py").write_bytes(b"# new V5 module alongside retained V4\n")
             guards = forbid_git(stack)
             loader = stack.enter_context(patch.object(migration.importlib.util, "spec_from_file_location",
-                                                      side_effect=AssertionError("Mismatched source imported")))
-            stderr = stack.enter_context(redirect_stderr(StringIO()))
-            self.assertEqual(migration.main(argv), 2)
-            self.assertIn("differs from the original", stderr.getvalue())
+                                                      side_effect=AssertionError("Dry run imported source")))
+            stdout = stack.enter_context(redirect_stdout(StringIO()))
+            stack.enter_context(redirect_stderr(StringIO()))
+            self.assertEqual(migration.main([*argv, "--dry-run"]), 0)
+            text = stdout.getvalue()
+            plan = printed_plan(text)
+            self.assertEqual(plan["source_changes"], {"missing": [], "extra": ["flex_gspo/metricx_reward.py"],
+                                                      "changed": ["train_megatron.py"]})
+            self.assertNotEqual(plan["source_code_sha256"], document["run_identity"]["code_sha256"])
+            self.assertEqual(launch.read_bytes(), original_launch)
+            self.assertFalse(output.exists())
+            loader.assert_not_called()
+            for guard in guards:
+                guard.assert_not_called()
+
+    def test_default_source_is_the_current_helper_directory_without_any_git_lookup(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            source, _, _, _, output, _, argv = migration_fixture(directory)
+            helper = source / "Scripts" / "resume_dp_migration.py"
+            helper.write_bytes(Path(migration.__file__).read_bytes())
+            # The default must use the helper's FLEX-GSPO, not a surrounding Git checkout.
+            del argv[-2:]
+            guards = forbid_git(stack)
+            stack.enter_context(patch.object(migration, "__file__", str(helper)))
+            loader = stack.enter_context(patch.object(migration.importlib.util, "spec_from_file_location",
+                                                      side_effect=AssertionError("Dry run imported source")))
+            stdout = stack.enter_context(redirect_stdout(StringIO()))
+            self.assertEqual(migration.main([*argv, "--dry-run"]), 0)
+            text = stdout.getvalue()
+            plan = printed_plan(text)
+            self.assertEqual(plan["source_mode"], "current")
+            self.assertEqual(plan["source_dir"], str(source.resolve()))
+            self.assertIsNone(plan["source_commit"])
             self.assertFalse(output.exists())
             loader.assert_not_called()
             for guard in guards:
@@ -173,7 +231,7 @@ class CopiedSourceMainTests(unittest.TestCase):
             for guard in guards:
                 guard.assert_not_called()
 
-    def test_main_uses_copied_code_in_real_child_and_records_native_migration_without_git(self):
+    def test_main_uses_current_code_and_preserves_both_original_and_new_source_identities(self):
         previous_cwd, previous_sys_path = Path.cwd(), sys.path[:]
         with tempfile.TemporaryDirectory() as directory:
             source, original, checkpoint, launch, output, document, argv = migration_fixture(directory)
@@ -181,7 +239,10 @@ class CopiedSourceMainTests(unittest.TestCase):
             (shadow / "flex_gspo").mkdir(parents=True)
             (shadow / "flex_gspo" / "__init__.py").write_text("ORIGIN = 'CURRENT'\n", encoding="utf-8")
             original_files = {p.relative_to(original): p.read_bytes() for p in original.rglob("*") if p.is_file()}
+            (source / "flex_gspo" / "qalco.py").write_bytes(b"# updated dispatch retaining V4\n")
+            (source / "flex_gspo" / "metricx_reward.py").write_bytes(b"# independent V5 implementation\n")
             restored_identity = four_gpu_identity(document["run_identity"])
+            restored_identity["code_sha256"] = migration.source_hashes(source)
             observed = {}
             test = self
 
@@ -226,7 +287,12 @@ class CopiedSourceMainTests(unittest.TestCase):
                         guard.assert_not_called()
                 self.assertEqual(observed["origin"], "COPIED")
                 audit = json.loads((output / "dp_migration.json").read_text(encoding="utf-8"))
-                self.assertEqual(audit["source_mode"], "copied")
+                self.assertEqual(audit["source_mode"], "current")
+                self.assertEqual(audit["source_policy"], "use_current_v4")
+                self.assertEqual(audit["source_changes"], {"missing": [], "extra": ["flex_gspo/metricx_reward.py"],
+                                                          "changed": ["flex_gspo/qalco.py"]})
+                self.assertEqual(audit["source_code_sha256"], restored_identity["code_sha256"])
+                self.assertNotEqual(audit["source_code_sha256"], document["run_identity"]["code_sha256"])
                 self.assertIsNone(audit["source_commit"])
                 self.assertEqual(audit["source_dir"], str(source.resolve()))
                 self.assertEqual(audit["original_identity"], document["run_identity"])
@@ -240,6 +306,35 @@ class CopiedSourceMainTests(unittest.TestCase):
             finally:
                 os.chdir(previous_cwd)
                 sys.path[:] = previous_sys_path
+
+
+class CurrentCodeIdentityTests(unittest.TestCase):
+    def test_source_change_requires_explicit_opt_in_and_does_not_rewrite_original_identity(self):
+        original = original_plan()["run_identity"]
+        current = four_gpu_identity(original)
+        current["code_sha256"] = {"train_megatron.py": "updated-launcher", "flex_gspo/metricx_reward.py": "new-module"}
+        before = copy.deepcopy((original, current))
+        with self.assertRaises(ValueError):
+            migration.validate_dp_migration(original, current)
+        self.assertIsNone(migration.validate_dp_migration(original, current, allow_code_change=True))
+        self.assertEqual((original, current), before)
+
+    def test_allowing_current_code_does_not_allow_model_data_reward_or_training_changes(self):
+        original = original_plan()["run_identity"]
+        for field, value in (("model_path", "/different-base"), ("dataset_sha256", "different-data"),
+                             ("reward_config_sha256", "different-reward"), ("framework_commit", "different-framework")):
+            current = four_gpu_identity(original)
+            current["code_sha256"] = {"train_megatron.py": "updated-launcher"}
+            current[field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                migration.validate_dp_migration(original, current, allow_code_change=True)
+        for field, value in (("global_batch_size", 32), ("train_iters", 2500), ("group_size", 4),
+                             ("kl_beta", 0), ("model", "/checkpoint-500-merged")):
+            current = four_gpu_identity(original)
+            current["code_sha256"] = {"train_megatron.py": "updated-launcher"}
+            current["settings"][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                migration.validate_dp_migration(original, current, allow_code_change=True)
 
 
 if __name__ == "__main__":
