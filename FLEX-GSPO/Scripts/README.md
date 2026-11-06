@@ -16,6 +16,7 @@
 | [Scripts/collect_brevity_samples.py](collect_brevity_samples.py) | 运行目录、`--dataset`、`--output`，可选 `--include-increments` | 导出观测候选和非空增量；不请求评分服务，不保证完整 G8 或全部 WAIT 轮 |
 | [Scripts/analyze_training_run.py](analyze_training_run.py) | 运行目录、必需的 `--native-log` 和 `--output-dir`，可选 `--reward-config` | 停止后的离线日志审查，不请求评分服务；公式复核受原运行身份约束 |
 | [Scripts/relocate_prepared_data.py](relocate_prepared_data.py) | 旧 prepared `--input-jsonl`、已复制 WAV 的 `--audio-dir`、新 `--output-dir`，可用 `--workers 16` | 核验 WAV 元数据，重建两处音频引用；不复制音频、不请求服务、不覆盖旧清单 |
+| [Scripts/resume_dp_migration.py](resume_dp_migration.py) | 原八卡 v4 的 `--launch-json`、原生 `--resume-from`、新 `--output-dir`、四个 `--gpu-ids` | `--source-dir` 直接校验复制的原训练代码，不需要 Git；恢复原生优化器等状态，保持原全局 batch 和训练总步数 |
 
 各入口可用 `python3 Scripts/<脚本名>.py --help` 查看参数。训练、手工服务诊断与监控的完整示例见[项目 README](../README.md)、[QALCO v4 训练说明](../docx/QALCO_v4训练说明.md)和 [QALCO v3 历史训练说明](../docx/QALCO_v3训练说明.md)。
 
@@ -26,6 +27,42 @@
 默认输出到运行目录下新的 `diagnostics/reward_revision_<时间>/`。先审查 `summary.txt`，再查看 `review_part_*.txt`（每份最多 5 个完整 G8）；`selected_groups.jsonl` 保存原始候选与对应任务，供后续离线奖励对照。另有逐步 `all_steps.csv`、全部组的 `group_statistics.jsonl`、空译任务统计 `empty_tasks.jsonl`，以及启动配置和日志快照来源 `provenance.json`。不会覆盖已有报告。
 
 迁移后的清单生成、Docker 路径、环境检查和完整训练命令，见 [data06 迁移与 v3 训练](../docx/data06迁移与v3训练.md)。
+
+## 跨服务器八卡转四卡恢复：不安装 Git
+
+Git 只用于可选的历史代码查找，不是 GSPO 训练或 Megatron 原生恢复的必要条件。
+第二台服务器使用 `--source-dir` 指定从原训练服务器复制的完整 `FLEX-GSPO` 文件夹即可。
+该目录包含 `train_megatron.py`、`swift_plugin.py`、`flex_gspo/`、`Scripts/` 和配置；不需要 `.git`。
+把本次新版 `Scripts/resume_dp_migration.py` 单独覆盖到复制目录中即可使用新参数，该辅助脚本不在旧训练源码指纹内。
+不要为了更新辅助脚本，把原训练核心文件换成最新 v5 文件。
+
+脚本在导入代码前，逐一核对旧 launch JSON 中的训练源码文件集合及 SHA256，并核对奖励配置的 SHA256。
+若不一致，会列出缺失、多出、内容变化的文件；不会静默更换奖励、改写旧指纹或重新开始训练。
+`Scripts/check_environment.py` 和 `_bootstrap.py` 在旧指纹外，只检查是否存在；仍应随原目录复制。
+选择 `--source-dir` 后不调用 Git，不创建 worktree，不需要网络来查找源码；训练时 COMET22 评分服务仍须可访问。
+如果复制目录在另一个路径，修改下面的 `--source-dir` 即可；参数指向 `FLEX-GSPO` 本层，不是 checkpoint。
+
+下面是已知原运行的路径示例。输出目录必须为空，GPU 4、5、6、7 必须实际可用。
+环境仍使用原训练 Docker 中的兼容 Python 环境。原 SFT、训练 JSONL 和引用音频在新机需可访问；此入口不做路径重写，原模型大小/时间戳及数据身份检查继续执行。
+
+```bash
+cd /data/yb/Code/FLEX/FLEX-GSPO
+source /data/yb/venvs/flex-gspo-online/bin/activate
+mkdir -p /data/yb/Code/FLEX/outputs/logs
+
+nohup python3 -u Scripts/resume_dp_migration.py \
+  --source-dir /data/yb/Code/FLEX/FLEX-GSPO \
+  --launch-json /data/yb/Code/FLEX/outputs/gspo_v4_comet22_g8_b32_3000_1104_001/launch_20261104T175951_477020Z.json \
+  --resume-from /data/yb/Code/FLEX/outputs/gspo_v4_comet22_g8_b32_3000_1104_001/v0-20261105-020043/checkpoint-500 \
+  --output-dir /data/yb/Code/FLEX/outputs/gspo_v4_resume500_4gpu_nogit_001 \
+  --gpu-ids 4,5,6,7 \
+  --master-port 29583 \
+  > /data/yb/Code/FLEX/outputs/logs/gspo_v4_resume500_4gpu_nogit_001.log 2>&1 < /dev/null &
+```
+
+`--dry-run` 也支持无 Git 路径：核对源码/配置及迁移计划后退出，不加载模型或访问评分服务。
+正常启动在新输出目录的 `dp_migration.json` 中记录 `source_mode=copied` 和实际源码路径；未查询 Git 时 `source_commit` 为 null。
+这不代表已验证 GPU 上的优化器重分片、offload 或训练成功；以实际恢复步数和更新日志为准。
 
 ## 离线奖励回放
 

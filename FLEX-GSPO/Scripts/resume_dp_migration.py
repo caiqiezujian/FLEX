@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Resume a V4 native checkpoint on four GPUs using its exact historical code.
+"""Resume a V4 native checkpoint on four GPUs using its exact original code.
 
 This helper lives outside the training source fingerprint. It permits only the
 explicit DP4 -> DP2 / vLLM replicas2 -> replicas1 transition; all other identity
 fields still have to match. No optimizer reset, merged-weight warm start, reward
 change, checkpoint rewrite, or edit to the main checkout is performed.
+
+Use --source-dir /path/to/original/FLEX-GSPO on a server without Git. The copied
+source is verified directly against launch JSON SHA256 hashes before importing.
+Without --source-dir, the existing Git history lookup remains available.
 """
 from __future__ import annotations
 
@@ -84,8 +88,23 @@ def build_resume_argv(document, checkpoint: Path, output: Path, gpu_ids: str,
 
 
 def git(repo, *args):
-    result = subprocess.run(["git", "-C", str(repo), *args], check=True, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE)
+    command = ["git", "-C", str(repo), *args]
+    try:
+        result = subprocess.run(command, check=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError as exc:
+        # Keep Git's reason visible: exit 128 alone cannot distinguish a copied
+        # directory without .git from ownership checks or a broken worktree.
+        detail = (exc.stderr or b"").decode("utf-8", errors="replace").strip()
+        raise ValueError(
+            f"Git failed (exit {exc.returncode}) in {repo}: "
+            f"{' '.join(args)}\n{detail or '(Git returned no stderr)'}\n"
+            "Git lookup needs a checkout with the original training history. "
+            "No Git is needed with --source-dir /path/to/original/FLEX-GSPO. "
+            "If this directory was copied without .git, clone the repository "
+            "into a separate directory and pass --repo /path/to/that/checkout. "
+            "Do not use git init: it does not restore historical commits."
+        ) from exc
     return result.stdout
 
 
@@ -98,6 +117,33 @@ def validate_source_hashes(expected):
                    (len(path.parts) == 2 and path.parts[0] == "flex_gspo" and path.suffix == ".py"))
         if not allowed or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise ValueError("Invalid training source fingerprint")
+
+
+def copied_root(directory: Path, expected: dict) -> Path:
+    """Verify a plain copied source folder without invoking Git or importing it."""
+    validate_source_hashes(expected)
+    root = directory.resolve()
+    if not root.is_dir():
+        raise ValueError(f"Copied source directory does not exist: {root}")
+    paths = [root / "train_megatron.py", root / "swift_plugin.py",
+             *sorted((root / "flex_gspo").glob("*.py"))]
+    actual = {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+              for p in paths if p.is_file()}
+    missing = sorted(set(expected) - set(actual))
+    extra = sorted(set(actual) - set(expected))
+    changed = sorted(name for name in set(expected) & set(actual) if expected[name] != actual[name])
+    if missing or extra or changed:
+        detail = json.dumps({"missing": missing, "extra": extra, "changed": changed}, ensure_ascii=False)
+        raise ValueError(f"Copied training source differs from the original launch: {root}\n{detail}\n"
+                         "Copy the original run's FLEX-GSPO source directory (including flex_gspo and Scripts). "
+                         "No files were changed; do not replace the saved fingerprints with new values.")
+    # These support files are executed by the original launcher. They were not
+    # included in its source fingerprint, so check presence without claiming a
+    # historical hash verification for them.
+    for name in ("Scripts/check_environment.py", "Scripts/_bootstrap.py"):
+        if not (root / name).is_file():
+            raise ValueError(f"Copied source is incomplete: missing {root / name}. Copy the full FLEX-GSPO folder.")
+    return root
 
 
 def find_original_commit(repo: Path, expected: dict, explicit=None):
@@ -171,11 +217,17 @@ def main(argv=None):
     parser.add_argument("--output-dir", required=True, type=Path, help="New migration output directory")
     parser.add_argument("--gpu-ids", required=True, help="Four actually available GPU IDs, e.g. 0,2,4,6")
     parser.add_argument("--master-port", type=int, default=29583, help="Unused torchrun rendezvous port")
-    parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[2])
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--source-dir", type=Path,
+                        help="Original FLEX-GSPO folder copied from the training server; hash-checked, no Git required")
+    source.add_argument("--repo", type=Path,
+                        help="Alternative Git checkout with original commit history (default: repository beside this script)")
     parser.add_argument("--source-commit", help="Optional exact historical commit; still checked against source hashes")
     parser.add_argument("--dry-run", action="store_true", help="Print migration plan without worktree/model/service changes")
     options = parser.parse_args(argv)
     try:
+        if options.source_dir is not None and options.source_commit is not None:
+            raise ValueError("--source-commit is only for Git lookup; omit it when using --source-dir")
         document = json.loads(options.launch_json.read_text(encoding="utf-8-sig"))
         original = document["run_identity"]
         expected_new = {**original, "parallelism": LAYOUT4}
@@ -207,13 +259,23 @@ def main(argv=None):
         output = options.output_dir.resolve()
         if output.exists() and any(output.iterdir()):
             raise ValueError("Use a new empty output directory; the original run is preserved")
-        repo = Path(git(options.repo, "rev-parse", "--show-toplevel").decode().strip()).resolve()
-        commit = find_original_commit(repo, original["code_sha256"], options.source_commit)
+        if options.source_dir is not None:
+            root = copied_root(options.source_dir, original["code_sha256"])
+            reward_config = select_reward_config(document, root)
+            commit, repo = None, None
+            print(f"[migration] Copied source verified: {root}; Git not used.", flush=True)
+        else:
+            repo_arg = options.repo if options.repo is not None else Path(__file__).resolve().parents[2]
+            repo = Path(git(repo_arg, "rev-parse", "--show-toplevel").decode().strip()).resolve()
+            commit = find_original_commit(repo, original["code_sha256"], options.source_commit)
         if not 1024 <= options.master_port <= 65535:
             raise ValueError("master-port must be in 1024..65535")
         plan = {"migration": "native_v4_world8_to_world4_dp4_to_dp2", "original_launch": str(launch),
                 "migration_helper_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-                "source_commit": commit, "checkpoint": str(checkpoint), "restored_iteration": iteration,
+                "source_commit": commit,
+                "source_mode": "copied" if options.source_dir is not None else "git_history",
+                "source_dir": str(root) if options.source_dir is not None else None,
+                "checkpoint": str(checkpoint), "restored_iteration": iteration,
                 "original_parallelism": original["parallelism"], "new_parallelism": LAYOUT4,
                 "global_batch_size": original["settings"].get("global_batch_size"),
                 "total_train_iters": original["settings"].get("train_iters"),
@@ -224,8 +286,9 @@ def main(argv=None):
         if options.dry_run:
             print("[migration] Plan only; checkpoint payloads/framework/GPU loading are not verified.", flush=True)
             return 0
-        root = historical_root(repo, commit, original["code_sha256"])
-        reward_config = select_reward_config(document, root)
+        if options.source_dir is None:
+            root = historical_root(repo, commit, original["code_sha256"])
+            reward_config = select_reward_config(document, root)
         # torchrun and its `python -m` workers put cwd before PYTHONPATH.
         # Keep both the parent and workers anchored to the historical source,
         # otherwise a current flex_gspo package could shadow the checked files.

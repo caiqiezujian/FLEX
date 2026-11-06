@@ -223,6 +223,28 @@ class DPMigrationArgumentsTests(unittest.TestCase):
 
 
 class DPMigrationHistoricalSourceTests(unittest.TestCase):
+    def test_copied_directory_without_git_reports_original_error_and_history_hint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "copied code"
+            repo.mkdir()
+            with self.assertRaises(ValueError) as raised:
+                migration.git(repo, "rev-parse", "--show-toplevel")
+            message = str(raised.exception)
+            self.assertIn("exit 128", message)
+            self.assertIn(str(repo), message)
+            self.assertIn("fatal:", message)
+            self.assertIn("--repo", message)
+            self.assertIn("Do not use git init", message)
+            self.assertEqual(list(repo.iterdir()), [])
+
+    def test_git_ownership_error_is_preserved_without_automatically_trusting_path(self):
+        error = subprocess.CalledProcessError(
+            128, ["git"], stderr=b"fatal: detected dubious ownership in repository at '/srv/copied'")
+        with patch.object(migration.subprocess, "run", side_effect=error) as run:
+            with self.assertRaisesRegex(ValueError, "detected dubious ownership"):
+                migration.git(Path("/srv/copied"), "rev-parse", "--show-toplevel")
+        self.assertEqual(run.call_count, 1)
+
     def git(self, repo, *args):
         return subprocess.run(["git", "-C", str(repo), *args], check=True,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.decode().strip()

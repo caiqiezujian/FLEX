@@ -10,8 +10,12 @@ cd /data/yb/Code/FLEX/FLEX-GSPO
 source /data/yb/venvs/flex-gspo-online/bin/activate
 
 # The migration helper automatically reads original training settings from launch JSON.
-# It finds matching historical Git code and creates a SEPARATE sibling worktree.
-# No checkout/reset of the current repository; no edits to old checkpoints/logs.
+# --source-dir uses the ORIGINAL training code copied from the eight-GPU server.
+# It checks file SHA256 against launch JSON; no Git/.git/network needed on this server.
+# Keep the full original FLEX-GSPO folder (flex_gspo/, Scripts/, configs/ included).
+# You may update Scripts/resume_dp_migration.py alone; it is outside the training fingerprint.
+# If this checkout contains newer training code, point --source-dir to a separate original copy.
+# No edits to source files, old checkpoints or old logs.
 unset CUDA_LAUNCH_BLOCKING TORCH_SHOW_CPP_STACKTRACES TORCH_DISTRIBUTED_DEBUG
 unset NCCL_DEBUG NCCL_DEBUG_SUBSYS FLEX_DEBUG_OFFLOAD
 export PYTHONFAULTHANDLER=1
@@ -21,12 +25,14 @@ mkdir -p /data/yb/Code/FLEX/outputs/logs
 # REQUIRED: replace launch-json and resume-from with files from the SAME old run.
 # --launch-json: original output root/launch_*.json, NOT checkpoint args.json.
 # --resume-from: .../v0-TIMESTAMP/checkpoint-500, NEVER checkpoint-500-merged.
+# --source-dir: copied ORIGINAL FLEX-GSPO, not its parent and not checkpoint-500.
 # --output-dir: a NEW empty directory (also change the log/PID names for another retry).
 # --gpu-ids: FOUR available physical GPU IDs; e.g. 0,2,4,6, not necessarily 0..3.
 # Keep the original global batch (normally64), micro2, total3000 and save500:
 # these are reconstructed from the saved launch; do not manually reduce batch to32.
 # --master-port: choose another free port if29583 is used.
 nohup python3 -u Scripts/resume_dp_migration.py \
+  --source-dir /data/yb/Code/FLEX/FLEX-GSPO \
   --launch-json "/替换为原八卡训练输出根目录/launch_实际时间.json" \
   --resume-from "/替换为原八卡训练输出根目录/v0-实际时间/checkpoint-500" \
   --output-dir /data/yb/Code/FLEX/outputs/gspo_v4_resume500_4gpu_g8_b64_001 \
