@@ -34,7 +34,8 @@ IDENTITY_FIELDS = {"schema", "framework_commit", "model_path", "parallelism",
                    "dataset_tasks", "reward_config_sha256", "settings", "code_sha256"}
 
 
-def validate_dp_migration(original: dict, current: dict, *, allow_code_change=False) -> None:
+def validate_dp_migration(original: dict, current: dict, *, allow_code_change=False,
+                          relocated_model=None) -> None:
     for value in (original, current):
         if not isinstance(value, dict) or not IDENTITY_FIELDS.issubset(value):
             raise ValueError("Missing original/current run identity fields")
@@ -48,6 +49,25 @@ def validate_dp_migration(original: dict, current: dict, *, allow_code_change=Fa
         # reward/settings. Keep both real fingerprints in the migration audit.
         before.pop("code_sha256")
         after.pop("code_sha256")
+    if relocated_model is not None:
+        target = str(Path(relocated_model).resolve())
+        if after["model_path"] != target or after["settings"].get("model") != target:
+            raise ValueError("Loaded model path does not match the explicit --model-path relocation")
+        before["model_path"] = target
+        before["settings"]["model"] = target
+        # A copied SFT can have different filesystem timestamps. Keep config,
+        # tokenizer/index hashes and shard names/sizes (and any other metadata)
+        # checked. This remains a metadata check, not a hash of all weight bytes.
+        for identity in (before, after):
+            weights = identity["weight_file_metadata"]
+            if not isinstance(weights, dict) or not weights:
+                raise ValueError("Model relocation requires saved/current weight shard metadata")
+            if any(not isinstance(value, dict) or not isinstance(value.get("bytes"), int)
+                   or value["bytes"] <= 0 for value in weights.values()):
+                raise ValueError("Model relocation has invalid weight shard metadata")
+            identity["weight_file_metadata"] = {
+                name: {key: value for key, value in info.items() if key != "mtime_ns"}
+                for name, info in weights.items()}
     if before != after:
         changed = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
         raise ValueError("Migration must retain original model/data/reward/code/batch/LR horizon; changed: "
@@ -68,7 +88,7 @@ def flag_value(argv, flag, default=None):
 
 
 def build_resume_argv(document, checkpoint: Path, output: Path, gpu_ids: str,
-                      reward_config: Path) -> list[str]:
+                      reward_config: Path, *, model_path=None) -> list[str]:
     settings = document["run_identity"]["settings"]
     if not isinstance(settings, dict) or not isinstance(settings.get("model"), str):
         raise ValueError("Original launch has no model/settings")
@@ -77,7 +97,8 @@ def build_resume_argv(document, checkpoint: Path, output: Path, gpu_ids: str,
     if document.get("reward_settings", {}).get("quality_provider") != "comet22":
         raise ValueError("Original run must use COMET22")
     # Keep the original SFT base: using the merged policy here would change KL.
-    argv = [settings["model"], flag_value(document["argv"], "--dataset"), str(output)]
+    model = str(Path(model_path).resolve()) if model_path is not None else settings["model"]
+    argv = [model, flag_value(document["argv"], "--dataset"), str(output)]
     for key, value in settings.items():
         if key == "model" or value is None:
             continue
@@ -225,6 +246,8 @@ def main(argv=None):
     parser.add_argument("--output-dir", required=True, type=Path, help="New migration output directory")
     parser.add_argument("--gpu-ids", required=True, help="Four actually available GPU IDs, e.g. 0,2,4,6")
     parser.add_argument("--master-port", type=int, default=29583, help="Unused torchrun rendezvous port")
+    parser.add_argument("--model-path", type=Path,
+                        help="New absolute path to the SAME original SFT base on this server, not GSPO merged weights")
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--source-dir", type=Path,
                         help="Current FLEX-GSPO folder; defaults beside this script, source differences are logged, no Git required")
@@ -238,6 +261,13 @@ def main(argv=None):
             raise ValueError("--source-commit is only for Git lookup; omit it when using --source-dir")
         document = json.loads(options.launch_json.read_text(encoding="utf-8-sig"))
         original = document["run_identity"]
+        relocated_model = None
+        if options.model_path is not None:
+            if not options.model_path.is_absolute():
+                raise ValueError("--model-path must be an absolute path to the original SFT base")
+            relocated_model = options.model_path.resolve()
+            if not relocated_model.is_dir():
+                raise ValueError(f"Missing model at --model-path: {relocated_model}")
         expected_new = {**original, "parallelism": LAYOUT4}
         validate_dp_migration(original, expected_new)
         if document.get("reward_settings", {}).get("version") != 4 or document["reward_settings"].get("quality_provider") != "comet22":
@@ -292,6 +322,10 @@ def main(argv=None):
                 "source_dir": str(root) if use_current_source else None,
                 "source_code_sha256": actual_source if use_current_source else original["code_sha256"],
                 "source_changes": source_changes if use_current_source else {},
+                "model_path": str(relocated_model) if relocated_model is not None else original["settings"]["model"],
+                "model_relocation": {"from": original["settings"]["model"], "to": str(relocated_model),
+                                     "verification": "config/tokenizer/index hashes and weight shard names/sizes; mtimes recorded only"}
+                                    if relocated_model is not None else None,
                 "checkpoint": str(checkpoint), "restored_iteration": iteration,
                 "original_parallelism": original["parallelism"], "new_parallelism": LAYOUT4,
                 "global_batch_size": original["settings"].get("global_batch_size"),
@@ -308,7 +342,8 @@ def main(argv=None):
             reward_config = select_reward_config(document, root)
         # torchrun and its `python -m` workers put cwd before PYTHONPATH.
         # Keep both parent and workers anchored to the selected source folder.
-        for value in (original["settings"]["model"], flag_value(document["argv"], "--dataset")):
+        model = relocated_model if relocated_model is not None else original["settings"]["model"]
+        for value in (model, flag_value(document["argv"], "--dataset")):
             if not Path(value).is_absolute():
                 raise ValueError("Migration requires original absolute model/dataset paths")
         os.chdir(root)
@@ -316,7 +351,8 @@ def main(argv=None):
         spec = importlib.util.spec_from_file_location("flex_original_launcher", root / "train_megatron.py")
         launcher = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(launcher)
-        forwarded = build_resume_argv(document, checkpoint, output, options.gpu_ids, reward_config)
+        forwarded = build_resume_argv(document, checkpoint, output, options.gpu_ids, reward_config,
+                                      model_path=relocated_model)
         forwarded.extend(["--master-port", str(options.master_port)])
 
         def verify_migration(args, identity):
@@ -324,12 +360,18 @@ def main(argv=None):
             # optimizer/RNG, model, dataset, and prompt preflight succeeds.
             if Path(args.resume_from).resolve() != checkpoint or Path(args.output).resolve() != output:
                 raise ValueError("Migration checkpoint/output mismatch")
-            validate_dp_migration(original, identity, allow_code_change=use_current_source)
+            validate_dp_migration(original, identity, allow_code_change=use_current_source,
+                                  relocated_model=relocated_model)
+            model_mtime_changes = {
+                name: {"original": info.get("mtime_ns"), "current": identity["weight_file_metadata"][name].get("mtime_ns")}
+                for name, info in original["weight_file_metadata"].items()
+                if info.get("mtime_ns") != identity["weight_file_metadata"][name].get("mtime_ns")}
             # Persistent evidence for the deliberate layout change. Native
             # launcher then writes its normal new run/session identity.
             output.mkdir(parents=True, exist_ok=True)
             with (output / "dp_migration.json").open("x", encoding="utf-8") as handle:
                 json.dump({**plan, "source_changes": compare_source_hashes(original["code_sha256"], identity["code_sha256"]),
+                           "model_weight_mtime_changes": model_mtime_changes,
                            "source_code_sha256": identity["code_sha256"],
                            "original_launch_sha256": hashlib.sha256(launch.read_bytes()).hexdigest(),
                            "original_identity": original, "new_identity": identity}, handle, ensure_ascii=False, indent=2)

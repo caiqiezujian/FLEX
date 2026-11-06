@@ -44,15 +44,19 @@ v4 仍通过原配置选择 COMET22 和 v4 的归一化奖励分支；项目支�
 显式 `--repo` 或 `--source-commit` 才启用可选的旧版 Git 历史查找；本次直接续训不使用这些参数。
 
 下面是已知原运行的路径示例。输出目录必须为空，GPU 4、5、6、7 必须实际可用。
-环境仍使用原训练 Docker 中的兼容 Python 环境。原 SFT、训练 JSONL 和引用音频在新机需可访问；此入口不做路径重写，原模型大小/时间戳及数据身份检查继续执行。
+环境仍使用原训练 Docker 中的兼容 Python 环境。原 SFT、训练 JSONL 和引用音频在新机需可访问。
+若 SFT 从 `/data/yb/model/sft_checkpoint-26508` 移到 `/data/yb/models/sft_checkpoint-26508`，加 `--model-path` 指定新地址；无需修改旧 launch JSON。
+该参数只映射原 SFT 基座的位置，`--resume-from` 仍指向 GSPO 原生 checkpoint-500，不要用 GSPO 合并权重替换 SFT。
+显式模型路径映射时，继续核对配置/tokenizer/索引文件哈希、权重分片名称和大小；文件复制产生的修改时间差异只记录到审计。这个核对不包含全部权重内容的 SHA256。未指定映射时仍执行原有身份检查。
 
 ```bash
 cd /data/yb/Code/FLEX/FLEX-GSPO
-source /data/yb/venvs/flex-gspo-online/bin/activate
+source /data/yb/vens/flex-gspo-online/bin/activate
 mkdir -p /data/yb/Code/FLEX/outputs/logs
 
 nohup python3 -u Scripts/resume_dp_migration.py \
   --source-dir /data/yb/Code/FLEX/FLEX-GSPO \
+  --model-path /data/yb/models/sft_checkpoint-26508 \
   --launch-json /data/yb/Code/FLEX/outputs/gspo_v4_comet22_g8_b32_3000_1104_001/launch_20261104T175951_477020Z.json \
   --resume-from /data/yb/Code/FLEX/outputs/gspo_v4_comet22_g8_b32_3000_1104_001/v0-20261105-020043/checkpoint-500 \
   --output-dir /data/yb/Code/FLEX/outputs/gspo_v4_resume500_4gpu_nogit_001 \

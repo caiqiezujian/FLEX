@@ -6,8 +6,8 @@ set -euo pipefail
 
 cd /data/yb/Code/FLEX/FLEX-GSPO
 
-# Replace if your existing environment is under /data/yb/vens instead.
-source /data/yb/venvs/flex-gspo-online/bin/activate
+# Use the environment on this server; older servers may use /data/yb/venvs instead.
+source /data/yb/vens/flex-gspo-online/bin/activate
 
 # The migration helper automatically reads original training settings from launch JSON.
 # --source-dir uses the CURRENT FLEX-GSPO code and continues the original COMET22 V4 run.
@@ -23,6 +23,7 @@ mkdir -p /data/yb/Code/FLEX/outputs/logs
 # REQUIRED: replace launch-json and resume-from with files from the SAME old run.
 # --launch-json: original output root/launch_*.json, NOT checkpoint args.json.
 # --resume-from: .../v0-TIMESTAMP/checkpoint-500, NEVER checkpoint-500-merged.
+# --model-path: new location of the SAME original SFT base; adjust/remove if no relocation.
 # --source-dir: CURRENT FLEX-GSPO, not its parent and not checkpoint-500; optional (script folder is default).
 # --output-dir: a NEW empty directory (also change the log/PID names for another retry).
 # --gpu-ids: FOUR available physical GPU IDs; e.g. 0,2,4,6, not necessarily 0..3.
@@ -31,6 +32,7 @@ mkdir -p /data/yb/Code/FLEX/outputs/logs
 # --master-port: choose another free port if29583 is used.
 nohup python3 -u Scripts/resume_dp_migration.py \
   --source-dir /data/yb/Code/FLEX/FLEX-GSPO \
+  --model-path /data/yb/models/sft_checkpoint-26508 \
   --launch-json "/替换为原八卡训练输出根目录/launch_实际时间.json" \
   --resume-from "/替换为原八卡训练输出根目录/v0-实际时间/checkpoint-500" \
   --output-dir /data/yb/Code/FLEX/outputs/gspo_v4_resume500_4gpu_g8_b64_001 \
